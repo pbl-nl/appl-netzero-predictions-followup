@@ -1,0 +1,20 @@
+# Core dependencies (required for all collectors)
+pandas>=2.0.0
+requests>=2.31.0
+
+# INFORM collector (Excel files)
+openpyxl>=3.1.0
+
+# RSF collector (score transformations)
+numpy>=1.24.0
+
+# VDem collector (R data files)
+pyreadr>=0.5.0
+
+# PRIMAP collector (NetCDF files)
+xarray>=2023.1.0
+netCDF4>=1.6.0
+
+# Optional: Performance improvements
+dask  # For parallel processing in xarray
+bottleneck  # For faster xarray operations
