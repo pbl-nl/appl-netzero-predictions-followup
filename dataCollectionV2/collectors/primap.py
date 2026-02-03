@@ -9,28 +9,26 @@ from ..core.base_collector import BaseCollector
 from ..core.protocols import CacheStrategy, RemoteResourceInfo
 from ..utils.caching import ChecksumStrategy
 from ..utils.hashing import validate_checksum
-from ..utils.netcdf import (
-    find_coord_name,
-    get_units_str,
-    load_netcdf,
-    year_from_time_values
-)
 
 
 class PRIMAPCollector(BaseCollector):
     """
     Collector for PRIMAP historical emissions data.
 
-    PRIMAP data is distributed via Zenodo as multi-dimensional NetCDF files
-    containing emissions data across:
-    - Area (countries)
-    - Time (years)
-    - Scenario (HISTCR, HISTTP, etc.)
-    - Category (7000+ IPCC categories)
-    - Entity (gases: CO2, CH4, N2O, F-gases, etc.)
+    PRIMAP data is distributed via Zenodo as CSV files. This collector uses
+    the "no_rounding" variant which includes emissions INCLUDING LULUCF.
+
+    CSV columns:
+    - area (ISO3): Country codes
+    - scenario (PRIMAP-hist): HISTCR, HISTTP, etc.
+    - category (IPCC2006_PRIMAP): IPCC category codes
+    - entity: Gas/GWP variant (e.g., "KYOTOGHG (AR6GWP100)")
+    - unit: Always "Gg CO2 / yr" (gigagrams)
+    - source: Data source
+    - Year columns: 1750, 1751, ..., 2022
 
     This collector aggregates to 4 key policy indicators:
-    1. Total GHG emissions (Mt CO2e)
+    1. Total GHG emissions (Mt CO2e) - INCLUDING LULUCF
     2. Non-CO2 emissions (Mt CO2e)
     3. GHG growth (% YoY change)
     4. Hard-to-abate sector emissions (Mt CO2e)
@@ -49,7 +47,7 @@ class PRIMAPCollector(BaseCollector):
         Query Zenodo API for latest PRIMAP dataset.
 
         Returns:
-            List with single RemoteResourceInfo for NetCDF file
+            List with single RemoteResourceInfo for CSV file
         """
         self.logger.info(f"Querying Zenodo API: {self.config.zenodo_api_url}")
 
@@ -72,57 +70,52 @@ class PRIMAPCollector(BaseCollector):
 
         self.logger.info(f"Latest record: {record_id} (version: {version})")
 
-        # Find NetCDF file (prefer no_rounding if configured)
-        netcdf_file = None
+        # Find CSV file (prefer no_rounding variant for LULUCF data)
+        csv_file = None
         for file_info in record.get("files", []):
             filename = file_info["key"]
 
-            if not filename.endswith(".nc"):
+            if not filename.endswith(".csv"):
                 continue
 
-            # If prefer_no_rounding, look for that variant
-            if self.config.prefer_no_rounding:
-                if "no_rounding" in filename.lower():
-                    netcdf_file = file_info
-                    break
-                elif netcdf_file is None:
-                    # Fallback: any NetCDF file
-                    netcdf_file = file_info
-            else:
-                # Just use first NetCDF file
-                if netcdf_file is None:
-                    netcdf_file = file_info
+            # Prefer the configured variant (e.g., "no_rounding")
+            if self.config.csv_variant in filename.lower():
+                csv_file = file_info
+                break
+            elif csv_file is None:
+                # Fallback: any CSV file
+                csv_file = file_info
 
-        if not netcdf_file:
-            raise ValueError("No NetCDF file found in PRIMAP record")
+        if not csv_file:
+            raise ValueError("No CSV file found in PRIMAP record")
 
-        self.logger.info(f"Selected file: {netcdf_file['key']}")
+        self.logger.info(f"Selected file: {csv_file['key']}")
 
         # Parse checksum (format: "md5:abc123...")
-        checksum = netcdf_file.get("checksum", "")
+        checksum = csv_file.get("checksum", "")
 
         return [
             RemoteResourceInfo(
-                url=netcdf_file["links"]["self"],
-                filename=netcdf_file["key"],
+                url=csv_file["links"]["self"],
+                filename=csv_file["key"],
                 checksum=checksum,
                 extra={
                     "record_id": record_id,
                     "version": version,
-                    "size_mb": netcdf_file.get("size", 0) / (1024 * 1024)
+                    "size_mb": csv_file.get("size", 0) / (1024 * 1024)
                 }
             )
         ]
 
     def _download_raw_data(self, resources: list[RemoteResourceInfo]) -> list[Path]:
         """
-        Download NetCDF files from Zenodo with checksum verification.
+        Download CSV files from Zenodo with checksum verification.
 
         Args:
-            resources: List of RemoteResourceInfo for NetCDF files
+            resources: List of RemoteResourceInfo for CSV files
 
         Returns:
-            List of paths to downloaded NetCDF files
+            List of paths to downloaded CSV files
         """
         paths = []
 
@@ -135,7 +128,7 @@ class PRIMAPCollector(BaseCollector):
             )
             self.logger.info("This may take several minutes for large files...")
 
-            # Streaming download for large NetCDF files
+            # Streaming download for large files
             self.http.download_file(resource.url, dest)
 
             # Verify checksum
@@ -174,29 +167,30 @@ class PRIMAPCollector(BaseCollector):
         Extract and aggregate PRIMAP data to policy indicators.
 
         Process:
-        1. Load NetCDF with xarray
-        2. Extract HISTCR scenario and filter year range
-        3. Melt multi-dimensional data to long format
+        1. Load CSV with pandas
+        2. Filter to HISTCR scenario and year range
+        3. Melt year columns to long format
         4. Aggregate to 4 indicators (if aggregation_only=True)
 
         Args:
-            raw_paths: List of paths to NetCDF files
+            raw_paths: List of paths to CSV files
 
         Returns:
             DataFrame with aggregated indicators
         """
         all_frames = []
 
-        for netcdf_path in raw_paths:
-            self.logger.info(f"Loading: {netcdf_path.name}")
+        for csv_path in raw_paths:
+            self.logger.info(f"Loading: {csv_path.name}")
 
-            # Open NetCDF
-            ds = load_netcdf(netcdf_path, decode_times=True)
+            # Read CSV
+            df = pd.read_csv(csv_path)
 
-            self.logger.info(f"Dataset dimensions: {dict(ds.dims)}")
+            self.logger.info(f"CSV shape: {df.shape}")
+            self.logger.info(f"Columns: {list(df.columns[:10])}...")
 
-            # Extract and melt to long table
-            df_long = self._extract_histcr_melted(ds)
+            # Transform CSV to long format
+            df_long = self._transform_csv_to_long(df)
 
             self.logger.info(f"Extracted: {len(df_long)} rows")
 
@@ -209,94 +203,108 @@ class PRIMAPCollector(BaseCollector):
             else:
                 all_frames.append(df_long)
 
-            # Close dataset
-            ds.close()
-
         combined = pd.concat(all_frames, ignore_index=True)
 
         return combined
 
-    def _extract_histcr_melted(self, ds) -> pd.DataFrame:
+    def _transform_csv_to_long(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Extract HISTCR scenario and melt to long format.
+        Transform PRIMAP CSV from wide to long format.
 
-        Converts multi-dimensional NetCDF to tabular format:
-        countryiso3code | indicator.id | indicator.value | indicator.type | date | value
+        CSV structure:
+        - Metadata columns: area (ISO3), scenario (PRIMAP-hist),
+          category (IPCC2006_PRIMAP), entity, unit, source
+        - Year columns: 1750, 1751, ..., 2022 (as strings or ints)
 
         Args:
-            ds: xarray Dataset
+            df: Wide-format DataFrame from CSV
 
         Returns:
-            Long-format DataFrame
+            Long-format DataFrame with standard schema
         """
-        # Find coordinate names (PRIMAP uses specific names)
-        area_c = find_coord_name(ds, ["area", "iso3", "country"])
-        time_c = find_coord_name(ds, ["time", "year"])
-        scenario_c = find_coord_name(ds, ["scenario"])
-        category_c = find_coord_name(ds, ["category"])
+        # Identify metadata columns vs year columns
+        # Year columns are numeric (or string digits)
+        metadata_cols = []
+        year_cols = []
 
-        if not area_c or not time_c:
-            raise ValueError(
-                f"Could not find required coordinates (area, time) in NetCDF. "
-                f"Available coords: {list(ds.coords)}, Dims: {list(ds.dims)}"
-            )
+        for col in df.columns:
+            col_str = str(col)
+            if col_str.isdigit():
+                year_val = int(col_str)
+                if self.config.year_start <= year_val <= self.config.year_end:
+                    year_cols.append(col)
+            else:
+                metadata_cols.append(col)
 
-        self.logger.info(
-            f"Coordinates: area={area_c}, time={time_c}, "
-            f"scenario={scenario_c}, category={category_c}"
+        self.logger.info(f"Metadata columns: {metadata_cols}")
+        self.logger.info(f"Year range in data: {year_cols[0]} to {year_cols[-1]}")
+
+        # Filter to HISTCR scenario
+        scenario_col = None
+        for col in metadata_cols:
+            if "scenario" in col.lower():
+                scenario_col = col
+                break
+
+        if scenario_col:
+            df = df[df[scenario_col] == self.config.scenario].copy()
+            self.logger.info(f"Filtered to {self.config.scenario}: {len(df)} rows")
+
+        # Melt year columns to long format
+        id_vars = [c for c in metadata_cols if c in df.columns]
+        df_long = df.melt(
+            id_vars=id_vars,
+            value_vars=year_cols,
+            var_name="date",
+            value_name="value"
         )
 
-        all_records = []
+        # Convert date to integer
+        df_long["date"] = df_long["date"].astype(int)
 
-        # Process each entity variable (CO2, CH4, N2O, etc.)
-        for entity_name in ds.data_vars:
-            self.logger.info(f"Processing entity: {entity_name}")
+        # Map column names to standard schema
+        # Find the area/ISO3 column
+        area_col = None
+        for col in id_vars:
+            if "area" in col.lower() or "iso" in col.lower():
+                area_col = col
+                break
 
-            da = ds[entity_name]
+        # Find the category column
+        category_col = None
+        for col in id_vars:
+            if "category" in col.lower():
+                category_col = col
+                break
 
-            # Select HISTCR scenario if scenario dimension exists
-            if scenario_c and scenario_c in da.dims:
-                try:
-                    da = da.sel({scenario_c: self.config.scenario})
-                except KeyError:
-                    self.logger.warning(
-                        f"Scenario {self.config.scenario} not found, "
-                        f"using all scenarios"
-                    )
+        # Find the entity column
+        entity_col = None
+        for col in id_vars:
+            if "entity" in col.lower():
+                entity_col = col
+                break
 
-            # Filter year range
-            if time_c:
-                years = year_from_time_values(da[time_c].values)
-                mask = (years >= self.config.year_start) & (years <= self.config.year_end)
-                da = da.isel({time_c: mask})
+        # Find the unit column
+        unit_col = None
+        for col in id_vars:
+            if "unit" in col.lower():
+                unit_col = col
+                break
 
-            # Convert to DataFrame
-            df = da.to_dataframe(name="value").reset_index()
+        # Rename columns to standard schema
+        rename_map = {}
+        if area_col:
+            rename_map[area_col] = "countryiso3code"
+        if category_col:
+            rename_map[category_col] = "indicator.id"
+        if entity_col:
+            rename_map[entity_col] = "indicator.type"
+        if unit_col:
+            rename_map[unit_col] = "indicator.value"
 
-            # Rename columns to standard schema
-            rename_map = {}
-            if area_c:
-                rename_map[area_c] = "countryiso3code"
-            if time_c:
-                rename_map[time_c] = "date"
-            if category_c:
-                rename_map[category_c] = "indicator.id"
+        df_long = df_long.rename(columns=rename_map)
 
-            df = df.rename(columns=rename_map)
-
-            # Extract year from date if needed
-            if "date" in df.columns and df["date"].dtype == "object":
-                df["date"] = year_from_time_values(df["date"].values)
-
-            # Add entity metadata
-            df["indicator.type"] = entity_name
-            df["indicator.value"] = get_units_str(da)
-
-            all_records.append(df)
-
-        combined = pd.concat(all_records, ignore_index=True)
-
-        # Select only required columns (filter out extra coordinates)
+        # Select only required columns
         required_cols = [
             "countryiso3code",
             "indicator.id",
@@ -306,9 +314,9 @@ class PRIMAPCollector(BaseCollector):
             "value"
         ]
 
-        available_cols = [col for col in required_cols if col in combined.columns]
+        available_cols = [col for col in required_cols if col in df_long.columns]
 
-        return combined[available_cols]
+        return df_long[available_cols]
 
     def _aggregate_primap_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -340,17 +348,19 @@ class PRIMAPCollector(BaseCollector):
         return pd.concat([total_ghg, nonco2, growth, hta], ignore_index=True)
 
     def _aggregate_total_ghg(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Total GHG emissions (KYOTOGHG, category '0')."""
+        """Total GHG emissions (KYOTOGHG AR6GWP100, category '0' = including LULUCF)."""
+        # Use EXACT match to avoid summing multiple GWP variants
         mask = (
-            df["indicator.type"].str.contains(
-                self.config.kyoto_entity_regex,
-                case=False,
-                na=False
-            ) &
-            (df["indicator.id"] == "0")
+            (df["indicator.type"] == self.config.kyoto_entity_exact) &
+            (df["indicator.id"] == self.config.total_category)
         )
 
-        df_total = df[mask].groupby(
+        df_total = df[mask].copy()
+
+        # Convert Gg to Mt (1 Mt = 1000 Gg)
+        df_total["value"] = df_total["value"] * self.config.gg_to_mt_factor
+
+        df_total = df_total.groupby(
             ["countryiso3code", "date"],
             as_index=False
         ).agg({"value": "sum"})
@@ -362,17 +372,19 @@ class PRIMAPCollector(BaseCollector):
         return df_total
 
     def _aggregate_nonco2(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Non-CO2 emissions (CH4 + N2O + F-gases)."""
+        """Non-CO2 emissions (CH4 + N2O + F-gases with AR6GWP100)."""
+        # Use exact entity names to avoid summing multiple GWP variants
         mask = (
-            df["indicator.type"].str.contains(
-                self.config.nonco2_entity_regex,
-                case=False,
-                na=False
-            ) &
-            (df["indicator.id"] == "0")
+            df["indicator.type"].isin(self.config.nonco2_entities) &
+            (df["indicator.id"] == self.config.total_category)
         )
 
-        df_nonco2 = df[mask].groupby(
+        df_nonco2 = df[mask].copy()
+
+        # Convert Gg to Mt (1 Mt = 1000 Gg)
+        df_nonco2["value"] = df_nonco2["value"] * self.config.gg_to_mt_factor
+
+        df_nonco2 = df_nonco2.groupby(
             ["countryiso3code", "date"],
             as_index=False
         ).agg({"value": "sum"})
@@ -407,16 +419,18 @@ class PRIMAPCollector(BaseCollector):
                 for p in self.config.hta_category_prefixes
             )
 
+        # Use exact entity match to avoid summing multiple GWP variants
         mask = (
-            df["indicator.type"].str.contains(
-                self.config.kyoto_entity_regex,
-                case=False,
-                na=False
-            ) &
+            (df["indicator.type"] == self.config.kyoto_entity_exact) &
             df["indicator.id"].map(is_hta_category)
         )
 
-        df_hta = df[mask].groupby(
+        df_hta = df[mask].copy()
+
+        # Convert Gg to Mt (1 Mt = 1000 Gg)
+        df_hta["value"] = df_hta["value"] * self.config.gg_to_mt_factor
+
+        df_hta = df_hta.groupby(
             ["countryiso3code", "date"],
             as_index=False
         ).agg({"value": "sum"})
@@ -494,4 +508,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
