@@ -7,3 +7,4 @@ venv/
 *.pyc
 *.ipynb
 CLAUDE.md
+data/iea/raw

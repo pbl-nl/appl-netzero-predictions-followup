@@ -192,6 +192,48 @@ class GitHubReleaseStrategy:
         return False, "release unchanged"
 
 
+class ManualDataStrategy:
+    """
+    Cache strategy for manually placed data files.
+
+    This strategy never triggers downloads since data must be placed manually.
+    It only checks if the expected file exists locally.
+    """
+
+    def __init__(self, raw_dir: Path):
+        """
+        Initialize manual data strategy.
+
+        Args:
+            raw_dir: Directory where raw files are stored
+        """
+        self.raw_dir = raw_dir
+
+    def should_download(
+        self,
+        resource: RemoteResourceInfo,
+        metadata: dict[str, Any]
+    ) -> tuple[bool, str]:
+        """
+        Check if file exists locally.
+
+        For manual data, we never "download" - we only check existence.
+        Returns False to skip download phase; the run() method will use
+        the manually placed file directly.
+
+        Args:
+            resource: Remote resource information
+            metadata: Local metadata dictionary
+
+        Returns:
+            (False, reason) - never triggers download for manual data
+        """
+        local_path = self.raw_dir / resource.filename
+        if local_path.exists():
+            return False, "using manually placed data file"
+        return False, "manual data file not found (must be placed by user)"
+
+
 class WorldBankChangeDetectionStrategy:
     """
     Multi-level cache for WorldBank: source + indicator lastupdated.
