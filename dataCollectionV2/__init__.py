@@ -21,7 +21,7 @@ Example usage:
     >>> print(result)
 """
 
-from .runner import run_all_collectors
+from .collect import run_all_collectors
 
 __all__ = ["run_all_collectors"]
 
