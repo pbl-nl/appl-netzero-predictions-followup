@@ -18,3 +18,9 @@ netCDF4>=1.6.0
 # Optional: Performance improvements
 dask  # For parallel processing in xarray
 bottleneck  # For faster xarray operations
+
+# Data Preparation
+pycountry>=22.3.5
+
+# Testing
+pytest>=7.0.0

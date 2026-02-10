@@ -7,4 +7,7 @@ venv/
 *.pyc
 *.ipynb
 CLAUDE.md
+.claude/
 data/iea/raw
+TODO.md
+.pytest_cache
