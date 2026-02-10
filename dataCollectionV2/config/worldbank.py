@@ -75,6 +75,11 @@ class WorldBankConfig(BaseConfig):
             2,
             "GDP per capita (constant 2015 US$)"
         ),
+        WorldBankIndicator(
+            "SP.POP.TOTL",
+            2,
+            "Population, total"
+        ),
 
         # Source 18: Climate Change Knowledge Portal
         WorldBankIndicator(

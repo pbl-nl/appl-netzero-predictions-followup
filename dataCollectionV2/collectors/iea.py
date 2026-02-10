@@ -138,7 +138,7 @@ class IEACollector(BaseCollector):
 
         for csv_path in raw_paths:
             self.logger.info(f"Loading: {csv_path.name}")
-
+            print(csv_path)
             # Read CSV (wide format with COUNTRY, PRODUCT, FLOW, year columns)
             df_wide = pd.read_csv(csv_path)
 
@@ -254,16 +254,20 @@ def build_metrics_computed(
 
     d = _melt_balance(df_wide)
 
+    d["COUNTRY"] = d["COUNTRY"].astype("category")
+    d["FLOW"]    = d["FLOW"].astype("category")
+    d["PRODUCT"] = d["PRODUCT"].astype("category")
+    
     # ---- Electricity output shares (ELOUTPUT) ----
     elo_total = (
         d[(d["FLOW"] == "ELOUTPUT") & (d["PRODUCT"] == "TOTAL")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "elo_total"})
     )
     elo_ren = (
         d[(d["FLOW"] == "ELOUTPUT") & (d["PRODUCT"].isin(RENEWABLE_PRODUCTS_FOR_OUTPUT))]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "elo_ren"})
     )
@@ -280,13 +284,13 @@ def build_metrics_computed(
     # ---- Heat output shares (HEATOUT) ----
     heat_total = (
         d[(d["FLOW"] == "HEATOUT") & (d["PRODUCT"] == "TOTAL")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "heat_total"})
     )
     heat_ren = (
         d[(d["FLOW"] == "HEATOUT") & (d["PRODUCT"].isin(RENEWABLE_PRODUCTS_FOR_OUTPUT))]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "heat_ren"})
     )
@@ -302,13 +306,13 @@ def build_metrics_computed(
     # ---- Final consumption pieces (TFC) ----
     tfc_total = (
         d[(d["FLOW"] == "TFC") & (d["PRODUCT"] == "TOTAL")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "tfc_total"})
     )
     nonenuse_total = (
         d[(d["FLOW"] == "NONENUSE") & (d["PRODUCT"] == "TOTAL")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "nonenuse_total"})
     )
@@ -319,21 +323,21 @@ def build_metrics_computed(
 
     mrenew_tfc = (
         d[(d["FLOW"] == "TFC") & (d["PRODUCT"] == "MRENEW")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "mrenew_tfc"})
     )
 
     elec_tfc = (
         d[(d["FLOW"] == "TFC") & (d["PRODUCT"] == "ELECTR")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "elec_tfc"})
     )
 
     heat_tfc = (
         d[(d["FLOW"] == "TFC") & (d["PRODUCT"] == "HEAT")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "heat_tfc"})
     )
@@ -369,7 +373,7 @@ def build_metrics_computed(
     # ---- Energy intensity: TES (TJ) -> MJ / GDP PPP constant USD ----
     tes_total_tj = (
         d[(d["FLOW"] == "TES") & (d["PRODUCT"] == "TOTAL")]
-        .groupby(["COUNTRY", "year"], as_index=False)["value"]
+        .groupby(["COUNTRY", "year"], as_index=False, observed=True, sort=False)["value"]
         .sum()
         .rename(columns={"value": "tes_tj"})
     )

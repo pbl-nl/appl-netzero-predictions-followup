@@ -98,7 +98,9 @@ class ChecksumStrategy:
         cached_checksum = file_meta.get("checksum")
 
         if cached_checksum != resource.checksum:
-            return True, f"checksum mismatch (cached: {cached_checksum[:8]}..., remote: {resource.checksum[:8]}...)"
+            cached_display = cached_checksum[:8] if cached_checksum else "None"
+            remote_display = resource.checksum[:8] if resource.checksum else "None"
+            return True, f"checksum mismatch (cached: {cached_display}..., remote: {remote_display}...)"
 
         return False, "checksum matches cached version"
 
