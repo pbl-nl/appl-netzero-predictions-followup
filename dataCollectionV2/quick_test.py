@@ -83,11 +83,7 @@ print("\n[7/7] Testing PRIMAP collector...")
 try:
     from dataCollectionV2.collectors.primap import PRIMAPCollector
     from dataCollectionV2.config.primap import PRIMAPConfig
-    from dataCollectionV2.utils.netcdf import load_netcdf, find_coord_name
     print("  ✓ PRIMAP imports successful")
-except ImportError as e:
-    print(f"  ⚠ PRIMAP imports failed (xarray not installed?): {e}")
-    print("    Install with: pip install xarray netCDF4")
 except Exception as e:
     print(f"  ✗ PRIMAP failed: {e}")
 
@@ -95,4 +91,4 @@ print("\n" + "=" * 70)
 print("Quick Test Complete!")
 print("\nNext steps:")
 print("  1. If you see ⚠ warnings, install missing dependencies:")
-print("     pip install pyreadr xarray netCDF4")
+print("     pip install pyreadr")
