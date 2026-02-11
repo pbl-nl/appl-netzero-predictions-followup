@@ -11,3 +11,5 @@ CLAUDE.md
 data/iea/raw
 TODO.md
 .pytest_cache
+output/
+interpretation.md
