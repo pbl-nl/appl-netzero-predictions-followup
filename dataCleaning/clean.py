@@ -13,6 +13,9 @@ import pandas as pd
 from dataCleaning.config.base import CleaningConfig
 from dataCleaning.core.protocols import CleaningResult
 from dataCleaning.steps.flags import (
+    detect_constant_series,
+    detect_cross_column_violations,
+    detect_infinities,
     detect_missing_values,
     detect_outliers,
     detect_range_violations,
@@ -84,9 +87,12 @@ def run_cleaning(config: CleaningConfig | None = None) -> CleaningResult:
         issues = []
         issues.extend(validate_structure(df, config))
         issues.extend(detect_missing_values(df))
+        issues.extend(detect_infinities(df))
         issues.extend(detect_range_violations(df, config))
         issues.extend(detect_outliers(df, config))
         issues.extend(detect_temporal_jumps(df, config))
+        issues.extend(detect_cross_column_violations(df, config))
+        issues.extend(detect_constant_series(df, config))
 
         diagnostics = diagnostics_to_frame(issues)
         cleaned = _attach_row_quality(df, diagnostics)

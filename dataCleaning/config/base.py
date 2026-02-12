@@ -43,7 +43,47 @@ class CleaningConfig:
         "population_density_people_per_sq_km_of_land_area",
         "inform_risk_index",
         "rsf_press_freedom_index",
+        "gdp_per_capita_constant_2015_us",
+        "energy_intensity_mj_per_usd_ppp",
+        "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average",
     )
+
+    bounded_columns: dict[str, tuple[float, float]] = field(default_factory=lambda: {
+        "agricultural_land_of_land_area": (0, 100),
+        "forest_area_of_land_area": (0, 100),
+        "coal_rents_of_gdp": (0, 100),
+        "natural_gas_rents_of_gdp": (0, 100),
+        "oil_rents_of_gdp": (0, 100),
+        "renewable_energy_share_tfc_pct": (0, 100),
+        "renewable_electricity_share_pct": (0, 100),
+        "rsf_press_freedom_index": (0, 100),
+        "inform_risk_index": (0, 10),
+        "v2x_regime": (0, 3),
+    })
+
+    exclude_from_outlier_detection: tuple[str, ...] = (
+        "v2x_regime",
+    )
+
+    temporal_jump_thresholds: dict[str, float] = field(default_factory=lambda: {
+        "population_total": 0.10,
+        "population_density_people_per_sq_km_of_land_area": 0.10,
+        "agricultural_land_of_land_area": 0.20,
+        "forest_area_of_land_area": 0.20,
+        "ghg_growth": 5.0,
+        "annual_deforestation_of_change": 5.0,
+        "coal_rents_of_gdp": 3.0,
+        "natural_gas_rents_of_gdp": 3.0,
+        "oil_rents_of_gdp": 3.0,
+    })
+    temporal_jump_default_threshold: float = 1.0
+
+    cross_column_rules: tuple[tuple[str, str], ...] = (
+        ("non_co2_emissions", "total_ghg_emissions"),
+        ("total_hard_to_abate_emissions", "total_ghg_emissions"),
+    )
+
+    constant_series_min_length: int = 10
 
     @property
     def input_path(self) -> Path:

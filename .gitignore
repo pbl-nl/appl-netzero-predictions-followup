@@ -1,15 +1,38 @@
-data/
+
+# --- Python / tooling caches ---
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
 venv/
 .venv/
+
+# --- macOS ---
 .DS_Store
-*.ipynb_checkpoints
-*.pyc
+
+# --- Jupyter notebooks ---
 *.ipynb
-CLAUDE.md
-.claude/
-data/iea/raw
-TODO.md
-.pytest_cache
+
+# --- File type policy ---
+# Ignore Markdown except README.md
+*.md
+!README.md
+!**/README.md
+
+# Ignore data/archive formats everywhere
+*.json
+*.csv
+*.zip
+*.xlsx
+
+# --- Project artifacts / data folders ---
+data/iea/raw/
 output/
-interpretation.md
+image/
+
+# --- Claude / agent tooling directories ---
+.claude/

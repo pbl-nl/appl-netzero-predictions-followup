@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from dataCleaning.clean import run_cleaning
@@ -99,3 +100,89 @@ def test_report_overview_matches_diagnostics_counts(tmp_path):
     overview = pd.read_csv(data_dir / "cleaning_report" / "overview.csv").iloc[0]
     assert int(overview["issue_total"]) == len(diagnostics)
     assert int(overview["missing_issue_count"]) == int((diagnostics["issue_type"] == "missing").sum())
+
+
+def test_infinity_detection(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    source = pd.DataFrame({
+        "country": ["USA", "USA", "DEU"],
+        "year": [1960, 1961, 1960],
+        "total_ghg_emissions": [10.0, np.inf, 11.0],
+        "population_total": [100.0, 101.0, -np.inf],
+    })
+    source.to_csv(data_dir / "merged_indicators.csv", index=False)
+
+    result = run_cleaning(CleaningConfig(data_dir=data_dir))
+    assert result.success
+
+    diagnostics = pd.read_csv(data_dir / "cleaning_diagnostics.csv")
+    inf_issues = diagnostics[diagnostics["issue_type"] == "infinity"]
+    assert len(inf_issues) == 2
+    assert set(inf_issues["severity"]) == {"critical"}
+
+
+def test_bounded_range_violation(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    source = pd.DataFrame({
+        "country": ["USA", "USA", "DEU"],
+        "year": [1960, 1961, 1960],
+        "agricultural_land_of_land_area": [50.0, 110.0, 40.0],
+        "inform_risk_index": [5.0, 11.0, 3.0],
+    })
+    source.to_csv(data_dir / "merged_indicators.csv", index=False)
+
+    result = run_cleaning(CleaningConfig(data_dir=data_dir))
+    assert result.success
+
+    diagnostics = pd.read_csv(data_dir / "cleaning_diagnostics.csv")
+    bounded = diagnostics[diagnostics["issue_type"] == "bounded_range_violation"]
+    assert len(bounded) >= 2
+    flagged_cols = set(bounded["column"])
+    assert "agricultural_land_of_land_area" in flagged_cols
+    assert "inform_risk_index" in flagged_cols
+
+
+def test_cross_column_violation(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    source = pd.DataFrame({
+        "country": ["USA", "USA", "DEU"],
+        "year": [1960, 1961, 1960],
+        "total_ghg_emissions": [100.0, 50.0, 80.0],
+        "non_co2_emissions": [90.0, 200.0, 70.0],
+        "total_hard_to_abate_emissions": [50.0, 60.0, 30.0],
+    })
+    source.to_csv(data_dir / "merged_indicators.csv", index=False)
+
+    result = run_cleaning(CleaningConfig(data_dir=data_dir))
+    assert result.success
+
+    diagnostics = pd.read_csv(data_dir / "cleaning_diagnostics.csv")
+    cross = diagnostics[diagnostics["issue_type"] == "cross_column_violation"]
+    assert len(cross) >= 2  # USA 1961: non_co2 > total, hard_to_abate > total
+
+
+def test_constant_series_detection(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    years = list(range(1960, 1975))
+    source = pd.DataFrame({
+        "country": ["USA"] * len(years),
+        "year": years,
+        "population_total": [100.0] * len(years),
+    })
+    source.to_csv(data_dir / "merged_indicators.csv", index=False)
+
+    result = run_cleaning(CleaningConfig(data_dir=data_dir, constant_series_min_length=10))
+    assert result.success
+
+    diagnostics = pd.read_csv(data_dir / "cleaning_diagnostics.csv")
+    constant = diagnostics[diagnostics["issue_type"] == "constant_series"]
+    assert len(constant) >= 1
+    assert constant.iloc[0]["column"] == "population_total"
