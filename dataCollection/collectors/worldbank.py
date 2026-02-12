@@ -1,6 +1,7 @@
 """World Bank data collector with multi-source support."""
 
 import json
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,8 @@ from ..config.worldbank import WorldBankConfig, WorldBankIndicator
 from ..core.base_collector import BaseCollector
 from ..core.protocols import CacheStrategy, RemoteResourceInfo
 from ..utils.caching import WorldBankChangeDetectionStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class WorldBankCollector(BaseCollector):
@@ -355,6 +358,8 @@ def main():
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
+
     # Create configuration
     config = WorldBankConfig(base_output_dir=args.output_dir)
 
@@ -365,14 +370,14 @@ def main():
         result = collector.run(force=args.force)
 
         if result.success:
-            print(f"  Downloaded: {result.downloaded}")
+            logger.info("Downloaded: %s", result.downloaded)
             return 0
         else:
-            print(f"\n✗ Failed: {result.error}", file=sys.stderr)
+            logger.error("Failed: %s", result.error)
             return 1
 
     except Exception as e:
-        print(f"\n✗ Error: {e}", file=sys.stderr)
+        logger.error("Error: %s", e)
         return 1
 
 

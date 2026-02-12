@@ -1,6 +1,6 @@
 """Merge indicator CSVs into a single dataset.
 
-Loads per-source CSV files produced by dataCollectionV2, applies
+Loads per-source CSV files produced by dataCollection, applies
 source-specific transformations, outer-joins them on (country, year),
 filters to valid ISO-3166-1 codes, and writes ``merged_indicators.csv``.
 """
@@ -200,9 +200,6 @@ def run_merge(config: MergeConfig | None = None) -> PreparationResult:
             len(merged),
         )
 
-        # Sort
-        merged = merged.sort_values(["country", "year"])
-
         # Types
         if "v2x_regime" in merged.columns:
             merged["v2x_regime"] = merged["v2x_regime"].astype("category")
@@ -216,7 +213,36 @@ def run_merge(config: MergeConfig | None = None) -> PreparationResult:
         merged = merged.dropna(subset=["year"])
         merged["year"] = merged["year"].astype(int)
 
+        if config.drop_outside_panel_years:
+            merged = merged[
+                (merged["year"] >= config.panel_year_start)
+                & (merged["year"] <= config.panel_year_end)
+            ]
+
+        if merged.duplicated(["country", "year"]).any():
+            dup_count = int(merged.duplicated(["country", "year"]).sum())
+            raise MergeError(f"Duplicate country-year keys found: {dup_count}")
+
+        if config.enforce_full_panel:
+            countries = sorted(merged["country"].dropna().unique())
+            years = list(range(config.panel_year_start, config.panel_year_end + 1))
+            full_index = pd.MultiIndex.from_product(
+                [countries, years], names=["country", "year"],
+            )
+            before = len(merged)
+            merged = (
+                merged.set_index(["country", "year"])
+                .reindex(full_index)
+                .reset_index()
+            )
+            added_rows = len(merged) - before
+            logger.info(
+                "Full panel enforced for %d countries x %d years (%d rows added)",
+                len(countries), len(years), added_rows,
+            )
+
         # Save
+        merged = merged.sort_values(["country", "year"]).reset_index(drop=True)
         output_path = config.merged_indicators_path
         merged.to_csv(output_path, index=False)
         logger.info("Saved merged indicators to %s", output_path)

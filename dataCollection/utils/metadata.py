@@ -1,11 +1,14 @@
 """Metadata management for tracking download state."""
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .filesystem import atomic_write
+
+logger = logging.getLogger(__name__)
 
 
 class MetadataManager:
@@ -42,7 +45,7 @@ class MetadataManager:
             metadata = json.loads(content)
             return metadata
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: Failed to load metadata from {self.metadata_path}: {e}")
+            logger.warning("Failed to load metadata from %s: %s", self.metadata_path, e)
             return self._default_metadata()
 
     def save(self, metadata: dict[str, Any]) -> None:

@@ -1,6 +1,7 @@
 """HTTP client with retry logic and conditional GET support."""
 
 import time
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,8 @@ import requests
 from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 from .hashing import sha256_file
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -98,10 +101,18 @@ class HTTPClient:
 
                 if attempt < self.settings.max_retries:
                     sleep_time = self.settings.backoff_base ** (attempt - 1)
-                    print(f"Request failed (attempt {attempt}/{self.settings.max_retries}), retrying in {sleep_time:.1f}s...")
+                    logger.warning(
+                        "Request failed (attempt %d/%d), retrying in %.1fs...",
+                        attempt,
+                        self.settings.max_retries,
+                        sleep_time,
+                    )
                     time.sleep(sleep_time)
                 else:
-                    print(f"Request failed after {self.settings.max_retries} attempts")
+                    logger.error(
+                        "Request failed after %d attempts",
+                        self.settings.max_retries,
+                    )
                     raise
 
         # Should not reach here, but just in case

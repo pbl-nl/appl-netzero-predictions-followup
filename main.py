@@ -1,11 +1,13 @@
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from dataAnalysis.analysis import run_analysis
-from dataCollectionV2 import run_all_collectors
+from dataCleaning.clean import run_cleaning
+from dataCollection import run_all_collectors
 from dataPreparation.prepare import run_preparation
 
 # Below is the logging level table
@@ -18,16 +20,25 @@ from dataPreparation.prepare import run_preparation
 # CRITICAL	50	    A serious failure that might stop the entire program.
 
 # Configure logging to show INFO level outputs in STDOUT
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
 
 
 def main():
     try:
+        logging.info("\n\nStarting data collection...\n\n")
         run_all_collectors()
+        logging.info("\n\nData collection completed.\n\n")
+        logging.info("\n\nStarting data preparation...\n\n")
         run_preparation()
+        logging.info("\n\nData preparation completed.\n\n")
+        logging.info("\n\nStarting data cleaning...\n\n")
+        run_cleaning()
+        logging.info("\n\nData cleaning completed.\n\n")
+        logging.info("\n\nStarting data analysis...\n\n")
         run_analysis()
+        logging.info("\n\nData analysis completed.\n\n")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"\n\nError: {e}\n\n")
 
 
 if __name__ == "__main__":
