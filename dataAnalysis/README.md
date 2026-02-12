@@ -1,161 +1,127 @@
-# Net-Zero RCE Panel Data Analysis
+# dataAnalysis
+## 1) Overview (for non-technical readers)
+### What it does
+This module runs a structured 16-step analysis checklist on the prepared dataset to assess data health, target behavior, leakage risk, and split feasibility.
 
-## Overview
+It runs the same analyses across three dataset splits (`1990_2024`, `2010_2024`, `2024`) and saves result tables/figures per split.
 
-Modular analysis pipeline for the remaining per-capita cumulative emissions budget (RCE) dataset. Runs 16 analysis steps across 3 data splits (`1990-2024`, `2010-2024`, `2024-only`), producing dynamic findings, CSV tables, and figures per split.
+The goal is to help decide whether data is ready for modeling and where major risks remain.
 
-Follows the same architectural pattern as `dataCollection/` and `dataPreparation/` — config/, core/, steps/, utils/ subdirectories orchestrated by a top-level script.
+### Why it exists
+Modeling without a consistent pre-model diagnostic pass can hide basic issues such as missingness concentration, implausible values, leakage-prone predictors, or weak split feasibility.
 
-## Data
+This module centralizes those checks into reproducible, step-labeled outputs.
 
-**Input**: `../data/merged_indicators.csv` — country-year panel with 3 target scenarios (optimistic, linear, pessimistic) and 24 feature columns.
+### What happens / why it happens / how it happens
+- **What happened:** Data is loaded by split, steps S01-S16 run in order, and each step emits findings plus optional tables/figures.
+- **Why it happened:** The project needs evidence-based readiness checks before model development.
+- **How it happened:** `analysis.py` orchestrates step modules, each implementing `run(df, config)` (S16 also receives prior results), with outputs written under `dataAnalysis/output/<split>/`.
 
-**Excluded**: 14 countries with negative RCE values (LULUCF artifacts) are excluded from analysis but documented.
+### Key concepts (optional but recommended)
+- **Split:** A fixed year window (`1990_2024`, `2010_2024`, or `2024`).
+- **ICC (Intraclass Correlation):** Share of variance explained by between-country differences.
+- **Leakage tiers:** `safe`, `caution`, `danger` feature-risk classes.
+- **Monotonicity:** Checks whether remaining-emissions targets decrease over time as expected.
 
-## Quick Start
+### Inputs & outputs (non-technical)
+- Inputs: prepared panel data (`data/merged_indicators.csv`) and net-zero target Excel (`data/netzero/Reduction rates NZ targets_26March2024.xlsx`) for pledge metadata step.
+- Outputs: split-specific CSV tables and PNG figures in `dataAnalysis/output/<split>/tables/` and `dataAnalysis/output/<split>/figures/`.
 
+## 2) Technical guide (for technical readers)
+### Folder structure
+```text
+dataAnalysis/
+├── analysis.py
+├── config/
+│   └── base.py
+├── core/
+│   ├── exceptions.py
+│   └── protocols.py
+├── steps/
+│   ├── s01_panel_grain.py
+│   ├── s02_panel_coverage.py
+│   ├── ...
+│   └── s16_summary.py
+├── utils/
+│   ├── io.py
+│   ├── stats.py
+│   └── interpret.py
+└── output/
+    ├── 1990_2024/
+    ├── 2010_2024/
+    └── 2024/
+```
+
+### How it works (simple system view)
+1. `run_analysis()` resolves splits and step numbers.
+2. For each split, `AnalysisConfig` sets year bounds and output paths.
+3. `utils/io.py::load_data()` loads `data/merged_indicators.csv`, excludes configured negative-RCE countries, and filters rows to split years.
+4. Steps S01-S15 run in order and return `AnalysisResult` with findings/tables/figures.
+5. S16 compiles findings from prior step results into a summary table.
+
+### Data contracts
+- Key file formats:
+- Input and table outputs are CSV.
+- Figure outputs are PNG by default.
+- Essential input columns:
+- Required keys: `country`, `year`
+- Target columns: `optimistic`, `linear`, `pessimistic`
+- Feature groups from `config/base.py` (emissions, governance, economic, energy, demographic, land, other)
+- Step-specific external file:
+- S05 reads `data/netzero/Reduction rates NZ targets_26March2024.xlsx` (sheet `NZ targets`, skip rows 11).
+- Output storage:
+- `dataAnalysis/output/<split>/tables/<table_name>.csv`
+- `dataAnalysis/output/<split>/figures/<figure_name>.png`
+
+### Configuration
+- Config file used:
+- `dataAnalysis/config/base.py`
+- Environment variables: none detected in module code.
+- Defaults/common overrides:
+- Default split: `1990_2024`
+- Available splits: `1990_2024`, `2010_2024`, `2024`
+- Default steps: all 16
+- Figure defaults: `FIGURE_DPI=300`, `FIGURE_FORMAT=png`
+- Excluded country list for negative RCE cases is configured in `NEGATIVE_RCE_COUNTRIES`.
+
+### How to run
 ```bash
-# Run full pipeline (all 3 splits, all 16 steps)
+# Run all splits and all steps
 python -m dataAnalysis.analysis
 
-# Run a single split
+# Run selected split
 python -m dataAnalysis.analysis --splits 1990_2024
 
-# Run specific steps on a specific split
+# Run selected split + selected steps
 python -m dataAnalysis.analysis --splits 2024 --steps 1 5 7
 
 # Programmatic usage
-from dataAnalysis import run_analysis
-results = run_analysis(splits=["2024"], steps=[1, 3, 6])
+python -c "from dataAnalysis import run_analysis; run_analysis(splits=['2010_2024'], steps=[1,2,3])"
 ```
 
-## Directory Structure
+### Error cases & troubleshooting
+1. `data/merged_indicators.csv` missing or unreadable: run preparation first.
+2. Invalid split name: use only `1990_2024`, `2010_2024`, or `2024`.
+3. S05 pledge metadata warnings: NZ Excel missing/unreadable causes soft-skip findings, not hard failure.
+4. Cross-sectional split behavior: some time-series steps intentionally skip or adapt (for example S04/S11).
+5. Insufficient rows/coverage for specific computations: step returns success with "insufficient data" findings and reduced outputs.
 
-```
-dataAnalysis/
-├── __init__.py
-├── analysis.py                    # Orchestrator + CLI
-├── config/
-│   ├── __init__.py
-│   └── base.py                    # AnalysisConfig dataclass
-├── core/
-│   ├── __init__.py
-│   ├── protocols.py               # AnalysisResult dataclass
-│   └── exceptions.py              # DataAnalysisError hierarchy
-├── steps/
-│   ├── __init__.py
-│   ├── s01_panel_grain.py         # Panel grain & key verification
-│   ├── s02_panel_coverage.py      # Coverage & unbalancedness
-│   ├── s03_target_audit.py        # Monotonicity, scenario ordering
-│   ├── s04_target_identity.py     # delta_RCE vs per-capita emissions
-│   ├── s05_pledge_metadata.py     # NZ pledge year analysis
-│   ├── s06_missingness.py         # Missingness patterns
-│   ├── s07_plausibility.py        # Type/units plausibility checks
-│   ├── s08_outliers.py            # Outliers & structural breaks
-│   ├── s09_variance_decomp.py     # Within vs between variance (ICC)
-│   ├── s10_target_distribution.py # Distribution & scaling analysis
-│   ├── s11_target_dynamics.py     # Curvature & trajectory analysis
-│   ├── s12_relationships.py       # Feature-target correlations
-│   ├── s13_leakage_audit.py       # Leakage risk classification
-│   ├── s14_log_diagnostics.py     # Pre-log transform readiness
-│   ├── s15_split_feasibility.py   # Train/validation feasibility
-│   └── s16_summary.py             # Compiled findings from S01-S15
-├── utils/
-│   ├── __init__.py
-│   ├── io.py                      # load_data, save_table, save_figure
-│   ├── stats.py                   # check_monotonicity, variance_decomposition, etc.
-│   └── interpret.py               # Threshold-based interpretation helpers
-└── output/                        # Per-split outputs
-    ├── 1990_2024/
-    │   ├── figures/
-    │   └── tables/
-    ├── 2010_2024/
-    │   ├── figures/
-    │   └── tables/
-    └── 2024/
-        ├── figures/
-        └── tables/
-```
+### Tests / validation
+- No dedicated `dataAnalysis/tests` directory is present in this repository.
+- `TODO (confirm): decide whether to add step-level tests under [dataAnalysis](./) or shared tests at repository root.`
 
-## Data Splits
+### Responsibilities and boundaries
+- What this module owns:
+- Split-aware analytical diagnostics (S01-S16), output artifacts, and readiness findings.
+- What it explicitly does NOT do (and which module does it instead):
+- It does not collect source data (`[dataCollection](../dataCollection/README.md)`).
+- It does not build/augment the merged panel (`[dataPreparation](../dataPreparation/README.md)`).
+- It does not produce the cleaning diagnostics tables (`[dataCleaning](../dataCleaning/README.md)`).
+- It does not train or evaluate prediction models.
 
-| Split | Years | Type | Notes |
-|-------|-------|------|-------|
-| `1990_2024` | 1990-2024 | Panel | Full temporal range with most indicators |
-| `2010_2024` | 2010-2024 | Panel | Recent period, better feature coverage |
-| `2024` | 2024 only | Cross-sectional | Single-year snapshot |
-
-Steps that require time series (monotonicity, dynamics, identity check, demeaned correlations) detect `is_cross_sectional` and either skip with a finding note or adapt to cross-sectional mode.
-
-## Analysis Steps
-
-| # | Step | What it checks | Key outputs |
-|---|------|---------------|-------------|
-| 1 | Panel Grain | One row per (country, year), valid ISO codes | `panel_grain.csv` |
-| 2 | Panel Coverage | Country/year coverage, internal gaps | `coverage_by_country.csv`, coverage heatmap |
-| 3 | Target Audit | Monotonicity, scenario ordering | `target_monotonicity.csv`, `target_scenario_ordering.csv` |
-| 4 | Target Identity | delta_RCE ≈ per-capita emissions | `identity_residuals.csv`, residual histogram |
-| 5 | Pledge Metadata | NZ GHG year distribution, coverage | `pledge_metadata.csv`, pledge histogram |
-| 6 | Missingness | Per-feature, per-year, per-country | `missingness_overall.csv`, missingness heatmap |
-| 7 | Plausibility | Negatives, zeros, inf, bound violations | `plausibility_summary.csv`, `plausibility_violations.csv` |
-| 8 | Outliers | Temporal jumps (>100% YoY), IQR extremes | `outlier_jumps.csv`, jump severity plot |
-| 9 | Variance Decomp | ICC, between/within variance ranking | `variance_decomposition.csv`, ICC bar chart |
-| 10 | Target Distribution | Skew, zeros, tail ratio, transform recs | `target_distribution.csv`, distribution plots |
-| 11 | Target Dynamics | Curvature (2nd derivative), trajectory shapes | `target_curvature.csv`, trajectory plots |
-| 12 | Relationships | Raw & demeaned feature-target correlations | `correlations_raw.csv`, `correlations_demeaned.csv`, heatmap |
-| 13 | Leakage Audit | Feature risk classification (safe/caution/danger) | `leakage_checklist.csv` |
-| 14 | Log Diagnostics | Zero/negative counts, transform recommendations | `log_readiness.csv` |
-| 15 | Split Feasibility | Usable sample after lagging, feature coverage | `split_feasibility.csv` |
-| 16 | Summary | Aggregated findings from S01-S15 | `summary_report.csv` |
-
-## Architecture
-
-### Step contract
-
-Every step follows the same signature:
-
-```python
-def run(df: pd.DataFrame, config: AnalysisConfig) -> AnalysisResult:
-```
-
-- Receives the already-filtered DataFrame (split applied by orchestrator)
-- Returns `AnalysisResult` with dynamic `findings`, saved table/figure paths
-- S16 additionally receives `prior_results` to compile the summary
-
-### AnalysisResult
-
-```python
-@dataclass
-class AnalysisResult:
-    success: bool
-    step_name: str
-    split_name: str
-    findings: list[str]       # Dynamic interpretation strings
-    tables_saved: list[Path]
-    figures_saved: list[Path]
-    error: Optional[str] = None
-```
-
-All findings are computed from actual data values — no canned/boilerplate text.
-
-### AnalysisConfig
-
-Split-aware dataclass providing:
-- `year_start`, `year_end` — derived from `split_name`
-- `is_cross_sectional` — True for `2024` split
-- `output_dir`, `tables_dir`, `figures_dir` — per-split output paths
-- Feature group lists (`TARGET_COLS`, `EMISSIONS_COLS`, etc.)
-- `NEGATIVE_RCE_COUNTRIES` — 14 excluded countries
-
-## Dependencies
-
-```
-pandas
-numpy
-matplotlib
-seaborn
-scipy
-openpyxl    # for NZ targets Excel in S05
-```
-
-Install with: `pip install -r ../requirements.txt`
+## Cross-module links
+- Upstream dependencies:
+- `[dataPreparation](../dataPreparation/README.md)`
+- `[data](../data/README.md)`
+- Downstream consumers:
+- `TODO (confirm): in-repo modeling consumer is not defined; check project root and integration plans in [main.py](../main.py).`
