@@ -1,19 +1,34 @@
 import logging
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Any
-from types import ModuleType
+from typing import Callable, List, Literal
 
-# Import collector modules
-from dataCollection.collectors import iea
-from dataCollection.collectors import inform
-from dataCollection.collectors import rsf
-from dataCollection.collectors import vdem
-from dataCollection.collectors import worldbank
-from dataCollection.collectors import primap
+from dataCollection.collectors.iea import IEACollector
+from dataCollection.collectors.inform import InformCollector
+from dataCollection.collectors.primap import PRIMAPCollector
+from dataCollection.collectors.rsf import RSFCollector
+from dataCollection.collectors.vdem import VDemCollector
+from dataCollection.collectors.worldbank import WorldBankCollector
+from dataCollection.config.iea import IEAConfig
+from dataCollection.config.inform import InformConfig
+from dataCollection.config.primap import PRIMAPConfig
+from dataCollection.config.rsf import RSFConfig
+from dataCollection.config.vdem import VDemConfig
+from dataCollection.config.worldbank import WorldBankConfig
 
-# Setup logger
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CollectorTaskResult:
+    collector: str
+    status: Literal["success", "failed", "skipped"]
+    exit_code: int | None
+    message: str | None
+    duration_sec: float
 
 
 def _ensure_stdout_logging(level: int = logging.INFO) -> None:
@@ -40,27 +55,14 @@ def _ensure_stdout_logging(level: int = logging.INFO) -> None:
 
 
 def _ensure_iea_data_directory(base_data_dir: Path) -> Path:
-    """
-    Ensure data/iea/raw directory exists.
-
-    Args:
-        base_data_dir: Base data directory (e.g., ./data)
-
-    Returns:
-        Path to data/iea/raw directory
-    """
+    """Ensure data/iea/raw directory exists."""
     iea_raw_dir = base_data_dir / "iea" / "raw"
     iea_raw_dir.mkdir(parents=True, exist_ok=True)
     return iea_raw_dir
 
 
 def _create_iea_readme(base_data_dir: Path) -> None:
-    """
-    Create README.md in data/iea/ explaining data restrictions.
-
-    Args:
-        base_data_dir: Base data directory (e.g., ./data)
-    """
+    """Create README.md in data/iea/ explaining data restrictions."""
     iea_dir = base_data_dir / "iea"
     iea_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,37 +73,18 @@ def _create_iea_readme(base_data_dir: Path) -> None:
 
 
 def _check_iea_csv_exists(iea_raw_dir: Path) -> tuple[bool, str]:
-    """
-    Check if exactly one CSV file exists in data/iea/raw/.
-
-    Args:
-        iea_raw_dir: Path to data/iea/raw directory
-
-    Returns:
-        Tuple of (success, message)
-        - success: True if exactly one CSV exists
-        - message: Description of status or error
-    """
+    """Check if exactly one CSV file exists in data/iea/raw/."""
     csv_files = list(iea_raw_dir.glob("*.csv"))
 
     if not csv_files:
         return False, f"No CSV file found in {iea_raw_dir}"
-    elif len(csv_files) > 1:
+    if len(csv_files) > 1:
         return False, f"Multiple CSV files found in {iea_raw_dir}: {[f.name for f in csv_files]}"
-    else:
-        return True, f"Found IEA data file: {csv_files[0].name}"
+    return True, f"Found IEA data file: {csv_files[0].name}"
 
 
 def _prompt_for_iea_data(iea_raw_dir: Path) -> bool:
-    """
-    Interactively prompt user to add IEA data or skip.
-
-    Args:
-        iea_raw_dir: Path to data/iea/raw directory
-
-    Returns:
-        True if user added data and it's valid, False to skip IEA processing
-    """
+    """Interactively prompt user to add IEA data or skip."""
     while True:
         exists, message = _check_iea_csv_exists(iea_raw_dir)
 
@@ -124,106 +107,154 @@ def _prompt_for_iea_data(iea_raw_dir: Path) -> bool:
         if response == "s":
             logger.info("Skipping IEA processing.")
             return False
-        elif response == "":
-            # User pressed Enter, check again
+        if response == "":
             continue
-        else:
-            logger.warning(
-                "Unknown option: '%s'. Press Enter to check again or 's' to skip.",
-                response,
-            )
+
+        logger.warning(
+            "Unknown option: '%s'. Press Enter to check again or 's' to skip.",
+            response,
+        )
 
 
-def run_iea_collector() -> bool:
-    """
-    Run the IEA collector with special handling for manual data.
-
-    Returns:
-        True if successful, False if failed or skipped
-    """
+def _prepare_iea_execution() -> tuple[bool, str]:
+    """Prepare IEA execution and prompt for data if needed."""
     base_data_dir = Path("data")
 
-    # Ensure directory structure exists
     logger.info("Setting up IEA data directory...")
     iea_raw_dir = _ensure_iea_data_directory(base_data_dir)
     _create_iea_readme(base_data_dir)
 
-    # Check for CSV file and prompt if missing
     logger.info("Checking for IEA data file...")
     if not _prompt_for_iea_data(iea_raw_dir):
-        return False
+        return False, "IEA skipped by user or missing file"
 
-    # Run the IEA collector
+    return True, "IEA data preflight passed"
+
+
+def _run_collector(collector_name: str, runner: Callable[[], object]) -> CollectorTaskResult:
+    start = time.perf_counter()
     try:
-        logger.info("Running IEA collector...")
-        if hasattr(iea, 'main'):
-            ret = iea.main()
-            if ret == 0:
-                logger.info("Successfully finished IEA collector.")
-                return True
-            else:
-                logger.warning(f"IEA collector returned non-zero exit code: {ret}")
-                return False
-        else:
-            logger.warning("IEA collector module does not have a main() function.")
-            logger.warning("Skipping IEA: No main() function found.")
-            return False
-    except Exception as e:
-        error_msg = f"Failed to run IEA collector: {e}"
-        logger.error(error_msg, exc_info=True)
-        return False
+        result = runner()
+        duration = time.perf_counter() - start
+        if getattr(result, "success", False):
+            return CollectorTaskResult(collector_name, "success", 0, None, duration)
+        return CollectorTaskResult(
+            collector_name,
+            "failed",
+            1,
+            getattr(result, "error", "Unknown collector failure"),
+            duration,
+        )
+    except Exception as exc:
+        duration = time.perf_counter() - start
+        return CollectorTaskResult(collector_name, "failed", 1, str(exc), duration)
+
+
+def _run_iea(should_run: bool, reason: str) -> CollectorTaskResult:
+    if not should_run:
+        return CollectorTaskResult("IEA", "skipped", None, reason, 0.0)
+    return _run_collector(
+        "IEA",
+        lambda: IEACollector(IEAConfig(base_output_dir=Path("data"))).run(force=False),
+    )
+
+
+def _run_inform() -> CollectorTaskResult:
+    return _run_collector(
+        "Inform",
+        lambda: InformCollector(InformConfig(base_output_dir=Path("data"))).run(force=False),
+    )
+
+
+def _run_rsf() -> CollectorTaskResult:
+    return _run_collector(
+        "RSF",
+        lambda: RSFCollector(RSFConfig(base_output_dir=Path("data"))).run(force=False),
+    )
+
+
+def _run_vdem() -> CollectorTaskResult:
+    return _run_collector(
+        "V-Dem",
+        lambda: VDemCollector(VDemConfig(base_output_dir=Path("data"))).run(force=False),
+    )
+
+
+def _run_worldbank() -> CollectorTaskResult:
+    return _run_collector(
+        "WorldBank",
+        lambda: WorldBankCollector(WorldBankConfig(base_output_dir=Path("data"))).run(force=False),
+    )
+
+
+def _run_primap() -> CollectorTaskResult:
+    return _run_collector(
+        "PRIMAP",
+        lambda: PRIMAPCollector(PRIMAPConfig(base_output_dir=Path("data"))).run(force=False),
+    )
 
 
 def run_all_collectors() -> None:
-    """
-    Executes the main method of all registered data collectors.
-    Failures in one collector do not stop others from running.
-    """
+    """Execute all six collectors concurrently with best-effort behavior."""
     _ensure_stdout_logging()
     logger.info("Starting data collection process...")
 
-    # Run IEA first with special handling for manual data
+    # Keep prompt interaction deterministic before workers start.
     logger.info("%s", "=" * 50)
-    logger.info("Processing IEA (manual data)")
+    logger.info("Processing IEA preflight (manual data)")
     logger.info("%s", "=" * 50)
-    run_iea_collector()
+    iea_should_run, iea_reason = _prepare_iea_execution()
 
-    # Other collectors that download data automatically
-    collectors: List[tuple[str, ModuleType]] = [
-        ("Inform", inform),
-        ("RSF", rsf),
-        ("V-Dem", vdem),
-        ("WorldBank", worldbank),
-        ("PRIMAP", primap),
+    tasks: List[tuple[str, Callable[[], CollectorTaskResult]]] = [
+        ("IEA", lambda: _run_iea(iea_should_run, iea_reason)),
+        ("Inform", _run_inform),
+        ("RSF", _run_rsf),
+        ("V-Dem", _run_vdem),
+        ("WorldBank", _run_worldbank),
+        ("PRIMAP", _run_primap),
     ]
 
-    # Save original args to restore later if needed, though we don't modify them
-    original_argv = sys.argv
+    logger.info("Launching concurrent collectors with 6 workers...")
+    results: list[CollectorTaskResult] = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        future_map = {executor.submit(fn): name for name, fn in tasks}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = CollectorTaskResult(name, "failed", 1, str(exc), 0.0)
+                logger.error("Collector %s failed unexpectedly: %s", name, exc, exc_info=True)
 
-    for name, collector_module in collectors:
-        try:
-            logger.info("%s", "=" * 50)
-            logger.info("Running %s collector...", name)
-            logger.info("%s", "=" * 50)
-
-            # Use module-level main function
-            if hasattr(collector_module, 'main'):
-                # We are relying on the fact that these main() functions use argparse
-                # which parses sys.argv. Since main.py likely has no args,
-                # the collectors will use their defaults.
-                ret = collector_module.main()
-
-                if ret == 0:
-                    logger.info("Successfully finished %s collector.", name)
-                else:
-                    logger.warning(f"{name} collector returned non-zero exit code: {ret}")
+            results.append(result)
+            if result.status == "success":
+                logger.info("[%s] completed in %.2fs", result.collector, result.duration_sec)
+            elif result.status == "skipped":
+                logger.info("[%s] skipped: %s", result.collector, result.message)
             else:
-                logger.warning(f"Collector module {name} does not have a main() function.")
-                logger.warning("Skipping %s: No main() function found.", name)
+                logger.warning(
+                    "[%s] failed in %.2fs: %s",
+                    result.collector,
+                    result.duration_sec,
+                    result.message,
+                )
 
-        except Exception as e:
-            error_msg = f"Failed to run {name} collector: {e}"
-            logger.error(error_msg, exc_info=True)
-            # Continue to next collector
+    success_count = sum(r.status == "success" for r in results)
+    failed_count = sum(r.status == "failed" for r in results)
+    skipped_count = sum(r.status == "skipped" for r in results)
+
+    logger.info("%s", "=" * 50)
+    logger.info("COLLECTION SUMMARY")
+    logger.info("Succeeded: %d", success_count)
+    logger.info("Failed: %d", failed_count)
+    logger.info("Skipped: %d", skipped_count)
+    for r in sorted(results, key=lambda x: x.collector):
+        logger.info(
+            "  - %s: %s (%.2fs)%s",
+            r.collector,
+            r.status,
+            r.duration_sec,
+            f" | {r.message}" if r.message else "",
+        )
 
     logger.info("Data collection process completed.")

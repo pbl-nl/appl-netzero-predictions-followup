@@ -25,12 +25,20 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", str
 
 def main():
     try:
+        logging.info("\n\nStarting data collection...\n\n")
         run_all_collectors()
+        logging.info("\n\nData collection completed.\n\n")
+        logging.info("\n\nStarting data preparation...\n\n")
         run_preparation()
+        logging.info("\n\nData preparation completed.\n\n")
+        logging.info("\n\nStarting data cleaning...\n\n")
         run_cleaning()
+        logging.info("\n\nData cleaning completed.\n\n")
+        logging.info("\n\nStarting data analysis...\n\n")
         run_analysis()
+        logging.info("\n\nData analysis completed.\n\n")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        logging.error(f"\n\nError: {e}\n\n")
 
 
 if __name__ == "__main__":
