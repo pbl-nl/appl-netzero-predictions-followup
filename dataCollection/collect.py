@@ -5,15 +5,38 @@ from typing import List, Any
 from types import ModuleType
 
 # Import collector modules
-from dataCollectionV2.collectors import iea
-from dataCollectionV2.collectors import inform
-from dataCollectionV2.collectors import rsf
-from dataCollectionV2.collectors import vdem
-from dataCollectionV2.collectors import worldbank
-from dataCollectionV2.collectors import primap
+from dataCollection.collectors import iea
+from dataCollection.collectors import inform
+from dataCollection.collectors import rsf
+from dataCollection.collectors import vdem
+from dataCollection.collectors import worldbank
+from dataCollection.collectors import primap
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+
+def _ensure_stdout_logging(level: int = logging.INFO) -> None:
+    """Ensure collection logs are emitted to stdout."""
+    root = logging.getLogger()
+    formatter = logging.Formatter("%(levelname)s: %(message)s")
+    has_stdout_handler = any(
+        isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) is sys.stdout
+        for h in root.handlers
+    )
+
+    if not root.handlers:
+        logging.basicConfig(level=level, format="%(levelname)s: %(message)s", stream=sys.stdout)
+        return
+
+    if not has_stdout_handler:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+
+    if root.level > level:
+        root.setLevel(level)
 
 
 def _ensure_iea_data_directory(base_data_dir: Path) -> Path:
@@ -44,7 +67,7 @@ def _create_iea_readme(base_data_dir: Path) -> None:
     readme_path = iea_dir / "README.md"
     if not readme_path.exists():
         readme_path.write_text("IEA Data cannot be provided publicly.\n")
-        print(f"Created {readme_path}")
+        logger.info("Created %s", readme_path)
 
 
 def _check_iea_csv_exists(iea_raw_dir: Path) -> tuple[bool, str]:
@@ -83,31 +106,32 @@ def _prompt_for_iea_data(iea_raw_dir: Path) -> bool:
         exists, message = _check_iea_csv_exists(iea_raw_dir)
 
         if exists:
-            print(f"  {message}")
+            logger.info("%s", message)
             return True
 
-        print(f"\n  WARNING: {message}")
-        print(f"  Please add the IEA data CSV file to: {iea_raw_dir}")
-        print()
-        print("  Options:")
-        print("    [Enter] - I've added the file, check again")
-        print("    [s]     - Skip IEA processing and continue with other collectors")
-        print()
+        logger.warning("%s", message)
+        logger.info("Please add the IEA data CSV file to: %s", iea_raw_dir)
+        logger.info("Options:")
+        logger.info("  [Enter] - I've added the file, check again")
+        logger.info("  [s]     - Skip IEA processing and continue with other collectors")
 
         try:
             response = input("  Your choice: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n  Skipping IEA processing (interrupted).")
+            logger.warning("Skipping IEA processing (interrupted).")
             return False
 
         if response == "s":
-            print("  Skipping IEA processing.")
+            logger.info("Skipping IEA processing.")
             return False
         elif response == "":
             # User pressed Enter, check again
             continue
         else:
-            print(f"  Unknown option: '{response}'. Press Enter to check again or 's' to skip.")
+            logger.warning(
+                "Unknown option: '%s'. Press Enter to check again or 's' to skip.",
+                response,
+            )
 
 
 def run_iea_collector() -> bool:
@@ -120,35 +144,33 @@ def run_iea_collector() -> bool:
     base_data_dir = Path("data")
 
     # Ensure directory structure exists
-    print("Setting up IEA data directory...")
+    logger.info("Setting up IEA data directory...")
     iea_raw_dir = _ensure_iea_data_directory(base_data_dir)
     _create_iea_readme(base_data_dir)
 
     # Check for CSV file and prompt if missing
-    print("Checking for IEA data file...")
+    logger.info("Checking for IEA data file...")
     if not _prompt_for_iea_data(iea_raw_dir):
         return False
 
     # Run the IEA collector
     try:
-        print("Running IEA collector...")
+        logger.info("Running IEA collector...")
         if hasattr(iea, 'main'):
             ret = iea.main()
             if ret == 0:
-                print("Successfully finished IEA collector.")
+                logger.info("Successfully finished IEA collector.")
                 return True
             else:
                 logger.warning(f"IEA collector returned non-zero exit code: {ret}")
-                print(f"Warning: IEA collector finished with code {ret}")
                 return False
         else:
             logger.warning("IEA collector module does not have a main() function.")
-            print("Skipping IEA: No main() function found.")
+            logger.warning("Skipping IEA: No main() function found.")
             return False
     except Exception as e:
         error_msg = f"Failed to run IEA collector: {e}"
         logger.error(error_msg, exc_info=True)
-        print(error_msg)
         return False
 
 
@@ -157,15 +179,14 @@ def run_all_collectors() -> None:
     Executes the main method of all registered data collectors.
     Failures in one collector do not stop others from running.
     """
-    print("Starting data collection process...")
-    print()
+    _ensure_stdout_logging()
+    logger.info("Starting data collection process...")
 
     # Run IEA first with special handling for manual data
-    print("=" * 50)
-    print("Processing IEA (manual data)")
-    print("=" * 50)
+    logger.info("%s", "=" * 50)
+    logger.info("Processing IEA (manual data)")
+    logger.info("%s", "=" * 50)
     run_iea_collector()
-    print()
 
     # Other collectors that download data automatically
     collectors: List[tuple[str, ModuleType]] = [
@@ -181,9 +202,9 @@ def run_all_collectors() -> None:
 
     for name, collector_module in collectors:
         try:
-            print("=" * 50)
-            print(f"Running {name} collector...")
-            print("=" * 50)
+            logger.info("%s", "=" * 50)
+            logger.info("Running %s collector...", name)
+            logger.info("%s", "=" * 50)
 
             # Use module-level main function
             if hasattr(collector_module, 'main'):
@@ -193,21 +214,16 @@ def run_all_collectors() -> None:
                 ret = collector_module.main()
 
                 if ret == 0:
-                    print(f"Successfully finished {name} collector.")
+                    logger.info("Successfully finished %s collector.", name)
                 else:
                     logger.warning(f"{name} collector returned non-zero exit code: {ret}")
-                    print(f"Warning: {name} collector finished with code {ret}")
             else:
                 logger.warning(f"Collector module {name} does not have a main() function.")
-                print(f"Skipping {name}: No main() function found.")
-
-            print()
+                logger.warning("Skipping %s: No main() function found.", name)
 
         except Exception as e:
             error_msg = f"Failed to run {name} collector: {e}"
             logger.error(error_msg, exc_info=True)
-            print(error_msg)
-            print()
             # Continue to next collector
 
-    print("Data collection process completed.")
+    logger.info("Data collection process completed.")

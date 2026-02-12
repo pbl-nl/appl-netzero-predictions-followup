@@ -1,5 +1,6 @@
 """INFORM Risk Index data collector."""
 
+import logging
 import re
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from ..core.base_collector import BaseCollector
 from ..core.protocols import CacheStrategy, RemoteResourceInfo
 from ..utils.caching import HTTPConditionalGetStrategy
 from ..utils.filesystem import safe_filename
+
+logger = logging.getLogger(__name__)
 
 
 class InformCollector(BaseCollector):
@@ -61,9 +64,9 @@ class InformCollector(BaseCollector):
             )
 
             if downloaded:
-                print(f"   Downloaded {resource.filename}")
+                self.logger.info("   Downloaded %s", resource.filename)
             else:
-                print(f"   Using cached {resource.filename} (HTTP 304)")
+                self.logger.info("   Using cached %s (HTTP 304)", resource.filename)
 
             # Update metadata for this file
             self.metadata_mgr.update_file_metadata(resource.filename, meta)
@@ -176,6 +179,7 @@ class InformCollector(BaseCollector):
 def main():
     """Command-line entry point for INFORM collector."""
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser(
         description="Download and process INFORM Risk Index data"
@@ -193,6 +197,8 @@ def main():
     )
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
+
     # Create config
     config = InformConfig(base_output_dir=args.output_dir)
 
@@ -200,8 +206,7 @@ def main():
     collector = InformCollector(config)
     result = collector.run(force=args.force)
 
-    # Print result
-    print(f"\n{result}")
+    logger.info("%s", result)
 
     return 0 if result.success else 1
 

@@ -185,7 +185,7 @@ class BaseCollector(ABC):
         """
         output_path = self.config.output_csv_path
         df.to_csv(output_path, index=False)
-        print(f"Saved {len(df)} rows to {output_path}")
+        self.logger.info("Saved %d rows to %s", len(df), output_path)
         return output_path
 
     def run(self, force: bool = False) -> CollectionResult:
@@ -205,33 +205,33 @@ class BaseCollector(ABC):
             Success: 1000 rows written to data/inform_indicators.csv
         """
         try:
-            print(f"\n=== Running {self.config.source_name} collector ===")
-            self.logger.info(f"Starting collection for {self.config.source_name}")
+            self.logger.info("=== Running %s collector ===", self.config.source_name)
+            self.logger.info("Starting collection for %s", self.config.source_name)
 
             # Phase 1: Initialize
-            print("1. Ensuring directories exist...")
+            self.logger.info("1. Ensuring directories exist...")
             self._ensure_directories()
 
-            print("2. Loading metadata...")
+            self.logger.info("2. Loading metadata...")
             metadata = self.metadata_mgr.load()
 
             # Phase 2: Discover
-            print("3. Discovering remote resources...")
+            self.logger.info("3. Discovering remote resources...")
             resources = self._discover_remote_resources()
-            print(f"   Found {len(resources)} resource(s)")
+            self.logger.info("   Found %d resource(s)", len(resources))
 
             # Phase 3: Check cache
-            print("4. Checking cache...")
+            self.logger.info("4. Checking cache...")
             should_download, reason = self._check_cache(resources, metadata, force)
-            print(f"   {reason}")
+            self.logger.info("   %s", reason)
 
             # Phase 4: Download
             if should_download:
-                print("5. Downloading raw data...")
+                self.logger.info("5. Downloading raw data...")
                 raw_paths = self._download_raw_data(resources)
-                print(f"   Downloaded {len(raw_paths)} file(s)")
+                self.logger.info("   Downloaded %d file(s)", len(raw_paths))
             else:
-                print("5. Using cached data...")
+                self.logger.info("5. Using cached data...")
                 # Get cached paths
                 raw_paths = [
                     self.config.raw_dir / resource.filename
@@ -239,23 +239,23 @@ class BaseCollector(ABC):
                 ]
 
             # Phase 5: Transform
-            print("6. Transforming to indicators...")
+            self.logger.info("6. Transforming to indicators...")
             df = self._transform_to_indicators(raw_paths)
-            print(f"   Generated {len(df)} rows")
+            self.logger.info("   Generated %d rows", len(df))
 
             # Phase 6: Validate
-            print("7. Validating output...")
+            self.logger.info("7. Validating output...")
             self._validate_output(df)
 
             # Phase 7: Save
-            print("8. Saving output...")
+            self.logger.info("8. Saving output...")
             output_path = self._save_output(df)
 
             # Phase 8: Update metadata
-            print("9. Updating metadata...")
+            self.logger.info("9. Updating metadata...")
             self.metadata_mgr.save(metadata)
 
-            print(f"=== Completed successfully ===\n")
+            self.logger.info("=== Completed successfully ===")
 
             return CollectionResult(
                 success=True,
@@ -266,7 +266,7 @@ class BaseCollector(ABC):
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
-            print(f"\n=== Failed: {error_msg} ===\n")
+            self.logger.error("=== Failed: %s ===", error_msg)
 
             return CollectionResult(
                 success=False,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,8 @@ from ..config.iea import IEAConfig
 from ..core.base_collector import BaseCollector
 from ..core.protocols import CacheStrategy, RemoteResourceInfo
 from ..utils.caching import ManualDataStrategy
+
+logger = logging.getLogger(__name__)
 
 
 # Renewables set for output calculations
@@ -138,7 +141,6 @@ class IEACollector(BaseCollector):
 
         for csv_path in raw_paths:
             self.logger.info(f"Loading: {csv_path.name}")
-            print(csv_path)
             # Read CSV (wide format with COUNTRY, PRODUCT, FLOW, year columns)
             df_wide = pd.read_csv(csv_path)
 
@@ -424,6 +426,8 @@ def main():
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
+
     # Create configuration
     config = IEAConfig(base_output_dir=args.output_dir)
 
@@ -434,14 +438,14 @@ def main():
         result = collector.run(force=args.force)
 
         if result.success:
-            print(f"  Processed: {result.rows} rows")
+            logger.info("Processed: %d rows", result.rows)
             return 0
         else:
-            print(f"\n✗ Failed: {result.error}", file=sys.stderr)
+            logger.error("Failed: %s", result.error)
             return 1
 
     except Exception as e:
-        print(f"\n✗ Error: {e}", file=sys.stderr)
+        logger.error("Error: %s", e)
         return 1
 
 

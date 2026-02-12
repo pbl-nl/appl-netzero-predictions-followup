@@ -4,7 +4,7 @@
 
 Modular analysis pipeline for the remaining per-capita cumulative emissions budget (RCE) dataset. Runs 16 analysis steps across 3 data splits (`1990-2024`, `2010-2024`, `2024-only`), producing dynamic findings, CSV tables, and figures per split.
 
-Follows the same architectural pattern as `dataCollectionV2/` and `dataPreparation/` — config/, core/, steps/, utils/ subdirectories orchestrated by a top-level script.
+Follows the same architectural pattern as `dataCollection/` and `dataPreparation/` — config/, core/, steps/, utils/ subdirectories orchestrated by a top-level script.
 
 ## Data
 

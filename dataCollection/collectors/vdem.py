@@ -1,5 +1,6 @@
 """V-Dem (Varieties of Democracy) data collector."""
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from ..utils.archive import extract_zip_to_temp, find_files_by_extension
 from ..utils.caching import GitHubReleaseStrategy
 from ..utils.hashing import sha256_file
 from ..utils.rdata import load_vdem_dataframe
+
+logger = logging.getLogger(__name__)
 
 
 class VDemCollector(BaseCollector):
@@ -261,6 +264,8 @@ def main():
 
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
+
     # Create configuration
     config = VDemConfig(
         base_output_dir=args.output_dir,
@@ -275,14 +280,14 @@ def main():
         result = collector.run(force=args.force)
 
         if result.success:
-            print(f"  Downloaded: {result.downloaded}")
+            logger.info("Downloaded: %s", result.downloaded)
             return 0
         else:
-            print(f"\n✗ Failed: {result.error}", file=sys.stderr)
+            logger.error("Failed: %s", result.error)
             return 1
 
     except Exception as e:
-        print(f"\n✗ Error: {e}", file=sys.stderr)
+        logger.error("Error: %s", e)
         return 1
 
 

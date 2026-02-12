@@ -1,6 +1,7 @@
 """RSF (Reporters Sans Frontières) World Press Freedom Index collector."""
 
 import csv
+import logging
 import re
 import time
 from pathlib import Path
@@ -14,6 +15,8 @@ from ..config.rsf import RSFConfig
 from ..core.base_collector import BaseCollector
 from ..core.protocols import CacheStrategy, RemoteResourceInfo
 from ..utils.caching import HTTPConditionalGetStrategy
+
+logger = logging.getLogger(__name__)
 
 
 ISO_RE = re.compile(r"^[A-Z]{3}$")
@@ -78,9 +81,9 @@ class RSFCollector(BaseCollector):
                 )
 
                 if downloaded:
-                    print(f"   Downloaded {resource.filename}")
+                    self.logger.info("   Downloaded %s", resource.filename)
                 else:
-                    print(f"   Using cached {resource.filename} (HTTP 304)")
+                    self.logger.info("   Using cached %s (HTTP 304)", resource.filename)
 
                 # Update metadata
                 self.metadata_mgr.update_file_metadata(resource.filename, meta)
@@ -88,7 +91,7 @@ class RSFCollector(BaseCollector):
                 paths.append(dest)
 
             except Exception as e:
-                print(f"   Warning: Failed to download {resource.filename}: {e}")
+                self.logger.warning("   Failed to download %s: %s", resource.filename, e)
                 # Continue with next year
                 continue
 
@@ -123,7 +126,7 @@ class RSFCollector(BaseCollector):
                 all_frames.append(df3)
 
             except Exception as e:
-                print(f"   Warning: Failed to process {path.name}: {e}")
+                self.logger.warning("   Failed to process %s: %s", path.name, e)
                 continue
 
         if len(all_frames) == 0:
@@ -441,6 +444,7 @@ class RSFCollector(BaseCollector):
 def main():
     """Command-line entry point for RSF collector."""
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser(
         description="Download and process RSF World Press Freedom Index data"
@@ -469,6 +473,8 @@ def main():
     )
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stdout)
+
     # Create config
     config = RSFConfig(base_output_dir=args.output_dir)
 
@@ -481,8 +487,7 @@ def main():
     collector = RSFCollector(config)
     result = collector.run(force=args.force)
 
-    # Print result
-    print(f"\n{result}")
+    logger.info("%s", result)
 
     return 0 if result.success else 1
 
