@@ -10,6 +10,7 @@ __pycache__/
 # --- Virtual environments ---
 venv/
 .venv/
+.trash
 
 # --- macOS ---
 .DS_Store
@@ -28,6 +29,10 @@ venv/
 *.csv
 *.zip
 *.xlsx
+*.pt
+*.joblib
+*.png
+*.html
 
 # --- Project artifacts / data folders ---
 data/iea/raw/

@@ -9,6 +9,9 @@ from dataAnalysis.analysis import run_analysis
 from dataCleaning.clean import run_cleaning
 from dataCollection import run_all_collectors
 from dataPreparation.prepare import run_preparation
+from modelPreparation.prepare_model import run_model_preparation
+from modelTraining.orchestrator import run_model_training
+from resultsAnalysis.orchestrator import run_results_analysis
 
 # Below is the logging level table
 
@@ -37,6 +40,15 @@ def main():
         logging.info("\n\nStarting data analysis...\n\n")
         run_analysis()
         logging.info("\n\nData analysis completed.\n\n")
+        logging.info("\n\nStarting model preparation...\n\n")
+        run_model_preparation()
+        logging.info("\n\nModel preparation completed.\n\n")
+        logging.info("\n\nStarting model training...\n\n")
+        run_model_training()
+        logging.info("\n\nModel training completed.\n\n")
+        logging.info("\n\nStarting results analysis...\n\n")
+        run_results_analysis()
+        logging.info("\n\nResults analysis completed.\n\n")
     except Exception as e:
         logging.error(f"\n\nError: {e}\n\n")
 
