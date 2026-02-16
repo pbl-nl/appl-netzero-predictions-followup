@@ -42,7 +42,7 @@ A single model run produces a point estimate with no information about confidenc
 
 ```text
 modelTraining/
-├── orchestrator.py              # CLI entry point + end-to-end orchestration
+├── orchestrator.py              # CLI entry point — delegates to steps/
 ├── baselines.py                 # Baseline models (country_mean, global_mean, Ridge, Lasso)
 ├── train_panel.py               # Panel split training loop (1990_2024, 2010_2024)
 ├── train_snapshot.py            # Snapshot split training loop (2024)
@@ -56,6 +56,11 @@ modelTraining/
 ├── utils.py                     # Shared helpers (bootstrap, metrics, split loading)
 ├── config/
 │   └── base.py                  # ModelTrainingConfig dataclass + algorithm/split constants
+├── steps/
+│   ├── s01_validate.py          # Pre-training checks (artifacts + dependencies)
+│   ├── s02_train.py             # Main training loop with tqdm progress bar
+│   ├── s03_compare.py           # Outer CV comparison (opt-in)
+│   └── s04_summarize.py         # Concat & save global outputs
 ├── core/
 │   ├── algorithms.py            # Algorithm registry + model factory (build_model)
 │   └── protocols.py             # RunResult, TrainingResult, InversionResult dataclasses
@@ -73,7 +78,7 @@ modelTraining/
 
 ### How it works (simple system view)
 
-1. **Artifact validation:** `orchestrator.py` verifies that `modelPreparation` artifacts (`pre_split_data.csv`, `split_indices.json`, `feature_list.json`) exist for every requested split and that optional dependencies (`xgboost`, `torch`) are installed for requested algorithms.
+1. **Orchestration:** `orchestrator.py` delegates to four sequential steps. **S01** (`s01_validate.py`) verifies that `modelPreparation` artifacts (`pre_split_data.csv`, `split_indices.json`, `feature_list.json`) exist for every requested split and that optional dependencies (`xgboost`, `torch`) are installed. **S02** (`s02_train.py`) runs the full training loop with a `tqdm` progress bar across all split/scenario/algorithm combos. **S03** (`s03_compare.py`) runs the optional outer CV comparison. **S04** (`s04_summarize.py`) concatenates and saves global output CSVs.
 2. **Baselines:** For each split/scenario, `baselines.py` evaluates four baselines (country mean, global mean, Ridge, Lasso) on the validation partition. Ridge/Lasso alphas are tuned on training data only.
 3. **Training loops:** For each algorithm/split/scenario, the orchestrator dispatches to `train_panel_combo()` or `train_snapshot_combo()`. These run N bootstrap iterations in parallel via `joblib.Parallel`. Each run: resamples training data → fits `ModelPreparationPipeline` on bootstrap sample → tunes hyperparameters via inner CV → trains model → predicts on validation and forecast partitions → persists model artifact.
 4. **Aggregation:** `aggregate.py` computes per-country median, mean, std, p5, p95, and coefficient of variation across runs.
