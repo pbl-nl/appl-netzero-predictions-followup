@@ -51,6 +51,11 @@ def _import_torch() -> Any:
     except ImportError as exc:
         raise ImportError("Neural algorithm requested but dependency 'torch' is not installed") from exc
 
+    # Prevent PyTorch's bundled libomp from spawning OpenMP threads that
+    # conflict with the system/scikit-learn libomp (dual-libomp segfault on
+    # macOS).  Single-threaded is fine here because the data per batch is small.
+    torch.set_num_threads(1)
+
     return {
         "torch": torch,
         "nn": nn,
@@ -735,7 +740,13 @@ def train_panel_combo(
     y_min = float(pd.to_numeric(y_full_train, errors="coerce").min())
     precomputed_shift = max(1.0, -y_min + 1.0)
 
-    parallel_results = Parallel(n_jobs=config.n_jobs, verbose=10, prefer="threads")(
+    is_neural = algorithm in {"SimpleNN", "LSTM"}
+    parallel_kwargs: dict[str, Any] = {"n_jobs": config.n_jobs, "verbose": 10}
+    if is_neural:
+        parallel_kwargs["backend"] = "loky"       # spawn-based: safe on macOS + Windows
+    else:
+        parallel_kwargs["prefer"] = "threads"     # GIL-releasing sklearn: fast with threads
+    parallel_results = Parallel(**parallel_kwargs)(
         delayed(_train_panel_run)(
             algorithm=algorithm,
             split=split,

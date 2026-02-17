@@ -105,7 +105,7 @@ def plot_ranking_grouped_bars(config: ResultsAnalysisConfig, ranking: RankingOut
         ax.set_ylabel("RMSE (log)")
         ax.set_xticks(x)
         ax.set_xticklabels(scenarios)
-        if i > 0:
+        if i > 0 and ax.legend_ is not None:
             ax.legend_.remove()
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
@@ -160,7 +160,8 @@ def plot_top_ahead_behind(config: ResultsAnalysisConfig, netzero: NetZeroOutputs
     axes[1].set_title("Top 10 Furthest Behind")
     axes[1].set_xlabel("Years vs pledge")
 
-    axes[0].legend_.remove()
+    if axes[0].legend_ is not None:
+        axes[0].legend_.remove()
     _save(fig, path, config.figure_dpi)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from modelTraining.config.base import ModelTrainingConfig
 from modelTraining.train_panel import train_panel_combo
@@ -220,3 +221,34 @@ def test_bootstrap_changes_with_seed():
     X_a, _ = bootstrap_rows(X, y, seed=1)
     X_b, _ = bootstrap_rows(X, y, seed=2)
     assert not X_a.equals(X_b)
+
+
+def test_panel_simplenn_parallel_loky(tmp_path):
+    """SimpleNN panel training with n_jobs=2 uses loky backend without segfault."""
+    pytest.importorskip("torch")
+
+    df, partitions, features = _panel_fixture()
+    config = ModelTrainingConfig(
+        output_dir=tmp_path / "out",
+        model_ready_dir=tmp_path / "mr",
+        data_dir=tmp_path / "data",
+        algorithms=["SimpleNN"],
+        splits=["1990_2024"],
+        scenarios=["linear"],
+        n_runs=2,
+        n_jobs=2,
+    )
+
+    out = train_panel_combo(
+        algorithm="SimpleNN",
+        split="1990_2024",
+        scenario="linear",
+        split_df=df,
+        partitions=partitions,
+        feature_columns=features,
+        config=config,
+        combo_dir=tmp_path / "nn_combo",
+    )
+
+    assert len(out.run_results) == 2
+    assert all(r.success for r in out.run_results)

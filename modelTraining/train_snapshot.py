@@ -304,7 +304,13 @@ def train_snapshot_combo(
     y_min = float(pd.to_numeric(y_full_train, errors="coerce").min())
     precomputed_shift = max(1.0, -y_min + 1.0)
 
-    parallel_results = Parallel(n_jobs=config.n_jobs, verbose=10, prefer="threads")(
+    is_neural = algorithm in {"SimpleNN", "LSTM"}
+    parallel_kwargs: dict[str, Any] = {"n_jobs": config.n_jobs, "verbose": 10}
+    if is_neural:
+        parallel_kwargs["backend"] = "loky"       # spawn-based: safe on macOS + Windows
+    else:
+        parallel_kwargs["prefer"] = "threads"     # GIL-releasing sklearn: fast with threads
+    parallel_results = Parallel(**parallel_kwargs)(
         delayed(_train_snapshot_run)(
             algorithm=algorithm,
             split=split,
