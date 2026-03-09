@@ -1,143 +1,192 @@
-## 1) Install Python 3.10 (if not available)
+# Net-Zero Predictions Follow-Up
 
-If Python version is 3.14 or higher some modules may not work. For stability 3.10 is recommended.
+This repository runs a country-level data pipeline for net-zero target analysis and model training. It downloads public-source data, combines it with a few manual input files, builds features, and saves training outputs in `results/`.
 
-1. Download Python 3.10 for Windows from the official site:
+This project was originally developed with Python 3.12. Use Python 3.10–3.12 to create the virtual environment; Python 3.13+ may fail to build scipy.
 
-   - Go to: https://www.python.org/downloads/release/python-310/
-   - Download the **Windows installer (64-bit)**.
-2. Run the installer and make these choices:
+## Setup Environment
 
-   - ✅ **Install launcher for all users (recommended)** (this installs `py.exe`)
-   - ✅ **Add python.exe to PATH** (optional; `py` is the more reliable way)
-   - Choose **Customize installation** (optional), but make sure it installs normally.
+### Windows
 
-This will install Python 3.10 *alongside* other versions.
-
----
-
-## 2) Verify Python 3.10 is available (in VS Code terminal)
-
-Open **VS Code → Terminal → New Terminal**.
-
-### PowerShell
-
-List all installed Python versions known to the launcher:
+From the project root:
 
 ```powershell
-py -0p
-```
-
-You should see an entry for `-3.10 ...`.
-
-Confirm 3.10 runs:
-
-```powershell
-py -3.10 --version
-```
-
-If that prints `Python 3.10.x`, you’re good.
-
----
-
-## 3) Create a project virtual environment using Python 3.10
-
-In the VS Code terminal, `cd` into your project folder (where you want `.venv`):
-
-```powershell
-cd path\to\your\project
-```
-
-Create `.venv` with Python 3.10:
-
-```powershell
-py -3.10 -m venv .venv
-```
-
----
-
-## 4) Activate the `.venv` in the VS Code terminal
-
-### PowerShell (VS Code default on many systems)
-
-```powershell
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install setuptools
+pip install -r requirements.txt
 ```
 
-If you get an execution policy error, run this once (per terminal session) and try again:
+If `python` does not work, try `py` instead.
+
+If PowerShell blocks activation, run this once and then try again:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-### Command Prompt (if your VS Code terminal is cmd.exe)
+If you use Command Prompt instead of PowerShell, activate the environment with:
 
 ```bat
 .\.venv\Scripts\activate.bat
 ```
 
----
+### macOS
 
-## 5) Tell VS Code to use this interpreter (important)
+From the project root:
 
-VS Code may not automatically switch to the new `.venv`.
-
-1. Press `Ctrl+Shift+P`
-2. Search: **Python: Select Interpreter**
-3. Pick the interpreter that looks like:
-   - `...\.venv\Scripts\python.exe`
-
-You should see the selected interpreter in the bottom status bar.
-
----
-
-## 6) Confirm everything is correct
-
-In the activated terminal:
-
-```powershell
-python --version
-python -c "import sys; print(sys.executable)"
-```
-
-You should see Python 3.10.x and a path containing `\.venv\`.
-
----
-
-## 7) Upgrade pip + install dependencies
-
-```powershell
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip
+pip install setuptools
 pip install -r requirements.txt
 ```
 
+If `python3` is not available, install Python first.
 
-## 8) Deactivate when done
+## Prepare the Data Folders
 
-```bash
-deactivate
-```
+Create these folders before running the pipeline:
 
----
-
-## Common issues
-
-### `py` is not recognized
-
-- Re-run the Python 3.10 installer and ensure **Python Launcher** is enabled.
-- Or install the launcher via the official installer again.
-
-### VS Code keeps using a different Python
-
-- Run **Python: Select Interpreter** and choose the `.venv` one.
-- Restart the terminal after selecting it.
-
-### PowerShell activation is blocked
-
-Use:
+### Windows
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+mkdir data\raw
+mkdir data\netzero
 ```
 
-This is temporary and only affects the current terminal session.
+### macOS
+
+```bash
+mkdir -p data/raw data/netzero
+```
+
+Your folder structure should look like this:
+
+```text
+data/
+  raw/
+    8624f431-en_2023.csv
+  netzero/
+    Reduction rates NZ targets_26March2024.xlsx
+    results_18December2025.csv
+```
+
+## Manual Files Required Before Running
+
+Add these files manually before running the code:
+
+- `data/raw/8624f431-en_2023.csv`
+  IEA data. This file is not publicly available and must be added manually.
+- `data/netzero/Reduction rates NZ targets_26March2024.xlsx`
+  Net-zero pledged years of countries. This file must be added manually.
+- `data/netzero/results_18December2025.csv`
+  2030 current-policy projections and net-zero pledged years by country. This file must be added manually.
+
+All other data is downloaded automatically by the scripts through API access or scripted downloads.
+
+`merge_target.py` may also create `data/netzero/population_estimate.csv` automatically if it is missing.
+
+## Run the Current Code
+
+From the repository root, run:
+
+```bash
+python main.py
+```
+
+This runs the full pipeline:
+
+- download
+- process
+- merge
+- clean
+- train
+
+Current pipeline stages:
+
+| Stage    | Script                      | Output                                |
+| -------- | --------------------------- | ------------------------------------- |
+| download | `download.py`             | files in `data/raw/`                |
+| process  | `process.py`              | files in `data/processed/`          |
+| merge    | `merge_target.py`         | `data/merged/merged.csv`            |
+| clean    | `cleaning_engineering.py` | `data/cleaned/cleaned_features.csv` |
+| train    | `training.py`             | files in `results/`                 |
+
+## Run Only Part of the Pipeline
+
+Examples:
+
+```bash
+python main.py --from process
+python main.py --stages download process
+python main.py --skip train
+python main.py --no-skip-existing
+```
+
+Existing outputs make stages skip automatically. Use `--no-skip-existing` to force the stages to run again.
+
+## Outputs
+
+After a full run, the main outputs are:
+
+- `data/processed/`
+- `data/merged/merged.csv`
+- `data/cleaned/cleaned_features.csv`
+- `results/final_models.pkl`
+- `results/clustering_results.xlsx`
+- `results/*.png`
+
+## Automatically Downloaded Sources
+
+The scripts automatically fetch public data such as:
+
+- INFORM
+- PRIMAP-hist
+- V-Dem
+- RSF files
+- World Bank indicators
+- Data360 protein supply
+- UN population projections
+
+## Reproduce Pipeline (Old Code Rewrite)
+
+The `reproduce/` directory contains a modular rewrite of `old/FinalCode_rev.py`, decomposed into focused scripts with all hard-coded values in `reproduce/config.json`.
+
+### Quick Start
+
+```bash
+cd reproduce
+python main.py
+```
+
+### Scripts
+
+| Script                   | Output                              | Description                                    |
+| ------------------------ | ----------------------------------- | ---------------------------------------------- |
+| `data_loading.py`        | `data/01_*.csv`                     | Load raw data, merge, EU aggregation           |
+| `feature_engineering.py` | `data/02_features.csv`              | Feature creation, trends, VIF reduction        |
+| `target_variable.py`     | `data/03_target.csv`                | Cumulative per-capita emissions target         |
+| `clustering.py`          | `data/04_indep_dep.xlsx`            | KMeans, HDBSCAN, PCA, reference clusters       |
+| `training.py`            | `data/05_models.pkl`                | XGBoost + LR with parallel iterations          |
+| `prediction.py`          | `data/06_mean_net_zero_years.xlsx`  | SHAP analysis, net-zero year prediction        |
+
+### Configuration
+
+Edit `reproduce/config.json` to switch between data sources:
+
+- `"data_source": "old"` — uses original static files from `old/data/`
+- `"data_source": "new"` — uses `data/merged/merged.csv` from the current pipeline
+
+Key settings: `target.start_year` (2021 or 2024), `target.alpha` (1.0=linear), `training.num_iterations`, `training.parallelize`.
+
+## Troubleshooting
+
+- If `python` or `python3` is not found, install Python and try again.
+- If the virtual environment does not activate, check that you are in the project root and retry the activation command for your operating system.
+- If the pipeline fails early, make sure the required manual files are present in `data/raw` and `data/netzero`.
+- The automatic download steps need internet access.
+- If scipy fails to build when installing requirements, switch to Python 3.12 or earlier to create the virtual environment.
+- If a stage seems to do nothing, its output may already exist. Run again with `python main.py --no-skip-existing`.

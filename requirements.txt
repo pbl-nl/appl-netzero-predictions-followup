@@ -1,0 +1,14 @@
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.14.1
+scikit-learn==1.5.2
+statsmodels==0.14.4
+matplotlib==3.9.2
+seaborn==0.13.2
+xgboost==2.1.4
+hyperopt==0.2.7
+openpyxl==3.1.5
+requests==2.32.3
+joblib==1.4.2
+shap==0.46.0
+hdbscan==0.8.39

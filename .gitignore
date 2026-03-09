@@ -33,11 +33,15 @@ venv/
 *.joblib
 *.png
 *.html
+!reproduce/config.json
 
 # --- Project artifacts / data folders ---
 data/iea/raw/
 output/
 image/
+data/
+results/
 
 # --- Claude / agent tooling directories ---
 .claude/
+old
