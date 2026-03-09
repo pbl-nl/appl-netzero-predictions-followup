@@ -155,6 +155,18 @@ The scripts automatically fetch public data such as:
 
 The `reproduce/` directory contains a modular rewrite of `old/FinalCode_rev.py`, decomposed into focused scripts with all hard-coded values in `reproduce/config.json`.
 
+### Prerequisites
+
+Before running the reproduce pipeline, ensure one of the following conditions is met depending on your `data_source` setting in `reproduce/config.json`:
+
+- **`"data_source": "old"`** — The original static data files in `old/data/` must be present. These are not downloaded automatically; the expected file paths are listed under `"paths"` in `reproduce/config.json`.
+- **`"data_source": "new"`** — The file `data/merged/merged.csv` must exist. Run the following from the repository root first:
+  ```bash
+  python download.py
+  python process.py
+  python merge_target.py
+  ```
+
 ### Quick Start
 
 ```bash
@@ -164,14 +176,14 @@ python main.py
 
 ### Scripts
 
-| Script                   | Output                              | Description                                    |
-| ------------------------ | ----------------------------------- | ---------------------------------------------- |
-| `data_loading.py`        | `data/01_*.csv`                     | Load raw data, merge, EU aggregation           |
-| `feature_engineering.py` | `data/02_features.csv`              | Feature creation, trends, VIF reduction        |
-| `target_variable.py`     | `data/03_target.csv`                | Cumulative per-capita emissions target         |
-| `clustering.py`          | `data/04_indep_dep.xlsx`            | KMeans, HDBSCAN, PCA, reference clusters       |
-| `training.py`            | `data/05_models.pkl`                | XGBoost + LR with parallel iterations          |
-| `prediction.py`          | `data/06_mean_net_zero_years.xlsx`  | SHAP analysis, net-zero year prediction        |
+| Script                     | Output                               | Description                              |
+| -------------------------- | ------------------------------------ | ---------------------------------------- |
+| `data_loading.py`        | `data/01_*.csv`                    | Load raw data, merge, EU aggregation     |
+| `feature_engineering.py` | `data/02_features.csv`             | Feature creation, trends, VIF reduction  |
+| `target_variable.py`     | `data/03_target.csv`               | Cumulative per-capita emissions target   |
+| `clustering.py`          | `data/04_indep_dep.xlsx`           | KMeans, HDBSCAN, PCA, reference clusters |
+| `training.py`            | `data/05_models.pkl`               | XGBoost + LR with parallel iterations    |
+| `prediction.py`          | `data/06_mean_net_zero_years.xlsx` | SHAP analysis, net-zero year prediction  |
 
 ### Configuration
 
@@ -180,7 +192,7 @@ Edit `reproduce/config.json` to switch between data sources:
 - `"data_source": "old"` — uses original static files from `old/data/`
 - `"data_source": "new"` — uses `data/merged/merged.csv` from the current pipeline
 
-Key settings: `target.start_year` (2021 or 2024), `target.alpha` (1.0=linear), `training.num_iterations`, `training.parallelize`.
+Key settings: `target.start_year` (2021), `target.alpha` (1.0=linear), `training.num_iterations`, `training.parallelize`.
 
 ## Troubleshooting
 
