@@ -210,7 +210,7 @@ def flatten_world_bank_row(row):
         "indicator_name": indicator.get("value"),
         "country_id": country.get("id"),
         "country_name": country.get("value"),
-        "countryiso3code": row.get("countryiso3code") if isinstance(row, dict) else None,
+        "countryiso3code": (row.get("countryiso3code") or country.get("id")) if isinstance(row, dict) else None,
         "date": row.get("date") if isinstance(row, dict) else None,
         "value": row.get("value") if isinstance(row, dict) else None,
         "unit": row.get("unit") if isinstance(row, dict) else None,

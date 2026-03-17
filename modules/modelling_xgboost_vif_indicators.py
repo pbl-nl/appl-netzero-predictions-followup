@@ -1,0 +1,361 @@
+import os
+import datetime
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedKFold
+import statsmodels.api as sm
+import xgboost as xgb
+from hyperopt import STATUS_OK, fmin, tpe, Trials
+from functools import partial
+
+from modules.config_loader import load_config
+
+
+config = load_config()
+
+
+# Define XGBoost objective function
+def objective_XGBoost(params, dtrain, folds, seed):
+    # params['device'] = 'cuda'
+    # params['tree_method'] = 'hist'
+    params['max_depth'] = int(params['max_depth'])
+    params['min_child_weight'] = int(params['min_child_weight'])
+    params['eval_metric'] = 'rmse'
+    cv_results = xgb.cv(params=params, dtrain=dtrain, num_boost_round=config["XGBoost"]["num_boost_round"], folds=folds,
+                        metrics='rmse', early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"], seed=seed)
+    return {'loss': cv_results['test-rmse-mean'].min(),
+            'status': STATUS_OK,
+            'num_boost_rounds': cv_results['test-rmse-mean'].idxmin()}
+
+
+def apply_XGBoost(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration):
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+
+    # Create stratified folds for cross-validation
+    folds = create_stratified_folds(X_train, y_train, clusters.loc[X_train.index], random_seed=seed)
+
+    # Define hyperparameter search
+    trials = Trials()
+    # Use partial to bind dtrain to the objective function
+    objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain, folds=folds, seed=seed)
+    best_hyperparams = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
+                            max_evals=config["XGBoost"]["num_trials"], trials=trials)
+    best_rmse = min([trial['result']['loss'] for trial in trials.trials])
+
+    # Collect data for this iteration instead of seed
+    for trial in trials.trials:
+        if trial['result']['status'] == 'ok':
+            trial_result = {
+                'loss': trial['result']['loss'],
+                **{k: v[0] for k, v in trial['misc']['vals'].items()}
+            }
+            # print(f"Appending result to iteration {iteration}")
+            all_results[iteration].append(trial_result)
+
+    evals_result = {}
+
+    # Perform hyperparameter optimisation
+    final_model = xgb.train(params={**best_hyperparams, 'eval_metric': 'rmse'},
+                            dtrain=dtrain,
+                            num_boost_round=config["XGBoost"]["num_boost_round"],
+                            evals=[(dtrain, 'train'), (dtest, 'test')],
+                            evals_result=evals_result,
+                            verbose_eval=False,
+                            early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"])
+
+    return final_model, evals_result, best_rmse, best_hyperparams
+
+
+def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration):
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+
+    # Create stratified folds for cross-validation
+    folds = create_stratified_folds(X_train, y_train, clusters.loc[X_train.index], random_seed=seed)
+
+    # Define hyperparameter search
+    trials = Trials()
+    # Use partial to bind dtrain to the objective function
+    objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain, folds=folds, seed=seed)
+    best_hyperparams = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
+                            max_evals=config["XGBoost"]["num_trials"], trials=trials)
+    # best_rmse = min([trial['result']['loss'] for trial in trials.trials])
+
+    # # Collect data for this iteration instead of seed
+    # for trial in trials.trials:
+    #     if trial['result']['status'] == 'ok':
+    #         trial_result = {
+    #             'loss': trial['result']['loss'],
+    #             **{k: v[0] for k, v in trial['misc']['vals'].items()}
+    #         }
+    #         # print(f"Appending result to iteration {iteration}")
+    #         all_results[iteration].append(trial_result)
+
+    evals_result = {}
+
+    # Perform hyperparameter optimisation
+    final_model = xgb.train(params={**best_hyperparams, 'eval_metric': 'rmse'},
+                            dtrain=dtrain,
+                            num_boost_round=config["XGBoost"]["num_boost_round"],
+                            evals=[(dtrain, 'train'), (dtest, 'test')],
+                            evals_result=evals_result,
+                            verbose_eval=False,
+                            early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"])
+
+    # Collect training and testing RMSE values for this iteration
+    # training_rmse_all_iterations.append(evals_result['train']['rmse'])
+    # testing_rmse_all_iterations.append(evals_result['test']['rmse'])
+
+    best_features_dict = get_top_features_dict(final_model)
+    # keys = list(best_features.keys())
+    # values = list(best_features.values())
+    # data = pd.DataFrame(data=values, index=keys, columns=["score"]).sort_values(by = "score", ascending=True)
+    # data.plot(kind='barh', figsize=(10,10))
+    # plot_filename = os.path.join(config["output_path"], 'XGBoost feature importance iteration ' + str(iteration) + '.png')
+    # plt.savefig(plot_filename)
+
+    # ##############################################################################################################################################################
+    # Second part of iteration: reduce modeling procedure to top 7 features only
+    # Sort the dictionary by values in descending order
+    # sorted_best_features_dict = sorted(best_features_dict.items(), key=lambda item: item[1], reverse=True)
+
+    # Select the top 7 best features:
+    # Convert dictionary items to a list and slice the first 7 items
+    chosen_features_list = list(best_features_dict.items())[:7]
+    chosen_features_dict = dict(chosen_features_list)
+    chosen_features = list(chosen_features_dict.keys())
+
+    # Guard: if no features were recorded (can happen when early stopping fires at
+    # round 0 on a very small dataset so no splits are made), fall back to all
+    # columns so the second-stage DMatrix is never empty.
+    if not chosen_features:
+        chosen_features = list(X_train.columns)
+        chosen_features_dict = {f: 0 for f in chosen_features}
+
+    # reduce training dataset
+    X_train_top = X_train[chosen_features]
+    X_test_top = X_test[chosen_features]
+
+    # create reduced training set for XGBoost
+    dtrain_top = xgb.DMatrix(X_train_top, label=y_train)
+    dtest_top = xgb.DMatrix(X_test_top, label=y_test)
+
+    # Define hyperparameter search
+    trials = Trials()
+    # Use partial to bind dtrain to the objective function
+    objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain_top, folds=folds, seed=seed)
+    best_hyperparams_top = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
+                                max_evals=config["XGBoost"]["num_trials"], trials=trials)
+    best_rmse_top = min([trial['result']['loss'] for trial in trials.trials])
+
+    # # Collect data for this iteration instead of seed
+    # for trial in trials.trials:
+    #     if trial['result']['status'] == 'ok':
+    #         trial_result = {
+    #             'loss': trial['result']['loss'],
+    #             **{k: v[0] for k, v in trial['misc']['vals'].items()}
+    #         }
+    #         # print(f"Appending result to iteration {iteration}")
+    #         # all_results[iteration].append(trial_result)
+
+    evals_result_top = {}
+
+    # Perform hyperparameter optimisation
+    final_model_top = xgb.train(params={**best_hyperparams_top, 'eval_metric': 'rmse'},
+                                dtrain=dtrain_top,
+                                num_boost_round=config["XGBoost"]["num_boost_round"],
+                                evals=[(dtrain_top, 'train'), (dtest_top, 'test')],
+                                evals_result=evals_result_top,
+                                verbose_eval=False,
+                                early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"]
+                                )
+
+    return final_model_top, evals_result_top, chosen_features_dict, best_rmse_top, best_hyperparams_top, dtest_top
+
+
+def save_checkpoint(checkpoint_dir, final_models, cluster_iteration_results, all_results,
+                    training_rmse_all_iterations, testing_rmse_all_iterations):
+    joblib.dump(final_models, os.path.join(checkpoint_dir, 'final_models.pkl'))
+    joblib.dump(cluster_iteration_results, os.path.join(checkpoint_dir, 'cluster_iteration_results.pkl'))
+    joblib.dump(all_results, os.path.join(checkpoint_dir, 'all_results.pkl'))
+    joblib.dump(training_rmse_all_iterations, os.path.join(checkpoint_dir, 'training_rmse_all_iterations.pkl'))
+    joblib.dump(testing_rmse_all_iterations, os.path.join(checkpoint_dir, 'testing_rmse_all_iterations.pkl'))
+
+
+def get_top_features(model, X, top_n=7):
+    feature_importances = model.get_score(importance_type='weight')
+    sorted_features = sorted(feature_importances, key=feature_importances.get, reverse=True)[:top_n]
+    return sorted_features
+
+
+def get_top_features_dict(model):
+    feature_importances = model.get_score(importance_type='weight')
+    sorted_feature_importances = dict(sorted(feature_importances.items(), key=lambda item: item[1], reverse=True))
+    return sorted_feature_importances
+
+
+def create_stratified_folds(X, y, clusters, n_splits=4, random_seed=123):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+    folds = []
+    for train_idx, test_idx in skf.split(X, clusters):
+        folds.append((train_idx.tolist(), test_idx.tolist()))
+    return folds
+
+
+# Function to perform backward elimination based on p-values
+def backward_elimination(X, y, significance_level=0.05):
+    features = X.columns.tolist()
+    while True:
+        X_with_intercept = sm.add_constant(X[features])
+        model = sm.OLS(y, X_with_intercept).fit()
+        p_values = model.pvalues
+        max_p_value = p_values.max()
+        if max_p_value > significance_level:
+            excluded_feature = p_values.idxmax()
+            features.remove(excluded_feature)
+        else:
+            break
+    return features, model
+
+
+def plot_hyperparam_effects_complete(all_results):
+    plt.rcParams['figure.dpi'] = 300
+    plt.figure(figsize=(18, 12))
+    all_data = pd.concat([pd.DataFrame(data) for data in all_results.values()], ignore_index=True)
+
+    # Parameters for which box plots are suitable
+    # boxplot_params = ['max_depth', 'min_child_weight']
+    boxplot_params = ['max_depth', 'min_child_weight']
+    # Parameters for which density or scatter plots are more suitable
+    other_params = ['learning_rate', 'reg_alpha', 'reg_lambda', 'gamma', 'subsample', 'colsample_bytree']
+    # other_params = ['learning_rate', 'reg_alpha', 'reg_lambda']
+
+    for i, param in enumerate(boxplot_params):
+        plt.subplot(2, 4, i + 1)
+        sns.boxplot(x=param, y='loss', data=all_data)
+        plt.title(f'{param}', size=20)
+        plt.xlabel('')
+        plt.ylabel('Loss', size=20)
+
+        # Adjust x-axis ticks to display 3 instead of 0
+        if param in ['max_depth', 'min_child_weight']:
+            ticks = plt.gca().get_xticks()
+            labels = [int(tick) + 3 if int(tick) == 0 else int(tick) for tick in ticks]
+            plt.gca().set_xticklabels(labels)
+
+    for i, param in enumerate(other_params):
+        plt.subplot(2, 4, i + 3)  # Adjust indexing based on the number of box plots
+        if all_data[param].nunique() > 20:
+            sns.histplot(all_data, x=param, y='loss', bins=30, pthresh=.1, cmap="mako")
+        else:
+            sns.scatterplot(x=param, y='loss', data=all_data, palette="viridis")
+        plt.title(f'{param}', size=20)
+        plt.xlabel('')
+        plt.ylabel('Loss', size=20)
+
+    # # Generate the filename with current date and time
+    current_time = datetime.datetime.now().strftime("%m%d%H%M")
+    # filename = f"{current_time}_hyperparameter_optimisation.png"
+    # plt.savefig(filename)
+
+    plt.tight_layout()
+    filename = os.path.join(config["output_path"], "hyperparameter_optimisation.png")
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_train_test_mse(training_rmse_all_iterations, testing_rmse_all_iterations):
+    for i in range(len(training_rmse_all_iterations)):
+        # Plot each iteration's MSE values
+        plt.plot(training_rmse_all_iterations[i], label=f'Iteration {i+1} Training MSE', alpha=0.7, color='blue')
+        plt.plot(testing_rmse_all_iterations[i], label=f'Iteration {i+1} Testing MSE', alpha=1, color='orange')
+
+    plt.xlabel('Boosting Rounds')
+    plt.ylabel('Mean Squared Error')
+    plt.title('Training and Testing Mean Squared Error (Separate Iterations)')
+    plt.grid(True)
+    plt.tight_layout()
+
+    # # Generate the filename with current date and time
+    # current_time = datetime.datetime.now().strftime("%m%d%H%M")
+    # filename = f"{current_time}_train_test_mse.png"
+    # plt.savefig(filename)
+    filename = os.path.join(config["output_path"], "Training and Testing Mean Squared Error (Separate Iterations).png")
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_trials(all_results):
+    plt.rcParams['figure.dpi'] = 300
+    # Gather all losses per evaluation
+    evaluations_losses = {}
+
+    for iteration, results in all_results.items():
+        for eval_num, result in enumerate(results, start=1):
+            if eval_num not in evaluations_losses:
+                evaluations_losses[eval_num] = []
+            evaluations_losses[eval_num].append(result['loss'])
+
+    # Compute the average loss for each evaluation
+    avg_losses = {eval_num: np.mean(losses) for eval_num, losses in evaluations_losses.items()}
+
+    # Sort the evaluations to ensure proper plotting
+    sorted_evals = sorted(avg_losses.keys())
+    sorted_avg_losses = [avg_losses[eval_num] for eval_num in sorted_evals]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(sorted_evals, sorted_avg_losses, label='Average Validation Loss', linestyle='-', color='orange')
+
+    plt.xlabel('Evaluations')
+    plt.ylabel('Loss')
+    # plt.title('Average Validation Loss Over Evaluations')
+    plt.legend()
+    plt.grid(True)
+
+    # # Generate the filename with current date and time
+    # current_time = datetime.datetime.now().strftime("%m%d%H%M")
+    # filename = f"{current_time}_average_validation_loss.png"
+    # plt.savefig(filename)
+    filename = os.path.join(config["output_path"], "Average Validation Loss Over Evaluations.png")
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_metrics_comparison(clustering_results_df):
+    # Define the metrics
+    loss_metrics = ['MAE', 'MSE']
+    score_metrics = ['R2', 'Explained Variance']
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12), sharex=True)
+
+    # Plot loss metrics
+    sns.boxplot(x='Cluster Type',
+                y='value',
+                hue='variable',
+                data=clustering_results_df.melt(id_vars=['Cluster Type'], value_vars=loss_metrics), ax=ax1)
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Comparison of Loss Metrics Across Cluster Types')
+    ax1.legend(title='Metric')
+
+    # Plot score metrics
+    sns.boxplot(x='Cluster Type',
+                y='value',
+                hue='variable',
+                data=clustering_results_df.melt(id_vars=['Cluster Type'], value_vars=score_metrics), ax=ax2)
+    ax2.set_ylabel('Score')
+    ax2.set_title('Comparison of Score Metrics Across Cluster Types')
+    ax2.legend(title='Metric')
+
+    # Set x-axis label
+    ax2.set_xlabel('Cluster Type')
+    ax2.set_xticklabels(clustering_results_df['Cluster Type'].unique(), rotation=45)
+
+    # Adjust the layout for better fit
+    fig.tight_layout()
+    filename = os.path.join(config["output_path"], "Comparison of Metrics Across Cluster Types.png")
+    plt.savefig(filename)
+    plt.close(fig)

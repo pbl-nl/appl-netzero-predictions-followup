@@ -4,14 +4,12 @@ import sys
 import os
 import time
 
-STAGES = ["download", "process", "merge", "clean", "train"]
+STAGES = ["download", "process", "merge"]
 
 STAGE_CONFIG = {
     "download": {"script": "download.py",             "sentinel": "data/raw/primap.csv"},
     "process":  {"script": "process.py",              "sentinel": "data/processed/worldbank.csv"},
     "merge":    {"script": "merge_target.py",         "sentinel": "data/merged/merged.csv"},
-    "clean":    {"script": "cleaning_engineering.py", "sentinel": "data/cleaned/cleaned_features.csv"},
-    "train":    {"script": "training.py",             "sentinel": "results/final_models.pkl"},
 }
 
 
@@ -20,7 +18,7 @@ def parse_args():
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--stages", nargs="+", choices=STAGES, metavar="STAGE",
-        help="Run only these stages (any of: download, process, merge, clean, train).",
+        help="Run only these stages (any of: download, process, merge).",
     )
     group.add_argument(
         "--from", dest="from_stage", choices=STAGES, metavar="STAGE",

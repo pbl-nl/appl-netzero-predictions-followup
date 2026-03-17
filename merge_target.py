@@ -48,6 +48,13 @@ IEA_COUNTRY_CATCHES = {
 }
 EXTRA_VALID_ISOS = {"XKX", "ANT"}
 
+# World Bank internal aggregate codes that are 3-letter alpha but not ISO 3166-1 countries.
+# Source 18 (IDA Results Measurement System) returns these alongside real country rows.
+WB_AGGREGATE_CODES = {
+    "DEA", "DEC", "IDB", "DFS", "DNF", "IDX",
+    "IDA", "DLA", "DMN", "DSA", "DSS",
+}
+
 
 def clean_column_name(name: str) -> str:
     text = str(name).strip().lower()
@@ -95,6 +102,8 @@ def parse_numeric_code(value: object) -> str | None:
 
 def is_valid_country_code(code: object) -> bool:
     if not isinstance(code, str):
+        return False
+    if code in WB_AGGREGATE_CODES:
         return False
     return (len(code) == 3 and code.isalpha()) or (code in EXTRA_VALID_ISOS)
 
