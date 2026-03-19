@@ -33,8 +33,11 @@ venv/
 *.html
 !modules/config.json
 
+# Allow archived source files in old_data/
+!data/old_data/
+!data/old_data/**
+
 # --- Project artifacts / data folders ---
-data/old_data/
 data/old_reproduce/
 data/new_reproduce/
 data/processed/
