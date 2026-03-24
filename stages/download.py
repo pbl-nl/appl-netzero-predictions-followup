@@ -35,6 +35,7 @@ STATIC_SOURCES = [
         "kind": "xlsx",
         "url": "https://drmkc.jrc.ec.europa.eu/inform-index/Portals/0/InfoRM/2025/INFORM2024_TREND_2015_2024_v70_ALL.xlsx",
         "filename": "inform.xlsx",
+        "use_browser_agent": False,
     },
     {
         "name": "primap",
@@ -127,7 +128,7 @@ def save_bytes(path, content):
 
 
 def download_binary_file(source):
-    content = get_response(source["url"], use_browser_agent=True)
+    content = get_response(source["url"], use_browser_agent=source.get("use_browser_agent", True))
     path = os.path.join(DATA_DIR, source["filename"])
     save_bytes(path, content)
     logging.info("Downloaded %s -> %s", source["name"], path)
@@ -275,7 +276,7 @@ def download_all(static_sources, world_bank_sources):
     return failed_downloads
 
 
-def main():
+def run():
     ensure_data_dir()
     static_sources = build_sources()
     world_bank_sources = [dict(source) for source in WORLD_BANK_SOURCES]
@@ -287,4 +288,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()

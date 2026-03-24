@@ -467,7 +467,7 @@ def process_worldbank():
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
-def main():
+def run():
     os.makedirs(OUT_DIR, exist_ok=True)
     process_iea()
     process_inform()
@@ -479,4 +479,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run()

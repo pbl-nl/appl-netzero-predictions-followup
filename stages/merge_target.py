@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+from glob import glob
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +12,7 @@ import requests
 
 log = logging.getLogger(__name__)
 
-
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 NETZERO_DIR = DATA_DIR / "netzero"
@@ -20,10 +20,10 @@ OUTPUT_PATH = DATA_DIR / "merged" / "merged.csv"
 
 START_YEAR = 2000
 END_YEAR = 2024
-PATH_START_YEAR = 2024
 PATH_MID_YEAR = 2030
-NZ_YEAR_CAP = 2100
 SCALE = 1e6
+
+NZ_XLSX = "Reduction rates NZ target revised_23Feb2026.xlsx"
 
 SCENARIO_ALPHAS = {
     "linear": 1.0,
@@ -31,15 +31,6 @@ SCENARIO_ALPHAS = {
     "pessimistic": 0.5,
 }
 
-# Catches from target.ipynb + merge config logic.
-NUMERIC_ISO_CATCHES = {
-    "891": "SRB",  # Serbia
-    "530": "ANT",  # Netherlands Antilles
-    "736": "SDN",  # Sudan
-}
-NAME_ISO_CATCHES = {
-    "united arab emirates": "ARE",
-}
 IEA_COUNTRY_CATCHES = {
     "MALI": "MLI",
     "KOSOVO": "XKX",
@@ -48,13 +39,33 @@ IEA_COUNTRY_CATCHES = {
 }
 EXTRA_VALID_ISOS = {"XKX", "ANT"}
 
-# World Bank internal aggregate codes that are 3-letter alpha but not ISO 3166-1 countries.
-# Source 18 (IDA Results Measurement System) returns these alongside real country rows.
+# World Bank internal aggregate codes (3-letter alpha but not real countries).
 WB_AGGREGATE_CODES = {
     "DEA", "DEC", "IDB", "DFS", "DNF", "IDX",
     "IDA", "DLA", "DMN", "DSA", "DSS",
 }
 
+# ---------------------------------------------------------------------------
+# Population download constants (UN World Population Prospects 2024)
+# ---------------------------------------------------------------------------
+POPULATION_URL = (
+    "https://population.un.org/wpp/assets/Excel%20Files/"
+    "1_Indicator%20(Standard)/EXCEL_FILES/1_General/"
+    "WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT.xlsx"
+)
+POPULATION_SHEET = "Medium variant"
+POPULATION_SKIP_ROWS = 16
+POPULATION_MULTIPLIER = 1000
+POPULATION_SOURCE_COLS = {
+    "ISO3 Alpha-code": "country",
+    "Year": "year",
+    "Total Population, as of 1 July (thousands)": "population_estimate",
+}
+
+
+# ==========================================================================
+# Utility functions
+# ==========================================================================
 
 def clean_column_name(name: str) -> str:
     text = str(name).strip().lower()
@@ -76,14 +87,6 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def normalize_country_name(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    text = str(value).strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
 def normalize_country_code(value: object) -> str | None:
     if pd.isna(value):
         return None
@@ -91,13 +94,6 @@ def normalize_country_code(value: object) -> str | None:
     if text in {"", "NAN", "NONE"}:
         return None
     return text
-
-
-def parse_numeric_code(value: object) -> str | None:
-    try:
-        return f"{int(float(value)):03d}"
-    except (TypeError, ValueError):
-        return None
 
 
 def is_valid_country_code(code: object) -> bool:
@@ -135,6 +131,10 @@ def dedupe_country_year(df: pd.DataFrame) -> pd.DataFrame:
         .first()
     )
 
+
+# ==========================================================================
+# Data loaders (processed CSVs -> DataFrames)
+# ==========================================================================
 
 def load_iea() -> pd.DataFrame:
     df = pd.read_csv(PROCESSED_DIR / "iea.csv")
@@ -224,6 +224,10 @@ def load_worldbank() -> pd.DataFrame:
     return dedupe_country_year(pivot)
 
 
+# ==========================================================================
+# Merge panel
+# ==========================================================================
+
 def build_merged_panel() -> pd.DataFrame:
     frames = [
         load_iea(),
@@ -259,81 +263,47 @@ def build_merged_panel() -> pd.DataFrame:
     return merged.sort_values(["country", "year"]).reset_index(drop=True)
 
 
-def load_nz_targets() -> pd.DataFrame:
-    df = pd.read_excel(
-        NETZERO_DIR / "Reduction rates NZ targets_26March2024.xlsx",
-        header=11,
-        sheet_name="NZ targets",
-        usecols=["Code", "Country name", "NZ GHG year"],
+# ==========================================================================
+# NZ data from 2026 xlsx
+# ==========================================================================
+
+def load_nz_data() -> pd.DataFrame:
+    """Load NZ GHG year and currpol_2030_median from the revised 2026 xlsx.
+
+    Reads two sheets and joins on numeric isocode:
+      - "NZ targets":       ISO Code (3-letter), NZ GHG year.1 (2026 column)
+      - "Emissions NDC Tool": currpol_2030_median
+
+    Returns DataFrame with columns: iso3, nz_ghg_year, currpol_2030_median
+    """
+    xlsx_path = NETZERO_DIR / NZ_XLSX
+
+    nz = pd.read_excel(
+        xlsx_path, sheet_name="NZ targets", skiprows=7,
+        usecols=["isocode", "ISO Code", "NZ GHG year.1"],
     )
-    df = df.rename(
-        columns={
-            "Code": "iso3",
-            "Country name": "country_name",
-            "NZ GHG year": "net_zero_year",
-        }
+    nz = nz.rename(columns={"ISO Code": "iso3", "NZ GHG year.1": "nz_ghg_year"})
+    nz["nz_ghg_year"] = pd.to_numeric(nz["nz_ghg_year"], errors="coerce")
+
+    emi = pd.read_excel(
+        xlsx_path, sheet_name="Emissions NDC Tool", skiprows=7,
+        usecols=["isocode", "currpol_2030_median"],
     )
-    df["iso3"] = df["iso3"].apply(normalize_country_code)
-    df = df.dropna(subset=["iso3"])
-    df["net_zero_year"] = pd.to_numeric(df["net_zero_year"], errors="coerce")
-    df["net_zero_year"] = df["net_zero_year"].fillna(NZ_YEAR_CAP).astype(int)
-    df["net_zero_year"] = df["net_zero_year"].clip(upper=NZ_YEAR_CAP)
-    df["name_key"] = df["country_name"].apply(normalize_country_name)
-    df = df[df["iso3"].str.fullmatch(r"[A-Z]{3}", na=False)]
-    return df[["iso3", "name_key", "net_zero_year"]].drop_duplicates(subset=["iso3"])
+    emi["currpol_2030_median"] = pd.to_numeric(emi["currpol_2030_median"], errors="coerce")
+
+    result = nz.merge(emi, on="isocode", how="left")
+    result["iso3"] = result["iso3"].str.strip().str.upper()
+    result = result[result["iso3"].str.fullmatch(r"[A-Z]{3}", na=False)]
+    return result[["iso3", "nz_ghg_year", "currpol_2030_median"]].drop_duplicates(subset=["iso3"])
 
 
-def load_currpol_targets(name_to_iso: dict[str, str]) -> pd.DataFrame:
-    df = pd.read_csv(
-        NETZERO_DIR / "results_18December2025.csv",
-        sep=";",
-        comment="#",
-        engine="python",
-        usecols=["isocode", "country_name", "currpol_2030_median"],
-    )
-    df["currpol_2030_median"] = pd.to_numeric(df["currpol_2030_median"], errors="coerce")
-    df["name_key"] = df["country_name"].apply(normalize_country_name)
-    df["iso3"] = df["name_key"].map(name_to_iso)
-    df["numeric_code"] = df["isocode"].apply(parse_numeric_code)
-
-    numeric_hits = df["numeric_code"].isin(NUMERIC_ISO_CATCHES)
-    df.loc[numeric_hits, "iso3"] = df.loc[numeric_hits, "numeric_code"].map(NUMERIC_ISO_CATCHES)
-
-    name_hits = df["name_key"].isin(NAME_ISO_CATCHES)
-    df.loc[name_hits, "iso3"] = df.loc[name_hits, "name_key"].map(NAME_ISO_CATCHES)
-
-    df = df.dropna(subset=["iso3", "currpol_2030_median"])
-    df["iso3"] = df["iso3"].apply(normalize_country_code)
-    df = df[df["iso3"].str.fullmatch(r"[A-Z]{3}", na=False)]
-    return (
-        df[["iso3", "currpol_2030_median"]]
-        .sort_values("iso3")
-        .drop_duplicates(subset=["iso3"], keep="first")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Population download constants (UN World Population Prospects 2024)
-# ---------------------------------------------------------------------------
-POPULATION_URL = (
-    "https://population.un.org/wpp/assets/Excel%20Files/"
-    "1_Indicator%20(Standard)/EXCEL_FILES/1_General/"
-    "WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT.xlsx"
-)
-POPULATION_SHEET = "Medium variant"
-POPULATION_SKIP_ROWS = 16
-POPULATION_MULTIPLIER = 1000
-POPULATION_SOURCE_COLS = {
-    "ISO3 Alpha-code": "country",
-    "Year": "year",
-    "Total Population, as of 1 July (thousands)": "population_estimate",
-}
-
+# ==========================================================================
+# Population projections (UN WPP)
+# ==========================================================================
 
 def load_population_projections() -> pd.DataFrame:
     netzero_population_path = NETZERO_DIR / "population_estimate.csv"
 
-    # Download and build the CSV if it doesn't exist yet
     if not netzero_population_path.exists():
         log.info("population_estimate.csv not found – downloading from UN WPP …")
         resp = requests.get(POPULATION_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -358,7 +328,6 @@ def load_population_projections() -> pd.DataFrame:
         df_pop.to_csv(netzero_population_path, index=False)
         log.info("Saved %d rows -> %s", len(df_pop), netzero_population_path)
 
-    # Read the CSV (either pre-existing or just downloaded)
     df = pd.read_csv(netzero_population_path)
     df = df.rename(columns={"country": "iso3"})
     df["iso3"] = df["iso3"].apply(normalize_country_code)
@@ -373,39 +342,46 @@ def load_population_projections() -> pd.DataFrame:
     )
 
 
-def emissions_path_2024_to_nz(
-    e_2024: float,
+# ==========================================================================
+# Emission path calculation
+# ==========================================================================
+
+def emissions_path_to_nz(
+    e_start: float,
     e_2030: float,
+    start_year: int,
     net_zero_year: int,
     alpha: float,
 ) -> dict[int, float]:
+    """Build emission trajectory: start_year -> 2030 (linear) -> NZ year (power curve)."""
     out: dict[int, float] = {}
-    if e_2024 < 0 or e_2030 < 0:
+    if e_start < 0 or e_2030 < 0:
         return out
 
-    if net_zero_year <= PATH_START_YEAR:
-        out[PATH_START_YEAR] = 0.0
+    if net_zero_year <= start_year:
+        out[start_year] = 0.0
         return out
 
     if net_zero_year <= PATH_MID_YEAR:
-        years = list(range(PATH_START_YEAR, net_zero_year + 1))
-        values = np.linspace(e_2024, 0.0, len(years))
+        years = list(range(start_year, net_zero_year + 1))
+        values = np.linspace(e_start, 0.0, len(years))
         for year, value in zip(years, values):
             out[year] = float(value)
         return out
 
-    # 2024 -> 2030 linear segment.
-    for year in range(PATH_START_YEAR, PATH_MID_YEAR + 1):
-        weight = (year - PATH_START_YEAR) / (PATH_MID_YEAR - PATH_START_YEAR)
-        out[year] = float((1 - weight) * e_2024 + weight * e_2030)
+    # start_year -> 2030: linear segment
+    span = PATH_MID_YEAR - start_year
+    for year in range(start_year, PATH_MID_YEAR + 1):
+        weight = (year - start_year) / span
+        out[year] = float((1 - weight) * e_start + weight * e_2030)
 
-    # 2030 -> NZ power segment.
+    # 2030 -> NZ year: power curve segment
     den = net_zero_year - PATH_MID_YEAR
     for year in range(PATH_MID_YEAR, net_zero_year + 1):
         progress = (year - PATH_MID_YEAR) / den
         out[year] = float(e_2030 * (1 - progress) ** float(alpha))
 
-    out[PATH_START_YEAR] = float(e_2024)
+    out[start_year] = float(e_start)
     out[PATH_MID_YEAR] = float(e_2030)
     out[net_zero_year] = 0.0
     return out
@@ -428,7 +404,9 @@ def per_capita_emissions_path(
 def cumulative_per_capita_path(
     future_per_capita_path: dict[int, float],
     historical_df: pd.DataFrame,
+    emission_start_year: int,
 ) -> dict[int, float]:
+    """Accumulate per-capita emissions backwards (future + historical)."""
     out: dict[int, float] = {}
     if not future_per_capita_path:
         return out
@@ -449,7 +427,7 @@ def cumulative_per_capita_path(
     )
     for row in hist.itertuples(index=False):
         year = int(row.year)
-        if year >= PATH_START_YEAR:
+        if year >= emission_start_year:
             continue
         if year < START_YEAR:
             continue
@@ -462,6 +440,10 @@ def cumulative_per_capita_path(
     return out
 
 
+# ==========================================================================
+# Target computation
+# ==========================================================================
+
 def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
     scenario_cols = ["country", "year"] + list(SCENARIO_ALPHAS.keys())
     if "total_ghg_emissions" not in merged.columns or "population_total" not in merged.columns:
@@ -471,13 +453,11 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
     history["total_ghg_emissions"] = pd.to_numeric(history["total_ghg_emissions"], errors="coerce")
     history["population_total"] = pd.to_numeric(history["population_total"], errors="coerce")
 
-    nz_targets = load_nz_targets()
-    name_to_iso = dict(zip(nz_targets["name_key"], nz_targets["iso3"]))
-    currpol_targets = load_currpol_targets(name_to_iso)
+    nz_data = load_nz_data()
     population = load_population_projections()
 
-    currpol_map = dict(zip(currpol_targets["iso3"], currpol_targets["currpol_2030_median"]))
-    nz_map = dict(zip(nz_targets["iso3"], nz_targets["net_zero_year"]))
+    nz_map = dict(zip(nz_data["iso3"], nz_data["nz_ghg_year"]))
+    currpol_map = dict(zip(nz_data["iso3"], nz_data["currpol_2030_median"]))
     pop_map = {
         iso3: dict(zip(group["year"], group["population_estimate"]))
         for iso3, group in population.groupby("iso3")
@@ -490,44 +470,52 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
 
     country_inputs = []
     for country, hist_df in history_groups.items():
-        row_2024 = hist_df[hist_df["year"] == PATH_START_YEAR]
-        if row_2024.empty:
+        # Find latest year with a non-NaN total GHG emission
+        valid = hist_df.dropna(subset=["total_ghg_emissions"]).sort_values("year")
+        if valid.empty:
             continue
-        e_2024 = row_2024["total_ghg_emissions"].iloc[0]
+        latest_row = valid.iloc[-1]
+        e_latest = latest_row["total_ghg_emissions"]
+        latest_year = int(latest_row["year"])
+
         e_2030 = currpol_map.get(country)
         net_zero_year = nz_map.get(country)
         pop_by_year = pop_map.get(country)
+
+        # If ANY required value is missing -> target stays NaN for this country
         if (
-            pd.isna(e_2024)
-            or e_2030 is None
-            or pd.isna(e_2030)
-            or net_zero_year is None
+            pd.isna(e_latest)
+            or e_2030 is None or pd.isna(e_2030)
+            or net_zero_year is None or pd.isna(net_zero_year)
             or pop_by_year is None
         ):
             continue
-        country_inputs.append(
-            {
-                "country": country,
-                "e_2024": float(e_2024),
-                "e_2030": float(e_2030),
-                "net_zero_year": int(net_zero_year),
-                "population": pop_by_year,
-                "history": hist_df,
-            }
-        )
+
+        country_inputs.append({
+            "country": country,
+            "e_start": float(e_latest),
+            "start_year": latest_year,
+            "e_2030": float(e_2030),
+            "net_zero_year": int(net_zero_year),
+            "population": pop_by_year,
+            "history": hist_df,
+        })
 
     scenario_frames: list[pd.DataFrame] = []
     for scenario, alpha in SCENARIO_ALPHAS.items():
         records = []
         for item in country_inputs:
-            emissions = emissions_path_2024_to_nz(
-                e_2024=item["e_2024"],
+            emissions = emissions_path_to_nz(
+                e_start=item["e_start"],
                 e_2030=item["e_2030"],
+                start_year=item["start_year"],
                 net_zero_year=item["net_zero_year"],
                 alpha=alpha,
             )
             per_capita = per_capita_emissions_path(emissions, item["population"])
-            cumulative = cumulative_per_capita_path(per_capita, item["history"])
+            cumulative = cumulative_per_capita_path(
+                per_capita, item["history"], item["start_year"],
+            )
             for year, value in cumulative.items():
                 if START_YEAR <= year <= END_YEAR:
                     records.append(
@@ -552,10 +540,19 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
         if col not in target.columns:
             target[col] = np.nan
 
+    # Apply natural log: ln(value) where value > 0, else NaN
+    for col in SCENARIO_ALPHAS:
+        vals = pd.to_numeric(target[col], errors="coerce")
+        target[col] = np.where(vals > 0, np.log(vals), np.nan)
+
     return target[scenario_cols].sort_values(["country", "year"]).reset_index(drop=True)
 
 
-def main() -> None:
+# ==========================================================================
+# Entry point
+# ==========================================================================
+
+def run() -> None:
     merged = build_merged_panel()
     targets = compute_target_columns(merged)
     final_df = merged.merge(targets, on=["country", "year"], how="left")
@@ -567,4 +564,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run()

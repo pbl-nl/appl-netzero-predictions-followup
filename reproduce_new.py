@@ -739,7 +739,6 @@ if __name__ == '__main__':
                            on='Country Code', how='left')
 
     target_variable = 'Cumulative per capita emissions'
-    combined_df[target_variable] = np.log(combined_df[target_variable])
 
     ##########################################################################
     # Filtering the dataset
@@ -1851,7 +1850,6 @@ if __name__ == '__main__':
     world = world[(world.NAME != "Antarctica")]
     world = world.merge(indep_dep_df[['Country Code', 'Cumulative per capita emissions']],
                         left_on='ISO_A3', right_on='Country Code', how='left')
-    world['Cumulative per capita emissions (exp)'] = np.exp(world['Cumulative per capita emissions'])
     world.loc[world['Country Code'] == 'ARE', 'NAME'] = 'UAE'
     world.loc[world['Country Code'] == 'USA', 'NAME'] = 'USA'
     top_20_countries = world.nlargest(20, 'Cumulative per capita emissions')
@@ -1871,10 +1869,9 @@ if __name__ == '__main__':
     handles = [mlines.Line2D([], [], marker='o', color='w',
                              markerfacecolor=cmap(norm(row['Cumulative per capita emissions'])),
                              markersize=12,
-                             label=f"{row['NAME']}: {row['Cumulative per capita emissions']:.2f} \
-                                ({row['Cumulative per capita emissions (exp)']:.0f})")
+                             label=f"{row['NAME']}: {row['Cumulative per capita emissions']:.2f}")
                for idx, row in top_20_countries.iterrows()]
-    ax.legend(handles=handles, title="Top 20: Log (Actual)", bbox_to_anchor=(1.05, 1),
+    ax.legend(handles=handles, title="Top 20", bbox_to_anchor=(1.05, 1),
               loc='upper left', fontsize=16, title_fontsize=16)
 
     sm = plt.cm.ScalarMappable(cmap='coolwarm', norm=norm)
@@ -1893,7 +1890,6 @@ if __name__ == '__main__':
     world = world[(world.NAME != "Antarctica")]
     world = world.merge(cum_emissions[['Country Code', 'Cumulative per capita emissions']],
                         left_on='ISO_A3', right_on='Country Code', how='left')
-    world['Cumulative per capita emissions (exp)'] = np.exp(world['Cumulative per capita emissions'])
     world.loc[world['Country Code'] == 'ARE', 'NAME'] = 'UAE'
     world.loc[world['Country Code'] == 'USA', 'NAME'] = 'USA'
     top_20_countries = world.nlargest(20, 'Cumulative per capita emissions')
@@ -1914,10 +1910,9 @@ if __name__ == '__main__':
     handles = [mlines.Line2D([], [], marker='o', color='w',
                              markerfacecolor=cmap(norm(row['Cumulative per capita emissions'])),
                              markersize=12,
-                             label=f"{row['NAME']}: {row['Cumulative per capita emissions']:.2f} \
-                                ({row['Cumulative per capita emissions (exp)']:.0f})")
+                             label=f"{row['NAME']}: {row['Cumulative per capita emissions']:.2f}")
                for idx, row in top_20_countries.iterrows()]
-    ax.legend(handles=handles, title="Top 20: Log (Actual)", bbox_to_anchor=(1.05, 1),
+    ax.legend(handles=handles, title="Top 20", bbox_to_anchor=(1.05, 1),
               loc='upper left', fontsize=16, title_fontsize=16, frameon=True, fancybox=True, shadow=True)
 
     sm = plt.cm.ScalarMappable(cmap='coolwarm', norm=norm)
@@ -1935,21 +1930,18 @@ if __name__ == '__main__':
                                   on='Country Code', how='left', suffixes=('_predicted', '_actual'))
     diff_cum_emissions['Difference'] = diff_cum_emissions['Cumulative per capita emissions_predicted'] - \
         diff_cum_emissions['Cumulative per capita emissions_actual']
-    diff_cum_emissions['Exp_Predicted'] = np.exp(diff_cum_emissions['Cumulative per capita emissions_predicted'])
-    diff_cum_emissions['Exp_Actual'] = np.exp(diff_cum_emissions['Cumulative per capita emissions_actual'])
-    diff_cum_emissions['Exp_Difference'] = diff_cum_emissions['Exp_Predicted'] - diff_cum_emissions['Exp_Actual']
     diff_cum_emissions = diff_cum_emissions.dropna(subset=['Cumulative per capita emissions_predicted',
                                                            'Cumulative per capita emissions_actual'])
 
-    sorted_diff = diff_cum_emissions.sort_values(by='Exp_Difference', ascending=False)
+    sorted_diff = diff_cum_emissions.sort_values(by='Difference', ascending=False)
     top_10 = sorted_diff.head(10)
     bottom_10 = sorted_diff.tail(10)
     top_bottom_20 = pd.concat([top_10, bottom_10])
 
     plt.rcParams['figure.dpi'] = 300
     plt.figure(figsize=(14, 8))
-    bars = plt.bar(top_bottom_20['Country Code'], top_bottom_20['Exp_Difference'], color='green')
-    for bar, diff in zip(bars, top_bottom_20['Exp_Difference']):
+    bars = plt.bar(top_bottom_20['Country Code'], top_bottom_20['Difference'], color='green')
+    for bar, diff in zip(bars, top_bottom_20['Difference']):
         if diff < 0:
             bar.set_color('red')
     plt.ylabel('Difference in Cumulative per Capita Emissions', fontsize=16)
