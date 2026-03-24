@@ -1,204 +1,168 @@
 # Net-Zero Predictions Follow-Up
 
-This repository runs a country-level data pipeline for net-zero target analysis and model training. It downloads public-source data, combines it with a few manual input files, builds features, and saves training outputs in `results/`.
+This repository contains three related workflows:
 
-This project was originally developed with Python 3.12. Use Python 3.10–3.12 to create the virtual environment; Python 3.13+ may fail to build scipy.
+- a data pipeline that builds `data/merged/merged.csv`
+- two reproduction scripts for the original study logic: `reproduce_old.py` and `reproduce_new.py`
+- the current training pipeline under `stages.training`
 
-## Setup Environment
+All commands below assume you are running from the repository root.
+
+## Python Version
+
+Use Python 3.12 if possible. Python 3.10-3.12 is the intended range for this repo. Python 3.13+ is not recommended here because some dependencies may fail to install or build cleanly.
+
+## Setup
+
+Before pulling the large data files, make sure Git LFS is installed on your machine: [git-lfs.com](https://git-lfs.com/).
+
+After cloning the repository, initialize Git LFS and fetch the tracked files:
+
+```bash
+git lfs install
+git lfs pull
+```
+
+If Git LFS was already installed before cloning, the large files may already be present. If you see tiny text pointer files instead of real CSV data, run `git lfs pull` again.
 
 ### Windows
 
-From the project root:
-
 ```powershell
-python -m venv .venv
+py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install setuptools
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-If `python` does not work, try `py` instead.
+If `py` is not available, use `python` instead.
 
-If PowerShell blocks activation, run this once and then try again:
+If PowerShell blocks activation, run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-If you use Command Prompt instead of PowerShell, activate the environment with:
-
-```bat
-.\.venv\Scripts\activate.bat
-```
-
-### macOS
-
-From the project root:
+### macOS/Linux
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install setuptools
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-If `python3` is not available, install Python first.
+## Data Requirements
 
-## Prepare the Data Folders
+The project expects some input files to already exist locally.
 
-Create these folders before running the pipeline:
-
-### Windows
-
-```powershell
-mkdir data\raw
-mkdir data\netzero
-```
-
-### macOS
-
-```bash
-mkdir -p data/raw data/netzero
-```
-
-Your folder structure should look like this:
-
-```text
-data/
-  raw/
-    8624f431-en_2023.csv
-  netzero/
-    Reduction rates NZ targets_26March2024.xlsx
-    results_18December2025.csv
-```
-
-## Manual Files Required Before Running
-
-Add these files manually before running the code:
+### Git LFS-tracked files
 
 - `data/raw/8624f431-en_2023.csv`
-  IEA data. This file is not publicly available and must be added manually.
+- CSV files under `data/old_data/`
+
+These files are stored with Git LFS. A normal clone is only enough if Git LFS is installed and the LFS objects were fetched correctly.
+
+### Required workbook files
+
+- `data/netzero/Reduction rates NZ target revised_23Feb2026.xlsx`
+  Required by `main.py` and `reproduce_new.py`.
 - `data/netzero/Reduction rates NZ targets_26March2024.xlsx`
-  Net-zero pledged years of countries. This file must be added manually.
-- `data/netzero/results_18December2025.csv`
-  2030 current-policy projections and net-zero pledged years by country. This file must be added manually.
+  Required by `reproduce_old.py`.
 
-All other data is downloaded automatically by the scripts through API access or scripted downloads.
+### Files created automatically
 
-`merge_target.py` may also create `data/netzero/population_estimate.csv` automatically if it is missing.
+- `python main.py` downloads public-source raw data into `data/raw/`
+- `python main.py` writes processed files into `data/processed/`
+- `python main.py` writes the merged panel to `data/merged/merged.csv`
+- `stages/merge_target.py` can create `data/netzero/population_estimate.csv` automatically if it is missing
 
-## Run the Current Code
+### Legacy file note
 
-From the repository root, run:
+`data/netzero/results_18December2025.csv` exists in the repository, but it is not used by the current `main.py`, `reproduce_new.py`, or `python -m stages.training` flow.
+
+## Run The Project
+
+### 1. Old Study
+
+This runs the legacy reproduction logic against the original study inputs configured in `modules/config.json`.
+
+Prerequisites:
+
+- `data/old_data/` must be present and populated
+- `data/netzero/Reduction rates NZ targets_26March2024.xlsx` must be present
+
+Run:
+
+```bash
+python reproduce_old.py
+```
+
+Outputs:
+
+- `data/old_reproduce/`
+
+### 2. Old Study With New Data
+
+This keeps the old-study logic but swaps in the new merged indicator panel.
+
+Prerequisites:
+
+- run `python main.py` first
+- keep `data/old_data/` present, because `reproduce_new.py` still uses supplemental legacy files for EU aggregation, population forecasts, and reference cluster inputs
+- keep `data/netzero/Reduction rates NZ target revised_23Feb2026.xlsx` present
+
+Run:
 
 ```bash
 python main.py
+python reproduce_new.py
 ```
 
-This runs the full pipeline:
+Outputs:
 
-- download
-- process
-- merge
-- clean
-- train
-
-Current pipeline stages:
-
-| Stage    | Script                      | Output                                |
-| -------- | --------------------------- | ------------------------------------- |
-| download | `download.py`             | files in `data/raw/`                |
-| process  | `process.py`              | files in `data/processed/`          |
-| merge    | `merge_target.py`         | `data/merged/merged.csv`            |
-| clean    | `cleaning_engineering.py` | `data/cleaned/cleaned_features.csv` |
-| train    | `training.py`             | files in `results/`                 |
-
-## Run Only Part of the Pipeline
-
-Examples:
-
-```bash
-python main.py --from process
-python main.py --stages download process
-python main.py --skip train
-python main.py --no-skip-existing
-```
-
-Existing outputs make stages skip automatically. Use `--no-skip-existing` to force the stages to run again.
-
-## Outputs
-
-After a full run, the main outputs are:
-
-- `data/processed/`
 - `data/merged/merged.csv`
-- `data/cleaned/cleaned_features.csv`
-- `results/final_models.pkl`
-- `results/clustering_results.xlsx`
-- `results/*.png`
+- `data/new_reproduce/`
 
-## Automatically Downloaded Sources
+### 3. New Study / Current Training Pipeline
 
-The scripts automatically fetch public data such as:
+This is the current training workflow.
 
-- INFORM
-- PRIMAP-hist
-- V-Dem
-- RSF files
-- World Bank indicators
-- Data360 protein supply
-- UN population projections
+Important:
 
-## Reproduce Pipeline (Old Code Rewrite)
+- `python main.py` is required first
+- `python main.py` does not run model training; it only runs the download, process, and merge steps
 
-The `reproduce/` directory contains a modular rewrite of `old/FinalCode_rev.py`, decomposed into focused scripts with all hard-coded values in `reproduce/config.json`.
-
-### Prerequisites
-
-Before running the reproduce pipeline, ensure one of the following conditions is met depending on your `data_source` setting in `reproduce/config.json`:
-
-- **`"data_source": "old"`** — The original static data files in `old/data/` must be present. These are not downloaded automatically; the expected file paths are listed under `"paths"` in `reproduce/config.json`.
-- **`"data_source": "new"`** — The file `data/merged/merged.csv` must exist. Run the following from the repository root first:
-  ```bash
-  python download.py
-  python process.py
-  python merge_target.py
-  ```
-
-### Quick Start
+Run:
 
 ```bash
-cd reproduce
 python main.py
+python -m stages.training
 ```
 
-### Scripts
+Outputs:
 
-| Script                     | Output                               | Description                              |
-| -------------------------- | ------------------------------------ | ---------------------------------------- |
-| `data_loading.py`        | `data/01_*.csv`                    | Load raw data, merge, EU aggregation     |
-| `feature_engineering.py` | `data/02_features.csv`             | Feature creation, trends, VIF reduction  |
-| `target_variable.py`     | `data/03_target.csv`               | Cumulative per-capita emissions target   |
-| `clustering.py`          | `data/04_indep_dep.xlsx`           | KMeans, HDBSCAN, PCA, reference clusters |
-| `training.py`            | `data/05_models.pkl`               | XGBoost + LR with parallel iterations    |
-| `prediction.py`          | `data/06_mean_net_zero_years.xlsx` | SHAP analysis, net-zero year prediction  |
+- `results/training/final_results.csv`
+- `results/training/final_prediction_summary.csv`
+- `results/training/trials.csv`
+- `results/training/outer_results.csv`
+- `results/training/winners.csv`
+- `results/training/overfitting_audit.csv`
+- `results/training/final_bootstrap_predictions.csv`
 
-### Configuration
+## What `main.py` Does
 
-Edit `reproduce/config.json` to switch between data sources:
+`python main.py` runs these steps:
 
-- `"data_source": "old"` — uses original static files from `old/data/`
-- `"data_source": "new"` — uses `data/merged/merged.csv` from the current pipeline
+1. download public data into `data/raw/`
+2. process raw files into `data/processed/`
+3. merge processed data and target inputs into `data/merged/merged.csv`
 
-Key settings: `target.start_year` (2021), `target.alpha` (1.0=linear), `training.num_iterations`, `training.parallelize`.
+It does not run `reproduce_old.py`, `reproduce_new.py`, or `python -m stages.training`.
 
 ## Troubleshooting
 
-- If `python` or `python3` is not found, install Python and try again.
-- If the virtual environment does not activate, check that you are in the project root and retry the activation command for your operating system.
-- If the pipeline fails early, make sure the required manual files are present in `data/raw` and `data/netzero`.
-- The automatic download steps need internet access.
-- If scipy fails to build when installing requirements, switch to Python 3.12 or earlier to create the virtual environment.
-- If a stage seems to do nothing, its output may already exist. Run again with `python main.py --no-skip-existing`.
+- If a required CSV is missing or looks like a Git LFS pointer file, run `git lfs pull`.
+- `python main.py` needs internet access for automatic downloads and for population data fallback if `data/netzero/population_estimate.csv` is missing.
+- If `python -m stages.training` fails immediately, make sure `data/merged/merged.csv` exists and rerun `python main.py`.
+- If `reproduce_new.py` fails after `python main.py`, verify that `data/old_data/` is still populated. `reproduce_new.py` is not fully self-contained from `merged.csv`.
+- If dependency installation fails, recreate the environment with Python 3.12.

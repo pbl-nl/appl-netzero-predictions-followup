@@ -36,6 +36,9 @@ venv/
 # Allow archived source files in old_data/
 !data/old_data/
 !data/old_data/**
+!results/
+!results/training/
+!results/training/*.csv
 
 # --- Project artifacts / data folders ---
 data/old_reproduce/
