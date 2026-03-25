@@ -8,12 +8,19 @@ import numpy as np
 import pandas as pd
 from hyperopt import hp
 from hyperopt.pyll.base import scope
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import (
+    AdaBoostRegressor,
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.feature_selection import SelectKBest, mutual_info_regression
-from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.linear_model import BayesianRidge, ElasticNet, HuberRegressor, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
+from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 
 from stages.training.config import (
@@ -291,6 +298,52 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
             "learning_rate_init": hp.loguniform("learning_rate_init", np.log(1e-4), np.log(1e-3)),
             "batch_size": hp.choice("batch_size", [64, 128, 256]),
         }
+    if model_name == "huber":
+        return {
+            "epsilon": hp.uniform("epsilon", 1.1, 2.0),
+            "alpha": hp.loguniform("alpha", np.log(1e-2), np.log(1e3)),
+            "max_iter": scope.int(hp.quniform("max_iter", 200, 500, 50)),
+        }
+    if model_name == "bayesian_ridge":
+        return {
+            "alpha_1": hp.loguniform("alpha_1", np.log(1e-7), np.log(1e-4)),
+            "alpha_2": hp.loguniform("alpha_2", np.log(1e-7), np.log(1e-4)),
+            "lambda_1": hp.loguniform("lambda_1", np.log(1e-7), np.log(1e-4)),
+            "lambda_2": hp.loguniform("lambda_2", np.log(1e-7), np.log(1e-4)),
+        }
+    if model_name == "extra_trees":
+        return {
+            "n_estimators": scope.int(hp.quniform("n_estimators", 100, 300, 25)),
+            "max_depth": hp.choice("max_depth", [3, 4, 5]),
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 20, 100, 5)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 60, 5)),
+            "max_features": hp.choice("max_features", [0.2, 0.3, 0.4, "sqrt"]),
+        }
+    if model_name == "gradient_boosting":
+        return {
+            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 200, 10)),
+            "max_depth": scope.int(hp.quniform("max_depth", 1, 3, 1)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.1)),
+            "subsample": hp.uniform("subsample", 0.5, 0.85),
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 20, 80, 5)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 15, 50, 5)),
+            "max_features": hp.choice("max_features", [0.3, 0.5, 0.7, "sqrt"]),
+        }
+    if model_name == "hist_gradient_boosting":
+        return {
+            "max_iter": scope.int(hp.quniform("max_iter", 50, 200, 10)),
+            "max_depth": scope.int(hp.quniform("max_depth", 2, 4, 1)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.1)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 60, 5)),
+            "max_leaf_nodes": scope.int(hp.quniform("max_leaf_nodes", 8, 31, 1)),
+            "l2_regularization": hp.loguniform("l2_regularization", np.log(0.1), np.log(50.0)),
+        }
+    if model_name == "adaboost":
+        return {
+            "n_estimators": scope.int(hp.quniform("n_estimators", 20, 100, 5)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.5)),
+            "loss": hp.choice("loss", ["linear", "square"]),
+        }
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
@@ -304,6 +357,26 @@ def normalize_hyperopt_params(model_name: str, params: dict[str, Any]) -> dict[s
         return normalized
     if model_name == "mlp":
         normalized["hidden_layer_sizes"] = tuple(normalized["hidden_layer_sizes"])
+        return normalized
+    if model_name == "huber":
+        normalized["max_iter"] = int(normalized["max_iter"])
+        return normalized
+    if model_name == "bayesian_ridge":
+        return normalized
+    if model_name == "extra_trees":
+        for key in ["n_estimators", "min_samples_split", "min_samples_leaf"]:
+            normalized[key] = int(normalized[key])
+        return normalized
+    if model_name == "gradient_boosting":
+        for key in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf"]:
+            normalized[key] = int(normalized[key])
+        return normalized
+    if model_name == "hist_gradient_boosting":
+        for key in ["max_iter", "max_depth", "min_samples_leaf", "max_leaf_nodes"]:
+            normalized[key] = int(normalized[key])
+        return normalized
+    if model_name == "adaboost":
+        normalized["n_estimators"] = int(normalized["n_estimators"])
         return normalized
     raise ValueError(f"Unsupported model name: {model_name}")
 
@@ -364,6 +437,61 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             early_stopping=True,
             n_iter_no_change=20,
             max_iter=500,
+            random_state=random_state,
+        )
+    if model_name == "huber":
+        return HuberRegressor(
+            epsilon=float(params["epsilon"]),
+            alpha=float(params["alpha"]),
+            max_iter=int(params["max_iter"]),
+        )
+    if model_name == "bayesian_ridge":
+        return BayesianRidge(
+            alpha_1=float(params["alpha_1"]),
+            alpha_2=float(params["alpha_2"]),
+            lambda_1=float(params["lambda_1"]),
+            lambda_2=float(params["lambda_2"]),
+            max_iter=500,
+        )
+    if model_name == "extra_trees":
+        return ExtraTreesRegressor(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=params["max_depth"],
+            min_samples_split=int(params["min_samples_split"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=params["max_features"],
+            random_state=random_state,
+            n_jobs=MODEL_N_JOBS,
+        )
+    if model_name == "gradient_boosting":
+        return GradientBoostingRegressor(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]),
+            min_samples_split=int(params["min_samples_split"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_features=params["max_features"],
+            random_state=random_state,
+        )
+    if model_name == "hist_gradient_boosting":
+        return HistGradientBoostingRegressor(
+            max_iter=int(params["max_iter"]),
+            max_depth=int(params["max_depth"]),
+            learning_rate=float(params["learning_rate"]),
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_leaf_nodes=int(params["max_leaf_nodes"]),
+            l2_regularization=float(params["l2_regularization"]),
+            early_stopping=False,
+            random_state=random_state,
+        )
+    if model_name == "adaboost":
+        base = DecisionTreeRegressor(max_depth=2, random_state=random_state)
+        return AdaBoostRegressor(
+            estimator=base,
+            n_estimators=int(params["n_estimators"]),
+            learning_rate=float(params["learning_rate"]),
+            loss=str(params["loss"]),
             random_state=random_state,
         )
     raise ValueError(f"Unsupported model name: {model_name}")

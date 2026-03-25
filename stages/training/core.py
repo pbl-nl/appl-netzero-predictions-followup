@@ -47,6 +47,7 @@ from stages.training.config import (
     PIPELINE_RANDOM_STATE,
     SELECTION_TOLERANCE,
     TEST_YEAR,
+    TIMING_PATH,
     TUNING_BUDGET_SECONDS,
     TRIALS_PATH,
     WINNERS_PATH,
@@ -78,6 +79,7 @@ from stages.training.bootstrap import (
     build_prediction_summary,
     run_final_bootstrap_iterations,
 )
+from stages.training.timing import TimingRecord, make_record
 
 logger = logging.getLogger(__name__)
 
@@ -134,37 +136,129 @@ def prepare_branch_outer_frames(
 ) -> dict[str, Any]:
     """Preprocess outer train and test. No separate val — inner CV handles that."""
     preprocessor = Preprocessor(active_branches=[branch])
+
+    t0 = time.monotonic()
     train_outputs = preprocessor.fit_transform(split["outer_train"])
+    train_elapsed = time.monotonic() - t0
+    train_sub_records = list(preprocessor.timing_records_)
+
+    t0 = time.monotonic()
     test_outputs = preprocessor.transform(
         split["outer_test"], history_df=split["outer_train"],
         split_name="outer_test",
     )
+    test_elapsed = time.monotonic() - t0
+    test_sub_records = list(preprocessor.timing_records_)
+
+    timing_records: list[TimingRecord] = []
+    timing_records.append(make_record(
+        phase="", operation="preprocess_outer_train",
+        elapsed_seconds=train_elapsed,
+        rows_in=len(split["outer_train"]),
+        rows_out=len(train_outputs[branch]),
+    ))
+    for rec in train_sub_records:
+        timing_records.append(make_record(
+            phase="", operation=rec["operation"],
+            elapsed_seconds=rec["elapsed_seconds"],
+            sub_operation=rec.get("sub_operation", ""),
+            rows_in=rec.get("rows_in"),
+            rows_out=rec.get("rows_out"),
+            n_features=rec.get("n_features"),
+            detail=rec.get("detail", ""),
+        ))
+    timing_records.append(make_record(
+        phase="", operation="preprocess_outer_test",
+        elapsed_seconds=test_elapsed,
+        rows_in=len(split["outer_test"]),
+        rows_out=len(test_outputs[branch]),
+    ))
+    for rec in test_sub_records:
+        timing_records.append(make_record(
+            phase="", operation=rec["operation"],
+            elapsed_seconds=rec["elapsed_seconds"],
+            sub_operation=rec.get("sub_operation", ""),
+            rows_in=rec.get("rows_in"),
+            rows_out=rec.get("rows_out"),
+            n_features=rec.get("n_features"),
+            detail=rec.get("detail", ""),
+        ))
+
     return {
         "preprocessor": preprocessor,
         "train_frame": train_outputs[branch],
         "test_frame": test_outputs[branch],
+        "timing_records": timing_records,
     }
 
 
 def prepare_branch_fold_frames(
     folds: list[dict[str, Any]],
     branch: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[TimingRecord]]:
     prepared: list[dict[str, Any]] = []
+    timing_records: list[TimingRecord] = []
     for fold in folds:
         preprocessor = Preprocessor(active_branches=[branch])
+
+        t0 = time.monotonic()
         train_outputs = preprocessor.fit_transform(fold["train"])
+        train_elapsed = time.monotonic() - t0
+        train_sub = list(preprocessor.timing_records_)
+
+        t0 = time.monotonic()
         val_outputs = preprocessor.transform(
             fold["val"],
             history_df=fold["train"],
             split_name=f"cv_val_{fold['fold_id']}",
         )
+        val_elapsed = time.monotonic() - t0
+        val_sub = list(preprocessor.timing_records_)
+
+        fold_id = fold["fold_id"]
+        timing_records.append(make_record(
+            phase="", operation="preprocess_cv_fold_train",
+            elapsed_seconds=train_elapsed,
+            fold_id=fold_id,
+            rows_in=len(fold["train"]),
+            rows_out=len(train_outputs[branch]),
+        ))
+        for rec in train_sub:
+            timing_records.append(make_record(
+                phase="", operation=rec["operation"],
+                elapsed_seconds=rec["elapsed_seconds"],
+                fold_id=fold_id,
+                sub_operation=rec.get("sub_operation", ""),
+                rows_in=rec.get("rows_in"),
+                rows_out=rec.get("rows_out"),
+                n_features=rec.get("n_features"),
+                detail=rec.get("detail", ""),
+            ))
+        timing_records.append(make_record(
+            phase="", operation="preprocess_cv_fold_val",
+            elapsed_seconds=val_elapsed,
+            fold_id=fold_id,
+            rows_in=len(fold["val"]),
+            rows_out=len(val_outputs[branch]),
+        ))
+        for rec in val_sub:
+            timing_records.append(make_record(
+                phase="", operation=rec["operation"],
+                elapsed_seconds=rec["elapsed_seconds"],
+                fold_id=fold_id,
+                sub_operation=rec.get("sub_operation", ""),
+                rows_in=rec.get("rows_in"),
+                rows_out=rec.get("rows_out"),
+                n_features=rec.get("n_features"),
+                detail=rec.get("detail", ""),
+            ))
+
         prepared.append({
             "fold_id": fold["fold_id"],
             "train_frame": train_outputs[branch],
             "val_frame": val_outputs[branch],
         })
-    return prepared
+    return prepared, timing_records
 
 
 def prepare_cv_fold_data(
@@ -377,182 +471,308 @@ def evaluate_candidate_model(
 # =============================================================================
 
 
-def refit_final_models(
+def _refit_single_winner(
     raw_df: pd.DataFrame,
-    winners_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    final_rows: list[dict[str, Any]] = []
-    prediction_rows: list[pd.DataFrame] = []
-    if winners_df.empty:
-        logger.warning("No winners available for final refit.")
-        return empty_final_results_df(), empty_final_predictions_df(), empty_final_prediction_summary_df()
+    outer_strategy: str,
+    target: str,
+    branch: str,
+    model_name: str,
+    bootstrap_workers: int | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, list[TimingRecord]]:
+    pid = os.getpid()
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.getLogger("hyperopt").setLevel(logging.WARNING)
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
+
+    refit_t0 = time.monotonic()
+    tag = f"refit({outer_strategy}/{target}/{model_name}/{branch})"
+    ctx = dict(
+        phase="final_refit", strategy=outer_strategy, target=target,
+        branch=branch, model_name=model_name,
+    )
+    timing_records: list[TimingRecord] = []
+
+    print(
+        f"[PID:{pid}] {tag} Starting "
+        f"({FINAL_BOOTSTRAP_ITERATIONS} bootstrap iterations)...",
+        flush=True,
+    )
 
     final_train_raw = raw_df[raw_df[YEAR_COL] < TEST_YEAR].copy()
     final_test_raw = raw_df[raw_df[YEAR_COL] == TEST_YEAR].copy()
 
-    for _, winner_row in winners_df.iterrows():
-        outer_strategy = str(winner_row["outer_strategy"])
-        target = str(winner_row["target"])
-        branch = str(winner_row["branch"])
-        model_name = str(winner_row["model_name"])
+    # Preprocess training data
+    preprocessor = Preprocessor(active_branches=[branch])
+    t0 = time.monotonic()
+    train_outputs = preprocessor.fit_transform(final_train_raw)
+    train_elapsed = time.monotonic() - t0
+    timing_records.append(make_record(
+        operation="preprocess_final_train", elapsed_seconds=train_elapsed,
+        rows_in=len(final_train_raw), rows_out=len(train_outputs[branch]),
+        **ctx,
+    ))
+    for rec in preprocessor.timing_records_:
+        timing_records.append(make_record(
+            operation=rec["operation"], elapsed_seconds=rec["elapsed_seconds"],
+            sub_operation=rec.get("sub_operation", ""),
+            rows_in=rec.get("rows_in"), rows_out=rec.get("rows_out"),
+            n_features=rec.get("n_features"), detail=rec.get("detail", ""),
+            **ctx,
+        ))
 
-        logger.info(
-            f"Final refit: strategy={outer_strategy} target={target} "
-            f"({model_name}, {branch}, {FINAL_BOOTSTRAP_ITERATIONS} iterations)"
+    # Scored test: standard cleaning (drops rows with too many NaNs / no targets)
+    t0 = time.monotonic()
+    test_outputs_scored = preprocessor.transform(
+        final_test_raw, history_df=final_train_raw, drop_rows=True,
+        split_name=f"final_test_{outer_strategy}_{target}",
+    )
+    timing_records.append(make_record(
+        operation="preprocess_final_test", elapsed_seconds=time.monotonic() - t0,
+        rows_in=len(final_test_raw), rows_out=len(test_outputs_scored[branch]),
+        detail="scored", **ctx,
+    ))
+    for rec in preprocessor.timing_records_:
+        timing_records.append(make_record(
+            operation=rec["operation"], elapsed_seconds=rec["elapsed_seconds"],
+            sub_operation=rec.get("sub_operation", ""),
+            rows_in=rec.get("rows_in"), rows_out=rec.get("rows_out"),
+            n_features=rec.get("n_features"), detail=rec.get("detail", ""),
+            **ctx,
+        ))
+
+    # All-country test: skip row drops — all countries for predictions
+    t0 = time.monotonic()
+    test_outputs_all = preprocessor.transform(
+        final_test_raw, history_df=final_train_raw, drop_rows=False,
+        split_name=f"final_test_all_{outer_strategy}_{target}",
+    )
+    timing_records.append(make_record(
+        operation="preprocess_final_test", elapsed_seconds=time.monotonic() - t0,
+        rows_in=len(final_test_raw), rows_out=len(test_outputs_all[branch]),
+        detail="all_countries", **ctx,
+    ))
+    for rec in preprocessor.timing_records_:
+        timing_records.append(make_record(
+            operation=rec["operation"], elapsed_seconds=rec["elapsed_seconds"],
+            sub_operation=rec.get("sub_operation", ""),
+            rows_in=rec.get("rows_in"), rows_out=rec.get("rows_out"),
+            n_features=rec.get("n_features"), detail=rec.get("detail", ""),
+            **ctx,
+        ))
+
+    train_frame = train_outputs[branch]
+    test_frame_scored = test_outputs_scored[branch]
+    test_frame_all = test_outputs_all[branch]
+
+    # Extract scored test set (countries with actual target values)
+    x_train, y_train, feature_columns = extract_xy(train_frame, target)
+    x_test_scored, y_test_scored, _ = extract_xy(test_frame_scored, target)
+
+    # Extract ALL countries for predictions (including those without targets)
+    all_feat_cols = feature_columns_from_frame(test_frame_all)
+    x_test_all = test_frame_all[all_feat_cols].copy()
+
+    if x_train.empty or x_test_scored.empty:
+        raise RuntimeError(
+            f"Empty train/test for strategy={outer_strategy}, target={target}."
         )
 
-        # Preprocess
-        preprocessor = Preprocessor(active_branches=[branch])
-        train_outputs = preprocessor.fit_transform(final_train_raw)
+    # Retune: run inner CV on all pre-2022 data to find best params for this model.
+    raw_folds = make_cv_folds(final_train_raw, outer_strategy)
+    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch)
+    for rec in fold_timing:
+        rec.update(ctx)
+        timing_records.append(rec)
 
-        # Scored test: standard cleaning (drops rows with too many NaNs / no targets)
-        test_outputs_scored = preprocessor.transform(
-            final_test_raw, history_df=final_train_raw, drop_rows=True,
-            split_name=f"final_test_{outer_strategy}_{target}",
-        )
-        # All-country test: skip row drops — all countries for predictions
-        test_outputs_all = preprocessor.transform(
-            final_test_raw, history_df=final_train_raw, drop_rows=False,
-            split_name=f"final_test_all_{outer_strategy}_{target}",
-        )
+    fold_feat_sets = []
+    for fold in fold_frames:
+        x_fold, _, fc = extract_xy(fold["train_frame"], target)
+        if not x_fold.empty:
+            fold_feat_sets.append(set(fc))
+    if fold_feat_sets:
+        common_feats = sorted(set(feature_columns) & set.intersection(*fold_feat_sets))
+    else:
+        common_feats = list(feature_columns)
 
-        train_frame = train_outputs[branch]
-        test_frame_scored = test_outputs_scored[branch]
-        test_frame_all = test_outputs_all[branch]
+    # Single selector fitted on common_feats — used everywhere below
+    t0 = time.monotonic()
+    selector = fit_feature_selector(x_train[common_feats], y_train)
+    x_train, selected_cols = apply_feature_selector(selector, x_train[common_feats], common_feats)
+    x_test_scored, _ = apply_feature_selector(selector, x_test_scored[common_feats], common_feats)
+    x_test_all, _ = apply_feature_selector(selector, x_test_all[common_feats], common_feats)
+    timing_records.append(make_record(
+        operation="feature_selection", elapsed_seconds=time.monotonic() - t0,
+        n_features=len(selected_cols),
+        detail=f"from {len(common_feats)} common features",
+        **ctx,
+    ))
 
-        # Extract scored test set (countries with actual target values)
-        x_train, y_train, feature_columns = extract_xy(train_frame, target)
-        x_test_scored, y_test_scored, _ = extract_xy(test_frame_scored, target)
+    prepared_folds = prepare_cv_fold_data(
+        fold_frames, target,
+        feature_selector=selector,
+        all_feature_columns=common_feats,
+    )
 
-        # Extract ALL countries for predictions (including those without targets)
-        all_feat_cols = feature_columns_from_frame(test_frame_all)
-        x_test_all = test_frame_all[all_feat_cols].copy()
+    print(
+        f"[PID:{pid}] {tag} Retuning on all pre-{TEST_YEAR} data "
+        f"({len(prepared_folds)} inner folds)...",
+        flush=True,
+    )
+    t0 = time.monotonic()
+    tuning_result, _ = tune_model(
+        prepared_folds, outer_strategy, branch, target, model_name,
+    )
+    timing_records.append(make_record(
+        operation="model_tuning", elapsed_seconds=time.monotonic() - t0,
+        detail=f"retune {tuning_result['trial_count']} trials",
+        **ctx,
+    ))
+    best_params = tuning_result["best_params"]
 
-        if x_train.empty or x_test_scored.empty:
-            raise RuntimeError(
-                f"Empty train/test for strategy={outer_strategy}, target={target}."
+    # Build base predictions for ALL countries
+    base_predictions = test_frame_all[[COUNTRY_COL, YEAR_COL]].copy()
+    base_predictions["actual"] = test_frame_all[target]
+    base_predictions["outer_strategy_source"] = outer_strategy
+    base_predictions["target"] = target
+    base_predictions["branch"] = branch
+    base_predictions["model_name"] = model_name
+
+    # Bootstrap
+    bootstrap_results, bootstrap_timing = run_final_bootstrap_iterations(
+        target=target,
+        model_name=model_name,
+        best_params=best_params,
+        x_train=x_train,
+        y_train=y_train,
+        x_test_scored=x_test_scored,
+        y_test_scored=y_test_scored,
+        x_test_all=x_test_all,
+        bootstrap_workers=bootstrap_workers,
+    )
+    for rec in bootstrap_timing:
+        rec.update(ctx)
+        timing_records.append(rec)
+
+    bootstrap_train_metrics: list[dict[str, float]] = []
+    bootstrap_test_metrics: list[dict[str, float]] = []
+    target_prediction_rows: list[pd.DataFrame] = []
+
+    for iteration_idx, train_metrics, scored_metrics, all_preds, _elapsed in bootstrap_results:
+        bootstrap_train_metrics.append(train_metrics)
+        bootstrap_test_metrics.append(scored_metrics)
+        iter_preds = base_predictions.copy()
+        iter_preds["iteration"] = iteration_idx + 1
+        iter_preds["prediction"] = all_preds
+        target_prediction_rows.append(iter_preds)
+
+    train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
+    test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
+    avg_train = {k: float(train_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
+    avg_test = {k: float(test_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
+
+    target_preds_df = pd.concat(target_prediction_rows, ignore_index=True)
+    pred_summary_df = build_prediction_summary(target_preds_df)
+
+    # Save artifact
+    t0 = time.monotonic()
+    artifact_model = fit_model(
+        build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
+        x_train, y_train,
+    )
+    artifact = {
+        "model": artifact_model,
+        "preprocessor": preprocessor,
+        "feature_selector": selector,
+        "selected_feature_columns": selected_cols,
+        "target": target,
+        "branch": branch,
+        "model_name": model_name,
+        "params": best_params,
+        "feature_columns": feature_columns,
+        "metrics": {"train": avg_train, "test": avg_test},
+        "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
+        "prediction_summary": pred_summary_df,
+        "outer_strategy_source": outer_strategy,
+    }
+    artifact_path = FINAL_ARTIFACTS_DIR / outer_strategy / f"{target}.joblib"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(artifact, artifact_path)
+    timing_records.append(make_record(
+        operation="artifact_save", elapsed_seconds=time.monotonic() - t0,
+        detail=str(artifact_path), **ctx,
+    ))
+
+    print(f"[PID:{pid}] {tag} Done. test_mae={avg_test['mae']:.4f}", flush=True)
+
+    timing_records.append(make_record(
+        operation="refit_worker_total", elapsed_seconds=time.monotonic() - refit_t0,
+        **ctx,
+    ))
+
+    final_row = {
+        "target": target,
+        "outer_strategy_source": outer_strategy,
+        "branch": branch,
+        "model_name": model_name,
+        "best_params_json": serialize_params(best_params),
+        "final_train_rows": int(len(x_train)),
+        "final_test_rows": int(len(x_test_scored)),
+        "feature_count": int(len(selected_cols)),
+        "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
+        "final_train_mae": avg_train["mae"],
+        "final_train_rmse": avg_train["rmse"],
+        "final_train_r2": avg_train["r2"],
+        "test_mae": avg_test["mae"],
+        "test_rmse": avg_test["rmse"],
+        "test_r2": avg_test["r2"],
+        "artifact_path": str(artifact_path),
+    }
+    return final_row, target_preds_df, timing_records
+
+
+def refit_final_models(
+    raw_df: pd.DataFrame,
+    winners_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[TimingRecord]]:
+    final_rows: list[dict[str, Any]] = []
+    prediction_rows: list[pd.DataFrame] = []
+    all_timing: list[TimingRecord] = []
+    if winners_df.empty:
+        logger.warning("No winners available for final refit.")
+        return empty_final_results_df(), empty_final_predictions_df(), empty_final_prediction_summary_df(), all_timing
+
+    n_winners = len(winners_df)
+    max_workers = min(n_winners, DEFAULT_CPU_WORKERS)
+    logger.info(f"Refitting {n_winners} winners across {max_workers} workers")
+
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _refit_single_winner, raw_df,
+                    str(row["outer_strategy"]), str(row["target"]),
+                    str(row["branch"]), str(row["model_name"]),
+                    bootstrap_workers=1,
+                ): idx
+                for idx, row in winners_df.iterrows()
+            }
+            for future in as_completed(futures):
+                final_row, target_preds_df, refit_timing = future.result()
+                final_rows.append(final_row)
+                prediction_rows.append(target_preds_df)
+                all_timing.extend(refit_timing)
+    except PermissionError as exc:
+        logger.warning(f"Process pool unavailable ({exc}). Running sequentially.")
+        for _, row in winners_df.iterrows():
+            final_row, target_preds_df, refit_timing = _refit_single_winner(
+                raw_df,
+                str(row["outer_strategy"]), str(row["target"]),
+                str(row["branch"]), str(row["model_name"]),
             )
-
-        # Retune: run inner CV on all pre-2022 data to find best params for this model.
-        # Feature selection must use the same common-feature intersection as the main worker,
-        # so that tuning, bootstrap, and artifact all operate on an identical feature set.
-        raw_folds = make_cv_folds(final_train_raw, outer_strategy)
-        fold_frames = prepare_branch_fold_frames(raw_folds, branch)
-
-        fold_feat_sets = []
-        for fold in fold_frames:
-            x_fold, _, fc = extract_xy(fold["train_frame"], target)
-            if not x_fold.empty:
-                fold_feat_sets.append(set(fc))
-        if fold_feat_sets:
-            common_feats = sorted(set(feature_columns) & set.intersection(*fold_feat_sets))
-        else:
-            common_feats = list(feature_columns)
-
-        # Single selector fitted on common_feats — used everywhere below
-        selector = fit_feature_selector(x_train[common_feats], y_train)
-        x_train, selected_cols = apply_feature_selector(selector, x_train[common_feats], common_feats)
-        x_test_scored, _ = apply_feature_selector(selector, x_test_scored[common_feats], common_feats)
-        x_test_all, _ = apply_feature_selector(selector, x_test_all[common_feats], common_feats)
-
-        prepared_folds = prepare_cv_fold_data(
-            fold_frames, target,
-            feature_selector=selector,
-            all_feature_columns=common_feats,
-        )
-
-        logger.info(
-            f"  Retuning {model_name} on all pre-{TEST_YEAR} data "
-            f"({len(prepared_folds)} inner folds)..."
-        )
-        tuning_result, _ = tune_model(
-            prepared_folds, outer_strategy, branch, target, model_name,
-        )
-        best_params = tuning_result["best_params"]
-
-        # Build base predictions for ALL countries
-        base_predictions = test_frame_all[[COUNTRY_COL, YEAR_COL]].copy()
-        base_predictions["actual"] = test_frame_all[target]
-        base_predictions["outer_strategy_source"] = outer_strategy
-        base_predictions["target"] = target
-        base_predictions["branch"] = branch
-        base_predictions["model_name"] = model_name
-
-        # Bootstrap
-        bootstrap_results = run_final_bootstrap_iterations(
-            target=target,
-            model_name=model_name,
-            best_params=best_params,
-            x_train=x_train,
-            y_train=y_train,
-            x_test_scored=x_test_scored,
-            y_test_scored=y_test_scored,
-            x_test_all=x_test_all,
-        )
-
-        bootstrap_train_metrics: list[dict[str, float]] = []
-        bootstrap_test_metrics: list[dict[str, float]] = []
-        target_prediction_rows: list[pd.DataFrame] = []
-
-        for iteration_idx, train_metrics, scored_metrics, all_preds in bootstrap_results:
-            bootstrap_train_metrics.append(train_metrics)
-            bootstrap_test_metrics.append(scored_metrics)
-            iter_preds = base_predictions.copy()
-            iter_preds["iteration"] = iteration_idx + 1
-            iter_preds["prediction"] = all_preds
-            target_prediction_rows.append(iter_preds)
-
-        train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
-        test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
-        avg_train = {k: float(train_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
-        avg_test = {k: float(test_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
-
-        target_preds_df = pd.concat(target_prediction_rows, ignore_index=True)
-        prediction_rows.append(target_preds_df)
-        pred_summary_df = build_prediction_summary(target_preds_df)
-
-        # Save artifact
-        artifact_model = fit_model(
-            build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
-            x_train, y_train,
-        )
-        artifact = {
-            "model": artifact_model,
-            "preprocessor": preprocessor,
-            "feature_selector": selector,
-            "selected_feature_columns": selected_cols,
-            "target": target,
-            "branch": branch,
-            "model_name": model_name,
-            "params": best_params,
-            "feature_columns": feature_columns,
-            "metrics": {"train": avg_train, "test": avg_test},
-            "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
-            "prediction_summary": pred_summary_df,
-            "outer_strategy_source": outer_strategy,
-        }
-        artifact_path = FINAL_ARTIFACTS_DIR / outer_strategy / f"{target}.joblib"
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(artifact, artifact_path)
-
-        final_rows.append({
-            "target": target,
-            "outer_strategy_source": outer_strategy,
-            "branch": branch,
-            "model_name": model_name,
-            "best_params_json": serialize_params(best_params),
-            "final_train_rows": int(len(x_train)),
-            "final_test_rows": int(len(x_test_scored)),
-            "feature_count": int(len(selected_cols)),
-            "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
-            "final_train_mae": avg_train["mae"],
-            "final_train_rmse": avg_train["rmse"],
-            "final_train_r2": avg_train["r2"],
-            "test_mae": avg_test["mae"],
-            "test_rmse": avg_test["rmse"],
-            "test_r2": avg_test["r2"],
-            "artifact_path": str(artifact_path),
-        })
+            final_rows.append(final_row)
+            prediction_rows.append(target_preds_df)
+            all_timing.extend(refit_timing)
 
     if prediction_rows:
         final_preds_df = pd.concat(prediction_rows, ignore_index=True)
@@ -568,7 +788,7 @@ def refit_final_models(
     else:
         final_results_df = empty_final_results_df()
 
-    return final_results_df, final_preds_df, final_summary_df
+    return final_results_df, final_preds_df, final_summary_df, all_timing
 
 
 # =============================================================================
@@ -710,7 +930,7 @@ def _make_error_row(
 
 
 # =============================================================================
-# Worker for a (strategy, branch) combo — iterates over outer test years
+# Worker for a (strategy, branch, target, outer_test_year) combo
 # =============================================================================
 
 
@@ -718,173 +938,209 @@ def _run_combo_worker(
     raw_df: pd.DataFrame,
     strategy: str,
     branch: str,
-    active_targets: list[str],
+    target: str,
+    outer_test_year: int,
     active_models: list[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[TimingRecord]]:
     pid = os.getpid()
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("hyperopt").setLevel(logging.WARNING)
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
     warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
 
-    tag = f"({strategy}/{branch})"
+    combo_t0 = time.monotonic()
+    tag = f"({strategy}/{branch})/test={outer_test_year}/target={target}"
+    ctx = dict(
+        phase="outer_cv", strategy=strategy, branch=branch,
+        target=target, outer_test_year=outer_test_year,
+    )
 
     # Never touch TEST_YEAR (2022) during nested CV
     raw_df_pre_test = raw_df[raw_df[YEAR_COL] < TEST_YEAR].copy()
 
     all_results: list[dict[str, Any]] = []
     all_trials: list[dict[str, Any]] = []
+    timing_records: list[TimingRecord] = []
 
-    for outer_test_year in OUTER_TEST_YEARS:
-        year_tag = f"{tag}/test={outer_test_year}"
-        print(f"[PID:{pid}] {year_tag} Splitting data...", flush=True)
+    print(f"[PID:{pid}] {tag} Splitting data...", flush=True)
 
-        split = make_nested_outer_split(raw_df_pre_test, outer_test_year)
-        raw_folds = make_cv_folds(split["outer_train"], strategy)
+    split = make_nested_outer_split(raw_df_pre_test, outer_test_year)
+    raw_folds = make_cv_folds(split["outer_train"], strategy)
 
-        if len(raw_folds) < MIN_VALID_FOLDS:
+    if len(raw_folds) < MIN_VALID_FOLDS:
+        print(
+            f"[PID:{pid}] {tag} Only {len(raw_folds)} inner folds, "
+            f"need {MIN_VALID_FOLDS}. Skipping.",
+            flush=True,
+        )
+        for m in active_models:
+            all_results.append(_make_error_row(
+                strategy, branch, target, m,
+                f"Only {len(raw_folds)} inner folds for test_year={outer_test_year}",
+                outer_test_year=outer_test_year,
+            ))
+        return all_results, all_trials, timing_records
+
+    print(f"[PID:{pid}] {tag} Preprocessing outer split...", flush=True)
+    branch_outer = prepare_branch_outer_frames(split, branch)
+    for rec in branch_outer["timing_records"]:
+        rec.update(ctx)
+        timing_records.append(rec)
+
+    print(f"[PID:{pid}] {tag} Preprocessing {len(raw_folds)} CV folds...", flush=True)
+    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch)
+    for rec in fold_timing:
+        rec.update(ctx)
+        timing_records.append(rec)
+
+    train_frame = branch_outer["train_frame"]
+    test_frame = branch_outer["test_frame"]
+    preprocessor = branch_outer["preprocessor"]
+
+    x_train, y_train, feat_cols = extract_xy(train_frame, target)
+    x_test, y_test, _ = extract_xy(test_frame, target)
+
+    # Compute intersection of feature columns across outer train and all CV folds
+    fold_feat_sets = []
+    for fold in fold_frames:
+        x_fold, _, fc = extract_xy(fold["train_frame"], target)
+        if not x_fold.empty:
+            fold_feat_sets.append(set(fc))
+    if fold_feat_sets:
+        common_feats = sorted(set(feat_cols) & set.intersection(*fold_feat_sets))
+    else:
+        common_feats = list(feat_cols)
+
+    # Feature selection on common features only
+    t0 = time.monotonic()
+    selector = fit_feature_selector(x_train[common_feats], y_train)
+    x_train, selected_cols = apply_feature_selector(
+        selector, x_train[common_feats], common_feats,
+    )
+    x_test, _ = apply_feature_selector(selector, x_test[common_feats], common_feats)
+    timing_records.append(make_record(
+        operation="feature_selection",
+        elapsed_seconds=time.monotonic() - t0,
+        n_features=len(selected_cols),
+        detail=f"from {len(common_feats)} common features",
+        **ctx,
+    ))
+
+    # Prepare CV folds with the same selector
+    prepared_folds = prepare_cv_fold_data(
+        fold_frames, target,
+        feature_selector=selector,
+        all_feature_columns=common_feats,
+    )
+
+    print(
+        f"[PID:{pid}] {tag}: "
+        f"{len(x_train)} train, {len(x_test)} test, "
+        f"{len(selected_cols)} features",
+        flush=True,
+    )
+
+    for model_name in active_models:
+        try:
             print(
-                f"[PID:{pid}] {year_tag} Only {len(raw_folds)} inner folds, "
-                f"need {MIN_VALID_FOLDS}. Skipping.",
+                f"[PID:{pid}] {tag} tuning {model_name}...",
                 flush=True,
             )
-            for t in active_targets:
-                for m in active_models:
-                    all_results.append(_make_error_row(
-                        strategy, branch, t, m,
-                        f"Only {len(raw_folds)} inner folds for test_year={outer_test_year}",
-                        outer_test_year=outer_test_year,
-                    ))
-            continue
-
-        print(f"[PID:{pid}] {year_tag} Preprocessing outer split...", flush=True)
-        branch_outer = prepare_branch_outer_frames(split, branch)
-
-        print(f"[PID:{pid}] {year_tag} Preprocessing {len(raw_folds)} CV folds...", flush=True)
-        fold_frames = prepare_branch_fold_frames(raw_folds, branch)
-
-        train_frame = branch_outer["train_frame"]
-        test_frame = branch_outer["test_frame"]
-        preprocessor = branch_outer["preprocessor"]
-
-        for target in active_targets:
-            print(f"[PID:{pid}] {year_tag} target={target}...", flush=True)
-
-            x_train, y_train, feat_cols = extract_xy(train_frame, target)
-            x_test, y_test, _ = extract_xy(test_frame, target)
-
-            # Compute intersection of feature columns across outer train and all CV folds
-            fold_feat_sets = []
-            for fold in fold_frames:
-                x_fold, _, fc = extract_xy(fold["train_frame"], target)
-                if not x_fold.empty:
-                    fold_feat_sets.append(set(fc))
-            if fold_feat_sets:
-                common_feats = sorted(set(feat_cols) & set.intersection(*fold_feat_sets))
-            else:
-                common_feats = list(feat_cols)
-
-            # Feature selection on common features only
-            selector = fit_feature_selector(x_train[common_feats], y_train)
-            x_train, selected_cols = apply_feature_selector(
-                selector, x_train[common_feats], common_feats,
+            t0 = time.monotonic()
+            tuning_result, trial_rows = tune_model(
+                prepared_folds, strategy, branch, target, model_name,
             )
-            x_test, _ = apply_feature_selector(selector, x_test[common_feats], common_feats)
+            timing_records.append(make_record(
+                operation="model_tuning",
+                elapsed_seconds=time.monotonic() - t0,
+                model_name=model_name,
+                detail=f"{tuning_result['trial_count']} trials",
+                **ctx,
+            ))
 
-            # Prepare CV folds with the same selector
-            prepared_folds = prepare_cv_fold_data(
-                fold_frames, target,
-                feature_selector=selector,
-                all_feature_columns=common_feats,
+            # Tag trial rows with outer_test_year for traceability
+            for tr in trial_rows:
+                tr["outer_test_year"] = outer_test_year
+            all_trials.extend(trial_rows)
+            best_params = tuning_result["best_params"]
+
+            t0 = time.monotonic()
+            train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
+                model_name, best_params,
+                x_train, y_train, x_test, y_test,
             )
+            timing_records.append(make_record(
+                operation="model_evaluation",
+                elapsed_seconds=time.monotonic() - t0,
+                model_name=model_name,
+                **ctx,
+            ))
 
             print(
-                f"[PID:{pid}] {year_tag} target={target}: "
-                f"{len(x_train)} train, {len(x_test)} test, "
-                f"{len(selected_cols)} features",
+                f"[PID:{pid}] {tag} {model_name}: "
+                f"outer_test_mae={test_metrics['mae']:.4f}",
                 flush=True,
             )
 
-            for model_name in active_models:
-                try:
-                    print(
-                        f"[PID:{pid}] {year_tag} target={target} tuning {model_name}...",
-                        flush=True,
-                    )
-                    tuning_result, trial_rows = tune_model(
-                        prepared_folds, strategy, branch, target, model_name,
-                    )
-                    # Tag trial rows with outer_test_year for traceability
-                    for tr in trial_rows:
-                        tr["outer_test_year"] = outer_test_year
-                    all_trials.extend(trial_rows)
-                    best_params = tuning_result["best_params"]
+            artifact = {
+                "model": fitted_model,
+                "preprocessor": preprocessor,
+                "feature_selector": selector,
+                "selected_feature_columns": selected_cols,
+                "target": target,
+                "branch": branch,
+                "model_name": model_name,
+                "params": best_params,
+                "feature_columns": feat_cols,
+                "metrics": {
+                    "outer_train": train_metrics,
+                    "outer_test": test_metrics,
+                },
+                "outer_strategy": strategy,
+                "outer_test_year": outer_test_year,
+            }
 
-                    train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
-                        model_name, best_params,
-                        x_train, y_train, x_test, y_test,
-                    )
+            result_row: dict[str, Any] = {
+                "status": "ok",
+                "outer_strategy": strategy,
+                "outer_test_year": outer_test_year,
+                "target": target,
+                "branch": branch,
+                "model_name": model_name,
+                "best_params_json": serialize_params(best_params),
+                "penalized_cv_loss": tuning_result["penalized_cv_loss"],
+                "gap_penalty": tuning_result["gap_penalty"],
+                "cv_train_mean_mae": tuning_result["cv_train_mean_mae"],
+                "cv_mean_mae": tuning_result["cv_mean_mae"],
+                "cv_mae_gap_abs": tuning_result["cv_mae_gap_abs"],
+                "cv_mae_gap_ratio": tuning_result["cv_mae_gap_ratio"],
+                "cv_positive_gap_fold_share": tuning_result["cv_positive_gap_fold_share"],
+                "folds_used": tuning_result["folds_used"],
+                "trial_count": tuning_result["trial_count"],
+                "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
+                "outer_train_rows": int(len(x_train)),
+                "outer_test_rows": int(len(x_test)),
+                "feature_count": int(len(selected_cols)),
+                "outer_train_mae": train_metrics["mae"],
+                "outer_test_mae": test_metrics["mae"],
+                "error": "",
+                "artifact": artifact,
+            }
+            result_row.update(classify_overfitting(result_row))
+            all_results.append(result_row)
+        except Exception as exc:
+            all_results.append(_make_error_row(
+                strategy, branch, target, model_name,
+                f"{type(exc).__name__}: {exc}",
+                outer_test_year=outer_test_year,
+            ))
 
-                    print(
-                        f"[PID:{pid}] {year_tag} target={target} {model_name}: "
-                        f"outer_test_mae={test_metrics['mae']:.4f}",
-                        flush=True,
-                    )
-
-                    artifact = {
-                        "model": fitted_model,
-                        "preprocessor": preprocessor,
-                        "feature_selector": selector,
-                        "selected_feature_columns": selected_cols,
-                        "target": target,
-                        "branch": branch,
-                        "model_name": model_name,
-                        "params": best_params,
-                        "feature_columns": feat_cols,
-                        "metrics": {
-                            "outer_train": train_metrics,
-                            "outer_test": test_metrics,
-                        },
-                        "outer_strategy": strategy,
-                        "outer_test_year": outer_test_year,
-                    }
-
-                    result_row: dict[str, Any] = {
-                        "status": "ok",
-                        "outer_strategy": strategy,
-                        "outer_test_year": outer_test_year,
-                        "target": target,
-                        "branch": branch,
-                        "model_name": model_name,
-                        "best_params_json": serialize_params(best_params),
-                        "penalized_cv_loss": tuning_result["penalized_cv_loss"],
-                        "gap_penalty": tuning_result["gap_penalty"],
-                        "cv_train_mean_mae": tuning_result["cv_train_mean_mae"],
-                        "cv_mean_mae": tuning_result["cv_mean_mae"],
-                        "cv_mae_gap_abs": tuning_result["cv_mae_gap_abs"],
-                        "cv_mae_gap_ratio": tuning_result["cv_mae_gap_ratio"],
-                        "cv_positive_gap_fold_share": tuning_result["cv_positive_gap_fold_share"],
-                        "folds_used": tuning_result["folds_used"],
-                        "trial_count": tuning_result["trial_count"],
-                        "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
-                        "outer_train_rows": int(len(x_train)),
-                        "outer_test_rows": int(len(x_test)),
-                        "feature_count": int(len(selected_cols)),
-                        "outer_train_mae": train_metrics["mae"],
-                        "outer_test_mae": test_metrics["mae"],
-                        "error": "",
-                        "artifact": artifact,
-                    }
-                    result_row.update(classify_overfitting(result_row))
-                    all_results.append(result_row)
-                except Exception as exc:
-                    all_results.append(_make_error_row(
-                        strategy, branch, target, model_name,
-                        f"{type(exc).__name__}: {exc}",
-                        outer_test_year=outer_test_year,
-                    ))
-
-    return all_results, all_trials
+    timing_records.append(make_record(
+        operation="combo_worker_total",
+        elapsed_seconds=time.monotonic() - combo_t0,
+        **ctx,
+    ))
+    return all_results, all_trials, timing_records
 
 
 # =============================================================================
@@ -895,8 +1151,10 @@ def _run_combo_worker(
 def _consume_worker_output(
     combo_results: list[dict[str, Any]],
     combo_trials: list[dict[str, Any]],
+    combo_timing: list[TimingRecord],
     all_outer_result_rows: list[dict[str, Any]],
     all_trial_rows: list[dict[str, Any]],
+    all_timing_rows: list[TimingRecord],
 ) -> None:
     for result_row in combo_results:
         artifact = result_row.pop("artifact", None)
@@ -915,6 +1173,7 @@ def _consume_worker_output(
             result_row["artifact_path"] = str(artifact_path)
         all_outer_result_rows.append(result_row)
     all_trial_rows.extend(combo_trials)
+    all_timing_rows.extend(combo_timing)
     persist_partial_outputs(all_trial_rows, all_outer_result_rows)
 
 
@@ -947,9 +1206,11 @@ def run() -> None:
     raw_df = load_panel_data(verbose=True)
 
     combos = [
-        (strategy, branch)
+        (strategy, branch, target, outer_test_year)
         for strategy in ACTIVE_OUTER_STRATEGIES
         for branch in ACTIVE_BRANCHES
+        for target in ACTIVE_TARGETS
+        for outer_test_year in OUTER_TEST_YEARS
     ]
 
     max_workers = min(len(combos), DEFAULT_CPU_WORKERS)
@@ -957,6 +1218,7 @@ def run() -> None:
 
     all_trial_rows: list[dict[str, Any]] = []
     all_outer_result_rows: list[dict[str, Any]] = []
+    all_timing_rows: list[TimingRecord] = []
     completed = 0
     total = len(combos)
 
@@ -964,73 +1226,95 @@ def run() -> None:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
-                    _run_combo_worker, raw_df, strategy, branch,
-                    list(ACTIVE_TARGETS), list(ACTIVE_MODELS),
-                ): (strategy, branch)
-                for strategy, branch in combos
+                    _run_combo_worker, raw_df, strategy, branch, target, outer_test_year,
+                    list(ACTIVE_MODELS),
+                ): (strategy, branch, target, outer_test_year)
+                for strategy, branch, target, outer_test_year in combos
             }
             for future in as_completed(futures):
-                strategy, branch = futures[future]
+                strategy, branch, target, outer_test_year = futures[future]
                 completed += 1
                 try:
-                    combo_results, combo_trials = future.result()
+                    combo_results, combo_trials, combo_timing = future.result()
                     _consume_worker_output(
-                        combo_results, combo_trials, all_outer_result_rows, all_trial_rows,
+                        combo_results, combo_trials, combo_timing,
+                        all_outer_result_rows, all_trial_rows, all_timing_rows,
                     )
                     logger.info(
-                        f"[{completed}/{total}] Done: {strategy}/{branch} "
+                        f"[{completed}/{total}] Done: {strategy}/{branch}/{target}/{outer_test_year} "
                         f"({len(combo_results)} results)"
                     )
                 except Exception as exc:
-                    logger.error(f"[{completed}/{total}] FAILED: {strategy}/{branch}: {exc}")
-                    for target in ACTIVE_TARGETS:
-                        for model_name in ACTIVE_MODELS:
-                            for oty in OUTER_TEST_YEARS:
-                                all_outer_result_rows.append(
-                                    _make_error_row(
-                                        strategy, branch, target, model_name,
-                                        str(exc), outer_test_year=oty,
-                                    )
-                                )
+                    logger.error(
+                        f"[{completed}/{total}] FAILED: "
+                        f"{strategy}/{branch}/{target}/{outer_test_year}: {exc}"
+                    )
+                    for model_name in ACTIVE_MODELS:
+                        all_outer_result_rows.append(
+                            _make_error_row(
+                                strategy, branch, target, model_name,
+                                str(exc), outer_test_year=outer_test_year,
+                            )
+                        )
                     persist_partial_outputs(all_trial_rows, all_outer_result_rows)
     except PermissionError as exc:
         logger.warning(f"Process pool unavailable ({exc}). Running sequentially.")
-        for strategy, branch in combos:
+        for strategy, branch, target, outer_test_year in combos:
             completed += 1
             try:
-                combo_results, combo_trials = _run_combo_worker(
-                    raw_df, strategy, branch, list(ACTIVE_TARGETS), list(ACTIVE_MODELS),
+                combo_results, combo_trials, combo_timing = _run_combo_worker(
+                    raw_df, strategy, branch, target, outer_test_year, list(ACTIVE_MODELS),
                 )
                 _consume_worker_output(
-                    combo_results, combo_trials, all_outer_result_rows, all_trial_rows,
+                    combo_results, combo_trials, combo_timing,
+                    all_outer_result_rows, all_trial_rows, all_timing_rows,
                 )
-                logger.info(f"[{completed}/{total}] Done: {strategy}/{branch}")
+                logger.info(
+                    f"[{completed}/{total}] Done: {strategy}/{branch}/{target}/{outer_test_year}"
+                )
             except Exception as inner_exc:
-                logger.error(f"[{completed}/{total}] FAILED: {strategy}/{branch}: {inner_exc}")
-                for target in ACTIVE_TARGETS:
-                    for model_name in ACTIVE_MODELS:
-                        for oty in OUTER_TEST_YEARS:
-                            all_outer_result_rows.append(
-                                _make_error_row(
-                                    strategy, branch, target, model_name,
-                                    str(inner_exc), outer_test_year=oty,
-                                )
-                            )
+                logger.error(
+                    f"[{completed}/{total}] FAILED: "
+                    f"{strategy}/{branch}/{target}/{outer_test_year}: {inner_exc}"
+                )
+                for model_name in ACTIVE_MODELS:
+                    all_outer_result_rows.append(
+                        _make_error_row(
+                            strategy, branch, target, model_name,
+                            str(inner_exc), outer_test_year=outer_test_year,
+                        )
+                    )
                 persist_partial_outputs(all_trial_rows, all_outer_result_rows)
 
     persist_partial_outputs(all_trial_rows, all_outer_result_rows)
 
     outer_results_df = pd.DataFrame(all_outer_result_rows)
+
+    t0 = time.monotonic()
     winners_df = select_winners(outer_results_df)
+    all_timing_rows.append(make_record(
+        phase="winner_selection", operation="winner_selection",
+        elapsed_seconds=time.monotonic() - t0,
+    ))
+
     overfitting_audit_df = build_overfitting_audit_df(outer_results_df, winners_df)
 
     winners_df.to_csv(WINNERS_PATH, index=False)
     overfitting_audit_df.to_csv(OVERFITTING_AUDIT_PATH, index=False)
 
-    final_results_df, final_preds_df, final_summary_df = refit_final_models(raw_df, winners_df)
+    final_results_df, final_preds_df, final_summary_df, refit_timing = refit_final_models(raw_df, winners_df)
+    all_timing_rows.extend(refit_timing)
+
     final_results_df.to_csv(FINAL_RESULTS_PATH, index=False)
     final_preds_df.to_csv(FINAL_BOOTSTRAP_PREDICTIONS_PATH, index=False)
     final_summary_df.to_csv(FINAL_PREDICTION_SUMMARY_PATH, index=False)
+
+    # Write timing CSV
+    if all_timing_rows:
+        timing_df = pd.DataFrame(all_timing_rows)
+        timing_df.sort_values("timestamp_utc", inplace=True)
+        timing_df.to_csv(TIMING_PATH, index=False)
+        logger.info(f"Timing records written: {len(timing_df)} rows → {TIMING_PATH}")
 
     logger.info("=" * 80)
     logger.info("Training Complete")

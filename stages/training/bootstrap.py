@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
@@ -24,6 +25,7 @@ from stages.training.helpers import (
     evaluate_metrics,
     fit_model,
 )
+from stages.training.timing import TimingRecord, make_record
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,8 @@ def _run_one_iteration(
     y_test_scored: pd.Series,
     x_test_all: pd.DataFrame,
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], np.ndarray]:
+) -> tuple[int, dict[str, float], dict[str, float], np.ndarray, float]:
+    t0 = time.monotonic()
     bootstrap_seed = PIPELINE_RANDOM_STATE + iteration_idx
     x_boot = x_train.sample(frac=1.0, replace=True, random_state=bootstrap_seed)
     y_boot = y_train.loc[x_boot.index]
@@ -78,7 +81,8 @@ def _run_one_iteration(
     scored_metrics = evaluate_metrics(y_test_scored, scored_preds)
 
     all_preds = model.predict(x_test_all)
-    return iteration_idx, train_metrics, scored_metrics, all_preds
+    elapsed = time.monotonic() - t0
+    return iteration_idx, train_metrics, scored_metrics, all_preds, elapsed
 
 
 def _init_worker(
@@ -106,7 +110,7 @@ def _init_worker(
 
 def _run_iteration_from_state(
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], np.ndarray]:
+) -> tuple[int, dict[str, float], dict[str, float], np.ndarray, float]:
     state = _WORKER_STATE
     if state is None:
         raise RuntimeError("Worker state not initialized.")
@@ -131,13 +135,21 @@ def run_final_bootstrap_iterations(
     x_test_scored: pd.DataFrame,
     y_test_scored: pd.Series,
     x_test_all: pd.DataFrame,
-) -> list[tuple[int, dict[str, float], dict[str, float], np.ndarray]]:
+    bootstrap_workers: int | None = None,
+) -> tuple[
+    list[tuple[int, dict[str, float], dict[str, float], np.ndarray, float]],
+    list[TimingRecord],
+]:
     iteration_indices = list(range(FINAL_BOOTSTRAP_ITERATIONS))
+    effective_max = bootstrap_workers if bootstrap_workers is not None else FINAL_BOOTSTRAP_MAX_WORKERS
     max_workers = min(
         FINAL_BOOTSTRAP_ITERATIONS,
-        max(1, FINAL_BOOTSTRAP_MAX_WORKERS),
+        max(1, effective_max),
         DEFAULT_CPU_WORKERS,
     )
+
+    bootstrap_total_t0 = time.monotonic()
+    results: list[tuple[int, dict[str, float], dict[str, float], np.ndarray, float]]
 
     if FINAL_BOOTSTRAP_ITERATIONS > 1 and max_workers > 1:
         logger.info(
@@ -159,10 +171,12 @@ def run_final_bootstrap_iterations(
                     executor.submit(_run_iteration_from_state, idx)
                     for idx in iteration_indices
                 ]
-                return sorted(
+                results = sorted(
                     [f.result() for f in as_completed(futures)],
                     key=lambda item: item[0],
                 )
+                timing_records = _build_bootstrap_timing(results, bootstrap_total_t0)
+                return results, timing_records
         except PermissionError as exc:
             logger.warning(
                 f"Process pool unavailable for target={target} ({exc}). "
@@ -172,7 +186,7 @@ def run_final_bootstrap_iterations(
     logger.info(
         f"Final bootstrap sequential: target={target} iterations={FINAL_BOOTSTRAP_ITERATIONS}"
     )
-    return [
+    results = [
         _run_one_iteration(
             model_name=model_name,
             best_params=best_params,
@@ -185,3 +199,24 @@ def run_final_bootstrap_iterations(
         )
         for idx in iteration_indices
     ]
+    timing_records = _build_bootstrap_timing(results, bootstrap_total_t0)
+    return results, timing_records
+
+
+def _build_bootstrap_timing(
+    results: list[tuple[int, dict[str, float], dict[str, float], np.ndarray, float]],
+    total_t0: float,
+) -> list[TimingRecord]:
+    records: list[TimingRecord] = []
+    for iteration_idx, _, _, _, elapsed in results:
+        records.append(make_record(
+            phase="", operation="bootstrap_iteration",
+            elapsed_seconds=elapsed,
+            bootstrap_iteration=iteration_idx,
+        ))
+    records.append(make_record(
+        phase="", operation="bootstrap_total",
+        elapsed_seconds=time.monotonic() - total_t0,
+        detail=f"{len(results)} iterations",
+    ))
+    return records

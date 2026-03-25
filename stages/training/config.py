@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from pathlib import Path
@@ -37,7 +38,8 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 5000
 
-ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp"]
+# ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp"]
+ACTIVE_MODELS = ["huber", "bayesian_ridge", "extra_trees", "gradient_boosting", "hist_gradient_boosting", "adaboost"]
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -56,10 +58,16 @@ SELECTION_TOLERANCE = 0.01  # 1% relative tolerance
 MODEL_COMPLEXITY_RANK: dict[str, int] = {
     "ridge": 1,
     "elasticnet": 2,
-    "svr": 3,
-    "random_forest": 4,
-    "xgboost": 5,
-    "mlp": 6,
+    "bayesian_ridge": 3,
+    "huber": 4,
+    "svr": 5,
+    "adaboost": 6,
+    "random_forest": 7,
+    "extra_trees": 8,
+    "gradient_boosting": 9,
+    "hist_gradient_boosting": 10,
+    "xgboost": 11,
+    "mlp": 12,
 }
 MAX_LOSS = 1e12
 MODEL_RANDOM_STATE = PIPELINE_RANDOM_STATE
@@ -72,6 +80,12 @@ MAX_TUNING_TRIALS_PER_MODEL: dict[str, int] = {
     "svr": 20,
     "random_forest": 30,
     "mlp": 30,
+    "huber": 20,
+    "bayesian_ridge": 15,
+    "extra_trees": 30,
+    "gradient_boosting": 35,
+    "hist_gradient_boosting": 35,
+    "adaboost": 25,
 }
 
 # Penalization: penalized_loss = cv_mean_mae * (1 + gap_penalty)
@@ -83,13 +97,23 @@ GAP_RATIO_CAP = 3.0
 OVERFIT_GAP_RATIO_THRESHOLD = 0.50
 
 # Feature selection
-N_FEATURES_TO_SELECT = 80
+N_FEATURES_TO_SELECT = 30
 
 # =============================================================================
 # Output paths
 # =============================================================================
 
-OUTPUT_DIR = Path("results/training")
+def _build_run_tag() -> str:
+    tag = os.environ.get("RUN_TAG", "").strip()
+    if tag:
+        return tag
+    tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.environ["RUN_TAG"] = tag  # freeze for spawn-ed worker processes
+    return tag
+
+
+RUN_TAG = _build_run_tag()
+OUTPUT_DIR = Path(f"results/training_{RUN_TAG}")
 TRIALS_PATH = OUTPUT_DIR / "trials.csv"
 OUTER_RESULTS_PATH = OUTPUT_DIR / "outer_results.csv"
 WINNERS_PATH = OUTPUT_DIR / "winners.csv"
@@ -97,6 +121,7 @@ FINAL_RESULTS_PATH = OUTPUT_DIR / "final_results.csv"
 FINAL_BOOTSTRAP_PREDICTIONS_PATH = OUTPUT_DIR / "final_bootstrap_predictions.csv"
 FINAL_PREDICTION_SUMMARY_PATH = OUTPUT_DIR / "final_prediction_summary.csv"
 OVERFITTING_AUDIT_PATH = OUTPUT_DIR / "overfitting_audit.csv"
+TIMING_PATH = OUTPUT_DIR / "timing.csv"
 OUTER_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "outer_winners"
 FINAL_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "final"
 

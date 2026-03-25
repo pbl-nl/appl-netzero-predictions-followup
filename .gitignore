@@ -19,38 +19,22 @@ venv/
 
 # --- File type policy ---
 # Ignore Markdown except README.md
-*.md
-!README.md
+OVERFITTING_COMPARISON_REPORT.md
 
 # Ignore data/archive formats everywhere
-*.json
-*.csv
-*.zip
-*.xlsx
-*.pt
 *.joblib
-*.png
-*.html
-!modules/config.json
 
-# Allow archived source files in old_data/
-!data/old_data/
-!data/old_data/**
-!results/
-!results/training/
-!results/training/*.csv
 
 # --- Project artifacts / data folders ---
-data/old_reproduce/
-data/new_reproduce/
-data/processed/
-data/merged/
-data/raw/*
-data/cleaned/
+old_reproduce/
+new_reproduce/
+processed/
+merged/
+raw/
+old/
 
-!data/raw/8624f431-en_2023.csv
-!data/netzero/*
-old
+!8624f431-en_2023.csv
+
 
 # --- Claude / agent tooling directories ---
 .claude/

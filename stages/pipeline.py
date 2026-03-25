@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -311,6 +312,7 @@ class Preprocessor:
             raise ValueError(f"Unsupported branches: {invalid}")
 
         self.active_branches_ = list(active_branches)
+        self.timing_records_: list[dict[str, Any]] = []
 
         # Fitted state — set during fit_transform
         self.feature_columns_: list[str] = []
@@ -335,11 +337,19 @@ class Preprocessor:
     # -----------------------------------------------------------------
     def fit_transform(self, train_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         pid = os.getpid()
+        self.timing_records_ = []
         self.feature_columns_ = get_feature_columns(train_df)
         self.continuous_features_ = get_continuous_features(train_df, self.feature_columns_)
 
         # Phase 1: Clean
+        t0 = time.monotonic()
         cleaned = self._clean(train_df, history_df=None, fit=True)
+        self.timing_records_.append({
+            "operation": "preprocess_sub_phase", "sub_operation": "clean",
+            "elapsed_seconds": time.monotonic() - t0,
+            "rows_in": len(train_df), "rows_out": len(cleaned),
+            "detail": "fit_transform",
+        })
         self.retained_raw_features_ = [
             c for c in self.feature_columns_ if c not in self.columns_to_drop_
         ]
@@ -354,19 +364,50 @@ class Preprocessor:
         )
 
         # Fit imputers on cleaned training data
+        t0 = time.monotonic()
         self._fit_imputers(cleaned)
+        self.timing_records_.append({
+            "operation": "preprocess_sub_phase", "sub_operation": "fit_imputers",
+            "elapsed_seconds": time.monotonic() - t0,
+            "rows_in": len(cleaned), "rows_out": len(cleaned),
+            "detail": "fit_transform",
+        })
 
         # Phase 2 + 3 per branch: Impute → Engineer
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
+            t0 = time.monotonic()
             imputed = self._impute(cleaned, branch)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "impute",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(cleaned), "rows_out": len(imputed),
+                "detail": f"fit_transform/{branch}",
+            })
             feat_cols = get_feature_columns(imputed)
             nans = int(imputed[feat_cols].isna().sum().sum())
             print(f"[PID:{pid}] Imputation ({branch}): {nans} NaNs remaining", flush=True)
 
+            t0 = time.monotonic()
             engineered = self._engineer(imputed, history_df=None)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "engineer",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(imputed), "rows_out": len(engineered),
+                "n_features": len(get_feature_columns(engineered)),
+                "detail": f"fit_transform/{branch}",
+            })
+
+            t0 = time.monotonic()
             final = self._encode_and_scale(engineered, branch, fit=True)
             n_feats = len(self.final_feature_columns_[branch])
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "encode_and_scale",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(engineered), "rows_out": len(final),
+                "n_features": n_feats,
+                "detail": f"fit_transform/{branch}",
+            })
             print(
                 f"[PID:{pid}] Engineering ({branch}): "
                 f"{len(self.retained_continuous_features_)}→{n_feats} features",
@@ -383,18 +424,70 @@ class Preprocessor:
         split_name: str = "data",
         drop_rows: bool = True,
     ) -> dict[str, pd.DataFrame]:
+        self.timing_records_ = []
+
+        t0 = time.monotonic()
         cleaned = self._clean(df, history_df=history_df, fit=False, drop_rows=drop_rows)
+        self.timing_records_.append({
+            "operation": "preprocess_sub_phase", "sub_operation": "clean",
+            "elapsed_seconds": time.monotonic() - t0,
+            "rows_in": len(df), "rows_out": len(cleaned),
+            "detail": f"transform/{split_name}",
+        })
 
         history_cleaned: pd.DataFrame | None = None
         if history_df is not None and not history_df.empty:
+            t0 = time.monotonic()
             history_cleaned = self._clean(history_df, history_df=None, fit=False)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "clean_history",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(history_df), "rows_out": len(history_cleaned),
+                "detail": f"transform/{split_name}",
+            })
 
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
+            t0 = time.monotonic()
             imputed = self._impute(cleaned, branch)
-            history_imputed = self._impute(history_cleaned, branch) if history_cleaned is not None else None
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "impute",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(cleaned), "rows_out": len(imputed),
+                "detail": f"transform/{split_name}/{branch}",
+            })
+
+            history_imputed = None
+            if history_cleaned is not None:
+                t0 = time.monotonic()
+                history_imputed = self._impute(history_cleaned, branch)
+                self.timing_records_.append({
+                    "operation": "preprocess_sub_phase", "sub_operation": "impute_history",
+                    "elapsed_seconds": time.monotonic() - t0,
+                    "rows_in": len(history_cleaned), "rows_out": len(history_imputed),
+                    "detail": f"transform/{split_name}/{branch}",
+                })
+
+            t0 = time.monotonic()
             engineered = self._engineer(imputed, history_df=history_imputed)
-            outputs[branch] = self._encode_and_scale(engineered, branch, fit=False)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "engineer",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(imputed), "rows_out": len(engineered),
+                "n_features": len(get_feature_columns(engineered)),
+                "detail": f"transform/{split_name}/{branch}",
+            })
+
+            t0 = time.monotonic()
+            result = self._encode_and_scale(engineered, branch, fit=False)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "encode_and_scale",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": len(engineered), "rows_out": len(result),
+                "n_features": len(self.final_feature_columns_.get(branch, [])),
+                "detail": f"transform/{split_name}/{branch}",
+            })
+            outputs[branch] = result
 
         return outputs
 

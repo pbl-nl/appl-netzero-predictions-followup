@@ -1,3 +1,2 @@
-data/raw/*.csv filter=lfs diff=lfs merge=lfs -text
-data/old_data/*.csv filter=lfs diff=lfs merge=lfs -text
-results/training/*.csv filter=lfs diff=lfs merge=lfs -text
+data/** filter=lfs diff=lfs merge=lfs -text
+results/** filter=lfs diff=lfs merge=lfs -text
