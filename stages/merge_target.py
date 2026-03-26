@@ -543,7 +543,8 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
     # Apply natural log: ln(value) where value > 0, else NaN
     for col in SCENARIO_ALPHAS:
         vals = pd.to_numeric(target[col], errors="coerce")
-        target[col] = np.where(vals > 0, np.log(vals), np.nan)
+        safe_vals = vals.where(vals > 0, np.nan)
+        target[col] = np.log(safe_vals)
 
     return target[scenario_cols].sort_values(["country", "year"]).reset_index(drop=True)
 
