@@ -69,10 +69,10 @@ WORLD_BANK_SOURCES = [
     {"name": "world_bank_total_population", "indicator": "SP.POP.TOTL", "source": 2},
     {"name": "world_bank_gdp_ppp", "indicator": "NY.GDP.MKTP.PP.KD", "source": 2},
     {"name": "world_bank_annual_deforestation", "indicator": "ER.FST.DFST.ZG", "source": 18},
-    {"name": "world_bank_control_of_corruption", "indicator": "CC.EST", "source": 3},
-    {"name": "world_bank_absence_of_violence_terrorism", "indicator": "PV.EST", "source": 3},
-    {"name": "world_bank_regulatory_quality", "indicator": "RQ.EST", "source": 3},
-    {"name": "world_bank_voice_and_accountability", "indicator": "VA.EST", "source": 3},
+    {"name": "world_bank_control_of_corruption", "indicator": "CC.EST", "source": 2},
+    {"name": "world_bank_absence_of_violence_terrorism", "indicator": "PV.EST", "source": 2},
+    {"name": "world_bank_regulatory_quality", "indicator": "RQ.EST", "source": 2},
+    {"name": "world_bank_voice_and_accountability", "indicator": "VA.EST", "source": 2},
 ]
 
 
