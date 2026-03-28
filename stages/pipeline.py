@@ -17,6 +17,7 @@ import pandas as pd
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, RobustScaler, StandardScaler
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ SCALER_CHOICE = "standard"  # Options: "standard", "minmax", "robust"
 MICE_MAX_ITER = 20
 MICE_TOL = 1e-3
 MICE_SKIP_COMPLETE = True
+MICE_COUNTRY_N_COMPONENTS = 5
 
 SHOW_SAMPLE_ROWS = 3
 TOP_MISSINGNESS_ROWS = 10
@@ -304,7 +306,11 @@ class Preprocessor:
         val_outputs = prep.transform(val_df, history_df=train_df)
     """
 
-    def __init__(self, active_branches: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        active_branches: list[str] | None = None,
+        train_start_year: int | None = None,
+    ) -> None:
         if active_branches is None:
             active_branches = list(BRANCH_NAMES)
         invalid = sorted(set(active_branches) - set(BRANCH_NAMES))
@@ -312,6 +318,7 @@ class Preprocessor:
             raise ValueError(f"Unsupported branches: {invalid}")
 
         self.active_branches_ = list(active_branches)
+        self.train_start_year_: int | None = train_start_year
         self.timing_records_: list[dict[str, Any]] = []
 
         # Fitted state — set during fit_transform
@@ -321,16 +328,127 @@ class Preprocessor:
         self.retained_continuous_features_: list[str] = []
         self.columns_to_drop_: set[str] = set()
 
+        # Country PCA embeddings
+        self.country_embedding_map_: dict[str, np.ndarray] = {}
+        self.country_pca_global_fallback_: np.ndarray = np.zeros(MICE_COUNTRY_N_COMPONENTS)
+        self.country_n_pca_components_: int = 0
+        self.pca_component_names_: list[str] = []
+
+        # Year standardization
+        self.year_mean_: float = 0.0
+        self.year_std_: float = 1.0
+
+        # Names of all synthetic (non-engineerable) columns
+        self.synthetic_feature_names_: list[str] = []
+
         # Imputers
         self.simple_imputer_: CountryYearFallbackImputer | None = None
         self.mice_numeric_imputer_: IterativeImputer | None = None
         self.mice_categorical_imputer_: SimpleImputer | None = None
         self.numeric_global_fallback_: pd.Series | None = None
 
+        # MICE pre-scaling
+        self.mice_scaler_means_: pd.Series | None = None
+        self.mice_scaler_stds_: pd.Series | None = None
+
+        # Post-engineering VIF columns to drop (per branch)
+        self.post_eng_columns_to_drop_: dict[str, set[str]] = {}
+
         # Encoders / scalers per branch
         self.encoder_: dict[str, OneHotEncoder] = {}
         self.scaler_: dict[str, Any] = {}
         self.final_feature_columns_: dict[str, list[str]] = {}
+
+    # -----------------------------------------------------------------
+    # Synthetic feature helpers (country PCA + year features)
+    # -----------------------------------------------------------------
+    def _build_country_embeddings(self, cleaned_train_df: pd.DataFrame) -> None:
+        """Build country PCA embeddings from cleaned training data.
+
+        Called after _clean() and column-drop fitting so that the embedding
+        only uses retained continuous features (post sparse/zero-var removal).
+        Profile per country: median + missing-rate of each retained feature.
+        Fills holes with column medians, standardises, then reduces via PCA.
+        Also computes year standardisation parameters.
+        """
+        year_vals = cleaned_train_df[YEAR_COL].values.astype(float)
+        self.year_mean_ = float(np.nanmean(year_vals))
+        yr_std = float(np.nanstd(year_vals))
+        self.year_std_ = yr_std if yr_std > 0 else 1.0
+
+        # Use only columns that survived drop rules (sparse + zero-variance removal)
+        # so the country embedding is aligned with the pipeline's data-quality contract.
+        feats = [c for c in self.retained_continuous_features_ if c in cleaned_train_df.columns]
+        if not feats or COUNTRY_COL not in cleaned_train_df.columns:
+            self.country_embedding_map_ = {}
+            self.country_n_pca_components_ = 0
+            self.pca_component_names_ = []
+            return
+
+        grouped = cleaned_train_df.groupby(COUNTRY_COL)[feats]
+        medians = grouped.median()
+        miss_rates = grouped.apply(lambda g: g.isna().mean())
+
+        medians.columns = [f"med_{c}" for c in feats]
+        miss_rates.columns = [f"miss_{c}" for c in feats]
+        summary = pd.concat([medians, miss_rates], axis=1)
+        countries = summary.index.tolist()
+
+        # Fill remaining column-wise holes, standardise, PCA
+        fill_imp = SimpleImputer(strategy="median")
+        summary_filled = fill_imp.fit_transform(summary.values)
+
+        scaler = StandardScaler()
+        summary_scaled = scaler.fit_transform(summary_filled)
+
+        n_components = min(
+            MICE_COUNTRY_N_COMPONENTS,
+            max(len(countries) - 1, 1),
+            summary_scaled.shape[1],
+        )
+        if n_components < 1:
+            self.country_embedding_map_ = {}
+            self.country_n_pca_components_ = 0
+            self.pca_component_names_ = []
+            return
+
+        pca = PCA(n_components=n_components, random_state=RANDOM_STATE)
+        components = pca.fit_transform(summary_scaled)
+
+        self.country_embedding_map_ = {
+            country: components[i] for i, country in enumerate(countries)
+        }
+        self.country_n_pca_components_ = n_components
+        self.country_pca_global_fallback_ = np.zeros(n_components)
+        self.pca_component_names_ = [f"country_pc{i+1}" for i in range(n_components)]
+
+        logger.info(
+            f"Country embeddings: {len(countries)} countries -> "
+            f"{n_components} PCA components "
+            f"(explained variance: {pca.explained_variance_ratio_.sum():.1%})"
+        )
+
+    def _attach_synthetic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add permanent synthetic columns: country PCA components + year features."""
+        out = df.copy()
+
+        # Country PCA components
+        if self.country_n_pca_components_ > 0:
+            fallback = self.country_pca_global_fallback_
+            embeddings = np.array([
+                self.country_embedding_map_.get(c, fallback)
+                for c in out[COUNTRY_COL]
+            ])
+            for i, col_name in enumerate(self.pca_component_names_):
+                out[col_name] = embeddings[:, i]
+
+        # Standardised year + year squared
+        year_std = (out[YEAR_COL].values.astype(float) - self.year_mean_) / self.year_std_
+        out["year_std"] = year_std
+        out["year_std_sq"] = year_std ** 2
+
+        self.synthetic_feature_names_ = self.pca_component_names_ + ["year_std", "year_std_sq"]
+        return out
 
     # -----------------------------------------------------------------
     # Public API
@@ -341,7 +459,7 @@ class Preprocessor:
         self.feature_columns_ = get_feature_columns(train_df)
         self.continuous_features_ = get_continuous_features(train_df, self.feature_columns_)
 
-        # Phase 1: Clean
+        # Phase 1: Clean (fits column drops on cleaned data — sparse + zero-variance)
         t0 = time.monotonic()
         cleaned = self._clean(train_df, history_df=None, fit=True)
         self.timing_records_.append({
@@ -362,6 +480,14 @@ class Preprocessor:
             f"{len(self.retained_continuous_features_)} continuous features retained",
             flush=True,
         )
+
+        # Build country PCA embeddings + attach synthetic features (post-clean, post-drop)
+        self._build_country_embeddings(cleaned)
+        cleaned = self._attach_synthetic_features(cleaned)
+        self.feature_columns_.extend(self.synthetic_feature_names_)
+        self.continuous_features_.extend(self.synthetic_feature_names_)
+        self.retained_raw_features_.extend(self.synthetic_feature_names_)
+        self.retained_continuous_features_.extend(self.synthetic_feature_names_)
 
         # Fit imputers on cleaned training data
         t0 = time.monotonic()
@@ -394,6 +520,29 @@ class Preprocessor:
                 "operation": "preprocess_sub_phase", "sub_operation": "engineer",
                 "elapsed_seconds": time.monotonic() - t0,
                 "rows_in": len(imputed), "rows_out": len(engineered),
+                "n_features": len(get_feature_columns(engineered)),
+                "detail": f"fit_transform/{branch}",
+            })
+
+            # Apply year filter AFTER engineering (lags/rolling need older years)
+            # but BEFORE VIF (train on relevant years only)
+            pre_filter_rows = len(engineered)
+            if self.train_start_year_ is not None:
+                mask = engineered[YEAR_COL] >= self.train_start_year_
+                engineered = engineered[mask].reset_index(drop=True)
+                print(
+                    f"[PID:{pid}] Year filter ({branch}): "
+                    f"{pre_filter_rows}→{len(engineered)} rows (>={self.train_start_year_})",
+                    flush=True,
+                )
+
+            # Post-engineering VIF
+            t0 = time.monotonic()
+            engineered = self._post_engineering_vif(engineered, branch, fit=True)
+            self.timing_records_.append({
+                "operation": "preprocess_sub_phase", "sub_operation": "post_engineering_vif",
+                "elapsed_seconds": time.monotonic() - t0,
+                "rows_in": pre_filter_rows, "rows_out": len(engineered),
                 "n_features": len(get_feature_columns(engineered)),
                 "detail": f"fit_transform/{branch}",
             })
@@ -435,6 +584,9 @@ class Preprocessor:
             "detail": f"transform/{split_name}",
         })
 
+        # Attach synthetic features after cleaning (consistent with fit_transform)
+        cleaned = self._attach_synthetic_features(cleaned)
+
         history_cleaned: pd.DataFrame | None = None
         if history_df is not None and not history_df.empty:
             t0 = time.monotonic()
@@ -445,6 +597,7 @@ class Preprocessor:
                 "rows_in": len(history_df), "rows_out": len(history_cleaned),
                 "detail": f"transform/{split_name}",
             })
+            history_cleaned = self._attach_synthetic_features(history_cleaned)
 
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
@@ -477,6 +630,9 @@ class Preprocessor:
                 "n_features": len(get_feature_columns(engineered)),
                 "detail": f"transform/{split_name}/{branch}",
             })
+
+            # Post-engineering VIF (transform: drop same columns as fit)
+            engineered = self._post_engineering_vif(engineered, branch, fit=False)
 
             t0 = time.monotonic()
             result = self._encode_and_scale(engineered, branch, fit=False)
@@ -512,8 +668,10 @@ class Preprocessor:
             working = current.copy()
 
         # Outlier replacement (IQR, computed on merged data, applied to current only)
-        self._apply_outlier_pass(working, COUNTRY_COL, self.continuous_features_, COUNTRY_OUTLIER_MIN_OBS)
-        self._apply_outlier_pass(working, YEAR_COL, self.continuous_features_, YEAR_OUTLIER_MIN_OBS)
+        # Exclude synthetic features (PCA, year_std) — they are derived, not raw observations
+        outlier_features = [c for c in self.continuous_features_ if c not in self.synthetic_feature_names_]
+        self._apply_outlier_pass(working, COUNTRY_COL, outlier_features, COUNTRY_OUTLIER_MIN_OBS)
+        self._apply_outlier_pass(working, YEAR_COL, outlier_features, YEAR_OUTLIER_MIN_OBS)
 
         # Range validation
         self._apply_numeric_range_rules(working)
@@ -525,15 +683,18 @@ class Preprocessor:
         # Row drops: all targets missing OR excessive feature missingness
         if drop_rows:
             feature_cols = get_feature_columns(cleaned)
-            row_missing = cleaned[feature_cols].isna().mean(axis=1) > ROW_MISSINGNESS_THRESHOLD
+            # Measure missingness on real observed features only — synthetic columns
+            # (PCA, year_std) are always populated and would dilute the ratio.
+            real_feature_cols = [c for c in feature_cols if c not in self.synthetic_feature_names_]
+            row_missing = cleaned[real_feature_cols].isna().mean(axis=1) > ROW_MISSINGNESS_THRESHOLD
             all_targets_nan = cleaned[TARGET_COLS].isna().all(axis=1)
             drop_mask = all_targets_nan | row_missing
         else:
             drop_mask = pd.Series(False, index=cleaned.index)
 
-        # Column drops + VIF (only during fit, computed on retained rows)
+        # Column drops: sparse + zero-variance (only during fit, computed on retained rows)
         if fit:
-            self._fit_column_drops_and_vif(cleaned.loc[~drop_mask].copy())
+            self._fit_column_drops(cleaned.loc[~drop_mask].copy())
 
         cleaned = cleaned.loc[~drop_mask].copy()
         cleaned = cleaned.drop(columns=sorted(self.columns_to_drop_), errors="ignore")
@@ -577,42 +738,22 @@ class Preprocessor:
             invalid = current_mask & working[col].notna() & ~working[col].isin(sorted(allowed))
             working.loc[invalid, col] = np.nan
 
-    def _fit_column_drops_and_vif(self, train_frame: pd.DataFrame) -> None:
+    def _fit_column_drops(self, train_frame: pd.DataFrame) -> None:
+        """Drop sparse and zero-variance columns. VIF is now post-engineering only."""
         feature_cols = get_feature_columns(train_frame)
         sparse = train_frame[feature_cols].isna().mean()
         self.columns_to_drop_ = set(sparse[sparse >= SPARSE_COLUMN_THRESHOLD].index.tolist())
 
-        vif_candidates = [
+        candidates = [
             c for c in self.continuous_features_
             if c not in self.columns_to_drop_ and c in train_frame.columns
         ]
-        if not vif_candidates:
+        if not candidates:
             return
 
-        # Temp impute for VIF computation
-        temp = train_frame[ID_COLS + vif_candidates].copy()
-        temp_imputer = CountryYearFallbackImputer(numeric_features=vif_candidates, categorical_features=[])
-        temp = temp_imputer.fit_transform(temp)
-
-        matrix = temp[vif_candidates].copy()
+        matrix = train_frame[candidates]
         zero_var = [c for c in matrix.columns if matrix[c].nunique(dropna=False) <= 1]
         self.columns_to_drop_.update(zero_var)
-        matrix = matrix.drop(columns=zero_var, errors="ignore")
-
-        selected = matrix.columns.tolist()
-        for _ in range(MAX_VIF_ITERATIONS):
-            if len(selected) <= 1:
-                break
-            vif_df = compute_vif_values(matrix[selected])
-            if vif_df.empty:
-                break
-            max_row = vif_df.iloc[0]
-            if float(max_row["vif"]) <= VIF_CUTOFF:
-                break
-            selected.remove(str(max_row["feature"]))
-
-        vif_dropped = [c for c in matrix.columns.tolist() if c not in selected]
-        self.columns_to_drop_.update(vif_dropped)
 
     # -----------------------------------------------------------------
     # Phase 2: Impute
@@ -629,13 +770,21 @@ class Preprocessor:
             self.simple_imputer_.fit(cleaned_train)
 
         if "mice" in self.active_branches_ and self.retained_continuous_features_:
+            # Pre-scale for MICE: BayesianRidge has no built-in normalisation
+            self.mice_scaler_means_ = cleaned_train[self.retained_continuous_features_].mean()
+            self.mice_scaler_stds_ = cleaned_train[self.retained_continuous_features_].std().replace(0, 1)
+            scaled = (
+                (cleaned_train[self.retained_continuous_features_] - self.mice_scaler_means_)
+                / self.mice_scaler_stds_
+            )
+
             self.mice_numeric_imputer_ = IterativeImputer(
                 random_state=RANDOM_STATE,
                 max_iter=MICE_MAX_ITER,
                 tol=MICE_TOL,
                 skip_complete=MICE_SKIP_COMPLETE,
             )
-            self.mice_numeric_imputer_.fit(cleaned_train[self.retained_continuous_features_])
+            self.mice_numeric_imputer_.fit(scaled.values)
 
         if "mice" in self.active_branches_ and retained_cats:
             self.mice_categorical_imputer_ = SimpleImputer(strategy="most_frequent")
@@ -653,8 +802,16 @@ class Preprocessor:
             if self.mice_numeric_imputer_ is None and self.retained_continuous_features_:
                 raise RuntimeError("MICE imputer has not been fit.")
             if self.retained_continuous_features_:
-                numeric_vals = self.mice_numeric_imputer_.transform(out[self.retained_continuous_features_])
-                out[self.retained_continuous_features_] = numeric_vals
+                # Scale → impute → inverse-scale
+                scaled = (
+                    (out[self.retained_continuous_features_] - self.mice_scaler_means_)
+                    / self.mice_scaler_stds_
+                )
+                imputed_scaled = self.mice_numeric_imputer_.transform(scaled.values)
+                out[self.retained_continuous_features_] = (
+                    imputed_scaled * self.mice_scaler_stds_.values
+                    + self.mice_scaler_means_.values
+                )
                 if self.numeric_global_fallback_ is not None:
                     out[self.retained_continuous_features_] = out[
                         self.retained_continuous_features_
@@ -692,16 +849,22 @@ class Preprocessor:
         new_cols: dict[str, pd.Series] = {}
         col_names: list[str] = []
 
+        # Synthetic features (PCA, year_std) are excluded — they are static/derived
+        engineerable = [
+            c for c in self.retained_continuous_features_
+            if c not in self.synthetic_feature_names_
+        ]
+
         # Lags
         for lag in LAG_PERIODS:
-            for col in self.retained_continuous_features_:
+            for col in engineerable:
                 name = f"{col}_lag{lag}"
                 new_cols[name] = group[col].shift(lag)
                 col_names.append(name)
 
         # Diffs (skip rate features)
         if ENABLE_DIFF_FEATURES:
-            for col in self.retained_continuous_features_:
+            for col in engineerable:
                 if col not in RATE_FEATURES:
                     name = f"{col}_diff1"
                     new_cols[name] = group[col].diff(1)
@@ -710,14 +873,14 @@ class Preprocessor:
         # Pct changes
         if ENABLE_PCT_CHANGE_FEATURES:
             for col in PCT_CHANGE_FEATURES:
-                if col in self.retained_continuous_features_:
+                if col in engineerable:
                     name = f"{col}_pct_change1"
                     new_cols[name] = group[col].pct_change().replace([np.inf, -np.inf], np.nan)
                     col_names.append(name)
 
         # Rolling means
         for window in ROLLING_WINDOWS:
-            for col in self.retained_continuous_features_:
+            for col in engineerable:
                 name = f"{col}_rollmean{window}"
                 new_cols[name] = group[col].transform(
                     lambda s: s.rolling(window=window, min_periods=ROLLING_MIN_PERIODS).mean()
@@ -741,6 +904,79 @@ class Preprocessor:
             result[col_names] = result[col_names].fillna(STRUCTURAL_NA_FILL_VALUE)
 
         return result
+
+    def _post_engineering_vif(
+        self, df: pd.DataFrame, branch: str, fit: bool,
+    ) -> pd.DataFrame:
+        """VIF reduction after feature engineering. The only VIF in the pipeline."""
+        if not fit:
+            drop = self.post_eng_columns_to_drop_.get(branch, set())
+            if drop:
+                df = df.drop(columns=sorted(drop), errors="ignore")
+            return df
+
+        # VIF candidates: retained continuous raw features + their engineered
+        # derivatives only. Synthetic features (PCA, year_std) and categorical-
+        # origin columns are excluded — any future column outside this lineage
+        # is automatically excluded too.
+        base_features = set(
+            c for c in self.retained_continuous_features_
+            if c not in self.synthetic_feature_names_
+        )
+        eng_suffixes = (
+            [f"_lag{lag}" for lag in LAG_PERIODS]
+            + ["_diff1"]
+            + ["_pct_change1"]
+            + [f"_rollmean{w}" for w in ROLLING_WINDOWS]
+        )
+        vif_candidates = []
+        for col in get_feature_columns(df):
+            if col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            if col in base_features:
+                vif_candidates.append(col)
+                continue
+            # Check if col is an engineered derivative of a base feature
+            for suffix in eng_suffixes:
+                if col.endswith(suffix) and col[: -len(suffix)] in base_features:
+                    vif_candidates.append(col)
+                    break
+
+        if not vif_candidates:
+            self.post_eng_columns_to_drop_[branch] = set()
+            return df
+
+        # Temp-fill NaNs for VIF computation
+        matrix = df[vif_candidates].fillna(df[vif_candidates].median())
+
+        # Drop zero-variance columns
+        zero_var = [c for c in matrix.columns if matrix[c].nunique(dropna=False) <= 1]
+        matrix = matrix.drop(columns=zero_var, errors="ignore")
+
+        selected = matrix.columns.tolist()
+        for _ in range(MAX_VIF_ITERATIONS):
+            if len(selected) <= 1:
+                break
+            vif_df = compute_vif_values(matrix[selected])
+            if vif_df.empty:
+                break
+            max_row = vif_df.iloc[0]
+            if float(max_row["vif"]) <= VIF_CUTOFF:
+                break
+            selected.remove(str(max_row["feature"]))
+
+        vif_dropped = [c for c in matrix.columns.tolist() if c not in selected]
+        dropped = set(zero_var + vif_dropped)
+        self.post_eng_columns_to_drop_[branch] = dropped
+
+        if dropped:
+            logger.info(
+                f"Post-engineering VIF ({branch}): dropped {len(dropped)} columns "
+                f"({len(zero_var)} zero-var, {len(vif_dropped)} high-VIF)"
+            )
+            df = df.drop(columns=sorted(dropped), errors="ignore")
+
+        return df
 
     def _encode_and_scale(self, df: pd.DataFrame, branch: str, fit: bool) -> pd.DataFrame:
         feature_cols = get_feature_columns(df)

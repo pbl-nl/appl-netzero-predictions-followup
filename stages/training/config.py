@@ -47,9 +47,19 @@ ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
 # Nested temporal CV: outer test years for model selection (2022 is final holdout)
 OUTER_TEST_YEARS = [2018, 2019, 2020, 2021]
 
-# Inner expanding-window validation years (filtered to those available per outer fold)
-CV_VALIDATION_YEARS = [2016, 2017, 2018, 2019, 2020]
+# Inner expanding-window temporal CV
+N_TEMPORAL_CV_FOLDS = 5
 MIN_VALID_FOLDS = 2
+
+# Training year range: only use data from this year onwards (applied after feature engineering).
+# Set to None to use all available years.
+TRAIN_START_YEAR: int | None = None
+
+# Maximum allowed TRAIN_START_YEAR — guarantees enough years for N_TEMPORAL_CV_FOLDS
+# expanding-window folds in the most restrictive outer test year.
+# Formula: min(OUTER_TEST_YEARS) - N_TEMPORAL_CV_FOLDS - 1
+# NEVER CHANGE THIS VALUE — it is derived from OUTER_TEST_YEARS and N_TEMPORAL_CV_FOLDS
+MAX_TRAIN_START_YEAR = min(OUTER_TEST_YEARS) - N_TEMPORAL_CV_FOLDS - 1  # = 2012
 
 # Overfitting-control selection rule for winner selection
 # Models within SELECTION_TOLERANCE of the best mean outer test MAE are treated as

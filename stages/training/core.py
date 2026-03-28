@@ -21,8 +21,10 @@ from stages.training.config import (
     ACTIVE_OUTER_STRATEGIES,
     ACTIVE_TARGETS,
     COUNTRY_COL,
-    CV_VALIDATION_YEARS,
     DEFAULT_CPU_WORKERS,
+    MAX_TRAIN_START_YEAR,
+    N_TEMPORAL_CV_FOLDS,
+    TRAIN_START_YEAR,
     FINAL_ARTIFACTS_DIR,
     FINAL_BOOTSTRAP_ITERATIONS,
     FINAL_BOOTSTRAP_PREDICTIONS_PATH,
@@ -98,12 +100,19 @@ def make_nested_outer_split(
     return {"outer_train": train, "outer_test": test}
 
 
-def make_expanding_year_folds(raw_outer_train_df: pd.DataFrame) -> list[dict[str, Any]]:
-    folds: list[dict[str, Any]] = []
+def make_expanding_year_folds(
+    raw_outer_train_df: pd.DataFrame,
+    n_folds: int = N_TEMPORAL_CV_FOLDS,
+) -> list[dict[str, Any]]:
     available_years = sorted(raw_outer_train_df[YEAR_COL].unique().tolist())
-    for val_year in CV_VALIDATION_YEARS:
-        if val_year not in available_years:
-            continue
+
+    if len(available_years) <= n_folds:
+        val_years = available_years[1:]
+    else:
+        val_years = available_years[-n_folds:]
+
+    folds: list[dict[str, Any]] = []
+    for val_year in val_years:
         train_df = raw_outer_train_df[raw_outer_train_df[YEAR_COL] < val_year].copy()
         val_df = raw_outer_train_df[raw_outer_train_df[YEAR_COL] == val_year].copy()
         if train_df.empty or val_df.empty:
@@ -126,6 +135,13 @@ def make_cv_folds(raw_outer_train_df: pd.DataFrame, strategy: str) -> list[dict[
     if strategy == "temporal_cv":
         return make_expanding_year_folds(raw_outer_train_df)
     if strategy == "random_cv":
+        # Filter by TRAIN_START_YEAR before random splitting — otherwise KFold
+        # can place pre-TRAIN_START_YEAR rows into validation folds, and
+        # Preprocessor.transform() does not apply the year filter.
+        if TRAIN_START_YEAR is not None:
+            raw_outer_train_df = raw_outer_train_df[
+                raw_outer_train_df[YEAR_COL] >= TRAIN_START_YEAR
+            ].copy()
         return make_random_folds(raw_outer_train_df)
     raise ValueError(f"Unsupported strategy for CV folds: {strategy}")
 
@@ -133,9 +149,10 @@ def make_cv_folds(raw_outer_train_df: pd.DataFrame, strategy: str) -> list[dict[
 def prepare_branch_outer_frames(
     split: dict[str, pd.DataFrame],
     branch: str,
+    train_start_year: int | None = None,
 ) -> dict[str, Any]:
     """Preprocess outer train and test. No separate val — inner CV handles that."""
-    preprocessor = Preprocessor(active_branches=[branch])
+    preprocessor = Preprocessor(active_branches=[branch], train_start_year=train_start_year)
 
     t0 = time.monotonic()
     train_outputs = preprocessor.fit_transform(split["outer_train"])
@@ -195,11 +212,12 @@ def prepare_branch_outer_frames(
 def prepare_branch_fold_frames(
     folds: list[dict[str, Any]],
     branch: str,
+    train_start_year: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[TimingRecord]]:
     prepared: list[dict[str, Any]] = []
     timing_records: list[TimingRecord] = []
     for fold in folds:
-        preprocessor = Preprocessor(active_branches=[branch])
+        preprocessor = Preprocessor(active_branches=[branch], train_start_year=train_start_year)
 
         t0 = time.monotonic()
         train_outputs = preprocessor.fit_transform(fold["train"])
@@ -503,7 +521,7 @@ def _refit_single_winner(
     final_test_raw = raw_df[raw_df[YEAR_COL] == TEST_YEAR].copy()
 
     # Preprocess training data
-    preprocessor = Preprocessor(active_branches=[branch])
+    preprocessor = Preprocessor(active_branches=[branch], train_start_year=TRAIN_START_YEAR)
     t0 = time.monotonic()
     train_outputs = preprocessor.fit_transform(final_train_raw)
     train_elapsed = time.monotonic() - t0
@@ -580,7 +598,7 @@ def _refit_single_winner(
 
     # Retune: run inner CV on all pre-2022 data to find best params for this model.
     raw_folds = make_cv_folds(final_train_raw, outer_strategy)
-    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch)
+    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch, train_start_year=TRAIN_START_YEAR)
     for rec in fold_timing:
         rec.update(ctx)
         timing_records.append(rec)
@@ -982,13 +1000,13 @@ def _run_combo_worker(
         return all_results, all_trials, timing_records
 
     print(f"[PID:{pid}] {tag} Preprocessing outer split...", flush=True)
-    branch_outer = prepare_branch_outer_frames(split, branch)
+    branch_outer = prepare_branch_outer_frames(split, branch, train_start_year=TRAIN_START_YEAR)
     for rec in branch_outer["timing_records"]:
         rec.update(ctx)
         timing_records.append(rec)
 
     print(f"[PID:{pid}] {tag} Preprocessing {len(raw_folds)} CV folds...", flush=True)
-    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch)
+    fold_frames, fold_timing = prepare_branch_fold_frames(raw_folds, branch, train_start_year=TRAIN_START_YEAR)
     for rec in fold_timing:
         rec.update(ctx)
         timing_records.append(rec)
@@ -1195,7 +1213,8 @@ def run() -> None:
     logger.info(f"BRANCHES={ACTIVE_BRANCHES}")
     logger.info(f"STRATEGIES={ACTIVE_OUTER_STRATEGIES}")
     logger.info(f"OUTER_TEST_YEARS={OUTER_TEST_YEARS}")
-    logger.info(f"CV_VALIDATION_YEARS={CV_VALIDATION_YEARS}")
+    logger.info(f"N_TEMPORAL_CV_FOLDS={N_TEMPORAL_CV_FOLDS}")
+    logger.info(f"TRAIN_START_YEAR={TRAIN_START_YEAR}")
     logger.info(f"SELECTION_TOLERANCE={SELECTION_TOLERANCE}")
     logger.info(f"BOOTSTRAP_ITERATIONS={FINAL_BOOTSTRAP_ITERATIONS}")
     logger.info(f"TUNING_BUDGET={TUNING_BUDGET_SECONDS}s")
@@ -1204,6 +1223,20 @@ def run() -> None:
     logger.info(f"N_FEATURES={N_FEATURES_TO_SELECT}")
 
     raw_df = load_panel_data(verbose=True)
+
+    # Validate TRAIN_START_YEAR (filtering happens inside Preprocessor, after engineering)
+    if TRAIN_START_YEAR is not None:
+        if TRAIN_START_YEAR > MAX_TRAIN_START_YEAR:
+            raise ValueError(
+                f"TRAIN_START_YEAR={TRAIN_START_YEAR} exceeds MAX_TRAIN_START_YEAR={MAX_TRAIN_START_YEAR}. "
+                f"With OUTER_TEST_YEARS starting at {min(OUTER_TEST_YEARS)} and "
+                f"N_TEMPORAL_CV_FOLDS={N_TEMPORAL_CV_FOLDS}, the maximum allowed value is "
+                f"{MAX_TRAIN_START_YEAR} to guarantee enough years for "
+                f"{N_TEMPORAL_CV_FOLDS} expanding-window folds in the most restrictive outer split."
+            )
+        logger.info(
+            f"TRAIN_START_YEAR={TRAIN_START_YEAR}: will filter training rows after feature engineering"
+        )
 
     combos = [
         (strategy, branch, target, outer_test_year)
