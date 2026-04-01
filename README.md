@@ -74,7 +74,7 @@ These files are stored with Git LFS. A normal clone is only enough if Git LFS is
 - `python main.py` downloads public-source raw data into `data/raw/`
 - `python main.py` writes processed files into `data/processed/`
 - `python main.py` writes the merged panel to `data/merged/merged.csv`
-- `stages/merge_target.py` can create `data/netzero/population_estimate.csv` automatically if it is missing
+- `stages/data.py` can create `data/netzero/population_estimate.csv` automatically if it is missing
 
 ### Legacy file note
 
@@ -141,13 +141,15 @@ python -m stages.training
 
 Outputs:
 
-- `results/training/final_results.csv`
-- `results/training/final_prediction_summary.csv`
-- `results/training/trials.csv`
-- `results/training/outer_results.csv`
-- `results/training/winners.csv`
-- `results/training/overfitting_audit.csv`
-- `results/training/final_bootstrap_predictions.csv`
+- `results/training_<timestamp>/final_results.csv`
+- `results/training_<timestamp>/final_prediction_summary.csv`
+- `results/training_<timestamp>/trials.csv`
+- `results/training_<timestamp>/outer_results.csv`
+- `results/training_<timestamp>/winners.csv`
+- `results/training_<timestamp>/overfitting_audit.csv`
+- `results/training_<timestamp>/final_bootstrap_predictions.csv`
+
+Where `<timestamp>` is auto-generated in `YYYYMMDD_HHMMSS` format.
 
 ## What `main.py` Does
 

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`main.py` is the entrypoint for the current data pipeline. It runs the workflow in `stages/` to download source data, preprocess it, and build `data/merged/merged.csv`. Put new pipeline stages in `stages/` and reusable helpers in `modules/`. The current model-training workflow lives in `stages/training/`. Legacy study reproduction remains in `reproduce_old.py` and `reproduce_new.py`. Store generated outputs in `data/old_reproduce/`, `data/new_reproduce/`, or `results/training/` rather than alongside source code.
+`main.py` is the entrypoint for the current data pipeline. It runs the workflow in `stages/` to download source data, preprocess it, and build `data/merged/merged.csv`. Put new pipeline stages in `stages/` and reusable helpers in `modules/`. The current model-training workflow lives in `stages/training/`. Legacy study reproduction remains in `reproduce_old.py` and `reproduce_new.py`. Store generated outputs in `data/old_reproduce/`, `data/new_reproduce/`, or `results/training_<timestamp>/` rather than alongside source code.
 
 ## Build, Test, and Development Commands
 Use Python 3.12 when possible.
@@ -18,7 +18,7 @@ Key workflows:
 - `python main.py`: rebuilds the current dataset pipeline and writes `data/merged/merged.csv`.
 - `python reproduce_old.py`: runs the original study workflow using legacy inputs.
 - `python reproduce_new.py`: reruns the old-study logic with the newer merged indicator panel.
-- `python -m stages.training`: runs the current training pipeline and writes outputs under `results/training/`.
+- `python -m stages.training`: runs the current training pipeline and writes outputs under `results/training_<timestamp>/`.
 
 ## Coding Style & Naming Conventions
 Follow the existing Python style: 4-space indentation, `snake_case` for files, functions, and variables, and `UPPER_CASE` for constants. Keep orchestration files thin and move reusable logic into focused helpers. Prefer repository-relative paths and read configurable locations through `modules/config.json` and `modules/config_loader.py` instead of hardcoding machine-specific paths.
