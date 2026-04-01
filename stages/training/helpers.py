@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from functools import partial
 from typing import Any
 
 import numpy as np
@@ -15,7 +14,6 @@ from sklearn.ensemble import (
     HistGradientBoostingRegressor,
     RandomForestRegressor,
 )
-from sklearn.feature_selection import SelectKBest, mutual_info_regression
 from sklearn.linear_model import BayesianRidge, ElasticNet, HuberRegressor, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.neural_network import MLPRegressor
@@ -24,31 +22,22 @@ from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 
 from stages.training.config import (
-    COUNTRY_COL,
     FINAL_PREDICTION_SUMMARY_COLUMNS,
     FINAL_PREDICTIONS_COLUMNS,
     FINAL_RESULTS_COLUMNS,
     GAP_PENALTY_WEIGHT,
     GAP_RATIO_CAP,
-    ID_COLS,
     MODEL_N_JOBS,
-    MODEL_RANDOM_STATE,
-    N_FEATURES_TO_SELECT,
     OUTER_RESULTS_PATH,
     OUTPUT_DIR,
     OUTER_ARTIFACTS_DIR,
     FINAL_ARTIFACTS_DIR,
-    PIPELINE_RANDOM_STATE,
     SVR_MAX_ITER,
-    TARGET_COLS,
     TRIALS_PATH,
-    YEAR_COL,
 )
 
 
-# =============================================================================
-# Output directories
-# =============================================================================
+# --- Output directories ---
 
 
 def ensure_output_dirs() -> None:
@@ -57,9 +46,7 @@ def ensure_output_dirs() -> None:
     FINAL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# =============================================================================
-# Serialization helpers
-# =============================================================================
+# --- Serialization helpers ---
 
 
 def to_native(value: Any, json_compat: bool = False) -> Any:
@@ -79,54 +66,7 @@ def serialize_params(params: dict[str, Any]) -> str:
     return json.dumps(to_native(params, json_compat=True), sort_keys=True)
 
 
-# =============================================================================
-# Feature / target extraction
-# =============================================================================
-
-
-def feature_columns_from_frame(frame: pd.DataFrame) -> list[str]:
-    return [col for col in frame.columns if col not in ID_COLS + TARGET_COLS]
-
-
-def extract_xy(frame: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Series, list[str]]:
-    feature_columns = feature_columns_from_frame(frame)
-    usable = frame[target].notna()
-    x = frame.loc[usable, feature_columns].copy()
-    y = frame.loc[usable, target].copy()
-    return x, y, feature_columns
-
-
-# =============================================================================
-# Feature selection
-# =============================================================================
-
-
-def fit_feature_selector(
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    n_features: int = N_FEATURES_TO_SELECT,
-) -> SelectKBest:
-    selector = SelectKBest(
-        score_func=partial(mutual_info_regression, random_state=PIPELINE_RANDOM_STATE),
-        k=min(n_features, x_train.shape[1]),
-    )
-    selector.fit(x_train, y_train)
-    return selector
-
-
-def apply_feature_selector(
-    selector: SelectKBest,
-    x: pd.DataFrame,
-    feature_columns: list[str],
-) -> tuple[pd.DataFrame, list[str]]:
-    mask = selector.get_support()
-    selected = [col for col, m in zip(feature_columns, mask) if m]
-    return x[selected], selected
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
+# --- Metrics ---
 
 
 def evaluate_metrics(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -167,9 +107,7 @@ def summarize_cv_metrics(fold_metrics: list[dict[str, float]]) -> dict[str, floa
     return summary
 
 
-# =============================================================================
-# Penalized objective (simple formula)
-# =============================================================================
+# --- Penalized objective ---
 
 
 def compute_penalized_cv_objective(cv_summary: dict[str, Any]) -> dict[str, float]:
@@ -182,9 +120,7 @@ def compute_penalized_cv_objective(cv_summary: dict[str, Any]) -> dict[str, floa
     }
 
 
-# =============================================================================
-# Model building / fitting / evaluation
-# =============================================================================
+# --- Model building / fitting / evaluation ---
 
 
 def fit_predict_evaluate(
@@ -215,9 +151,7 @@ def predict_evaluate(
     return metrics, predictions
 
 
-# =============================================================================
-# Partial output persistence
-# =============================================================================
+# --- Partial output persistence ---
 
 
 def persist_partial_outputs(
@@ -230,9 +164,7 @@ def persist_partial_outputs(
         pd.DataFrame(all_outer_result_rows).to_csv(OUTER_RESULTS_PATH, index=False)
 
 
-# =============================================================================
-# Empty DataFrame constructors
-# =============================================================================
+# --- Empty DataFrame constructors ---
 
 
 def empty_final_results_df() -> pd.DataFrame:
@@ -247,9 +179,7 @@ def empty_final_prediction_summary_df() -> pd.DataFrame:
     return pd.DataFrame(columns=FINAL_PREDICTION_SUMMARY_COLUMNS)
 
 
-# =============================================================================
-# Hyperopt search spaces and model construction
-# =============================================================================
+# --- Hyperopt search spaces and model construction ---
 
 
 def get_hyperopt_space(model_name: str) -> dict[str, Any]:
@@ -347,38 +277,23 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
+_INT_KEYS_BY_MODEL: dict[str, list[str]] = {
+    "random_forest": ["n_estimators", "min_samples_split", "min_samples_leaf"],
+    "huber": ["max_iter"],
+    "extra_trees": ["n_estimators", "min_samples_split", "min_samples_leaf"],
+    "gradient_boosting": ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf"],
+    "hist_gradient_boosting": ["max_iter", "max_depth", "min_samples_leaf", "max_leaf_nodes"],
+    "adaboost": ["n_estimators"],
+}
+
+
 def normalize_hyperopt_params(model_name: str, params: dict[str, Any]) -> dict[str, Any]:
     normalized = {key: to_native(value) for key, value in params.items()}
-    if model_name in {"ridge", "elasticnet", "xgboost", "svr"}:
-        return normalized
-    if model_name == "random_forest":
-        for key in ["n_estimators", "min_samples_split", "min_samples_leaf"]:
-            normalized[key] = int(normalized[key])
-        return normalized
     if model_name == "mlp":
         normalized["hidden_layer_sizes"] = tuple(normalized["hidden_layer_sizes"])
-        return normalized
-    if model_name == "huber":
-        normalized["max_iter"] = int(normalized["max_iter"])
-        return normalized
-    if model_name == "bayesian_ridge":
-        return normalized
-    if model_name == "extra_trees":
-        for key in ["n_estimators", "min_samples_split", "min_samples_leaf"]:
-            normalized[key] = int(normalized[key])
-        return normalized
-    if model_name == "gradient_boosting":
-        for key in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf"]:
-            normalized[key] = int(normalized[key])
-        return normalized
-    if model_name == "hist_gradient_boosting":
-        for key in ["max_iter", "max_depth", "min_samples_leaf", "max_leaf_nodes"]:
-            normalized[key] = int(normalized[key])
-        return normalized
-    if model_name == "adaboost":
-        normalized["n_estimators"] = int(normalized["n_estimators"])
-        return normalized
-    raise ValueError(f"Unsupported model name: {model_name}")
+    for key in _INT_KEYS_BY_MODEL.get(model_name, []):
+        normalized[key] = int(normalized[key])
+    return normalized
 
 
 def build_model(model_name: str, params: dict[str, Any], random_state: int) -> Any:

@@ -14,24 +14,19 @@ import numpy as np
 import pandas as pd
 from hyperopt import STATUS_OK, Trials, fmin, tpe
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.model_selection import KFold
 
 from stages.training.config import (
     ACTIVE_BRANCHES,
     ACTIVE_MODELS,
     ACTIVE_OUTER_STRATEGIES,
     ACTIVE_TARGETS,
-    COUNTRY_COL,
     DEFAULT_CPU_WORKERS,
     MAX_TRAIN_START_YEAR,
-    N_TEMPORAL_CV_FOLDS,
     TRAIN_START_YEAR,
     FINAL_ARTIFACTS_DIR,
     FINAL_BOOTSTRAP_ITERATIONS,
     FINAL_BOOTSTRAP_PREDICTIONS_PATH,
     FINAL_PREDICTION_SUMMARY_PATH,
-    FINAL_PREDICTIONS_COLUMNS,
-    FINAL_RESULTS_COLUMNS,
     FINAL_RESULTS_PATH,
     GAP_PENALTY_WEIGHT,
     GAP_RATIO_CAP,
@@ -42,31 +37,30 @@ from stages.training.config import (
     MODEL_COMPLEXITY_RANK,
     MODEL_RANDOM_STATE,
     N_FEATURES_TO_SELECT,
+    N_TEMPORAL_CV_FOLDS,
     OUTER_ARTIFACTS_DIR,
-    OUTER_RESULTS_PATH,
     OUTER_TEST_YEARS,
     OVERFIT_GAP_RATIO_THRESHOLD,
     OVERFITTING_AUDIT_PATH,
-    PIPELINE_RANDOM_STATE,
     SELECTION_TOLERANCE,
     TEST_YEAR,
     TUNING_BUDGET_SECONDS,
-    TRIALS_PATH,
     WINNERS_PATH,
-    YEAR_COL,
-    Preprocessor,
+)
+from stages.training.data_preparation import (
+    load_final_preprocessor,
+    load_outer_preprocessor,
+    load_prepared_final_target,
+    load_prepared_outer_target,
+    run_data_preparation_stage,
 )
 from stages.training.helpers import (
-    apply_feature_selector,
     build_model,
     compute_penalized_cv_objective,
     empty_final_predictions_df,
     empty_final_prediction_summary_df,
     empty_final_results_df,
     ensure_output_dirs,
-    extract_xy,
-    feature_columns_from_frame,
-    fit_feature_selector,
     fit_model,
     get_hyperopt_space,
     normalize_hyperopt_params,
@@ -83,225 +77,25 @@ from stages.training.bootstrap import (
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Splitting and fold creation
-# =============================================================================
+_ERROR_ROW_NAN_FIELDS = frozenset({
+    "penalized_cv_loss", "gap_penalty",
+    "cv_train_mean_mae", "cv_mean_mae",
+    "cv_mae_gap_abs", "cv_mae_gap_ratio", "cv_positive_gap_fold_share",
+    "folds_used", "trial_count", "tuning_elapsed_seconds",
+    "outer_train_rows", "outer_test_rows", "feature_count",
+    "outer_train_mae", "outer_test_mae",
+})
 
 
-def make_nested_outer_split(
-    raw_df: pd.DataFrame, outer_test_year: int,
-) -> dict[str, pd.DataFrame]:
-    """Split for nested CV: train = years < outer_test_year, test = that year."""
-    train = raw_df[raw_df[YEAR_COL] < outer_test_year].copy()
-    test = raw_df[raw_df[YEAR_COL] == outer_test_year].copy()
-    return {"outer_train": train, "outer_test": test}
+def _configure_worker_logging() -> None:
+    """Standard logging/warning setup for subprocess workers."""
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.getLogger("hyperopt").setLevel(logging.WARNING)
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
 
 
-def make_expanding_year_folds(
-    raw_outer_train_df: pd.DataFrame,
-    n_folds: int = N_TEMPORAL_CV_FOLDS,
-) -> list[dict[str, Any]]:
-    available_years = sorted(raw_outer_train_df[YEAR_COL].unique().tolist())
-
-    if len(available_years) <= n_folds:
-        val_years = available_years[1:]
-    else:
-        val_years = available_years[-n_folds:]
-
-    folds: list[dict[str, Any]] = []
-    for val_year in val_years:
-        train_df = raw_outer_train_df[raw_outer_train_df[YEAR_COL] < val_year].copy()
-        val_df = raw_outer_train_df[raw_outer_train_df[YEAR_COL] == val_year].copy()
-        if train_df.empty or val_df.empty:
-            continue
-        folds.append({"fold_id": int(val_year), "train": train_df, "val": val_df})
-    return folds
-
-
-def make_random_folds(raw_outer_train_df: pd.DataFrame, n_splits: int = 5) -> list[dict[str, Any]]:
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=PIPELINE_RANDOM_STATE)
-    folds: list[dict[str, Any]] = []
-    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(raw_outer_train_df)):
-        train_df = raw_outer_train_df.iloc[train_idx].copy()
-        val_df = raw_outer_train_df.iloc[val_idx].copy()
-        folds.append({"fold_id": fold_idx, "train": train_df, "val": val_df})
-    return folds
-
-
-def make_cv_folds(raw_outer_train_df: pd.DataFrame, strategy: str) -> list[dict[str, Any]]:
-    if strategy == "temporal_cv":
-        return make_expanding_year_folds(raw_outer_train_df)
-    if strategy == "random_cv":
-        # Filter by TRAIN_START_YEAR before random splitting — otherwise KFold
-        # can place pre-TRAIN_START_YEAR rows into validation folds, and
-        # Preprocessor.transform() does not apply the year filter.
-        if TRAIN_START_YEAR is not None:
-            raw_outer_train_df = raw_outer_train_df[
-                raw_outer_train_df[YEAR_COL] >= TRAIN_START_YEAR
-            ].copy()
-        return make_random_folds(raw_outer_train_df)
-    raise ValueError(f"Unsupported strategy for CV folds: {strategy}")
-
-
-def prepare_branch_outer_frames(
-    split: dict[str, pd.DataFrame],
-    branch: str,
-    train_start_year: int | None = None,
-) -> dict[str, Any]:
-    """Preprocess outer train and test. No separate val — inner CV handles that."""
-    preprocessor = Preprocessor(active_branches=[branch], train_start_year=train_start_year)
-    train_outputs = preprocessor.fit_transform(split["outer_train"])
-    test_outputs = preprocessor.transform(
-        split["outer_test"], history_df=split["outer_train"],
-        split_name="outer_test",
-    )
-    return {
-        "preprocessor": preprocessor,
-        "train_frame": train_outputs[branch],
-        "test_frame": test_outputs[branch],
-    }
-
-
-def prepare_branch_fold_frames(
-    folds: list[dict[str, Any]],
-    branch: str,
-    train_start_year: int | None = None,
-) -> list[dict[str, Any]]:
-    prepared: list[dict[str, Any]] = []
-    for fold in folds:
-        preprocessor = Preprocessor(active_branches=[branch], train_start_year=train_start_year)
-        train_outputs = preprocessor.fit_transform(fold["train"])
-        val_outputs = preprocessor.transform(
-            fold["val"],
-            history_df=fold["train"],
-            split_name=f"cv_val_{fold['fold_id']}",
-        )
-        prepared.append({
-            "fold_id": fold["fold_id"],
-            "train_frame": train_outputs[branch],
-            "val_frame": val_outputs[branch],
-        })
-    return prepared
-
-
-def prepare_cv_fold_data(
-    prepared_fold_frames: list[dict[str, Any]],
-    target: str,
-    feature_selector: Any = None,
-    all_feature_columns: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    prepared: list[dict[str, Any]] = []
-    for fold in prepared_fold_frames:
-        x_train, y_train, feat_cols = extract_xy(fold["train_frame"], target)
-        x_val, y_val, _ = extract_xy(fold["val_frame"], target)
-
-        if x_train.empty or x_val.empty:
-            continue
-
-        if feature_selector is not None and all_feature_columns is not None:
-            x_train, _ = apply_feature_selector(feature_selector, x_train, all_feature_columns)
-            x_val, _ = apply_feature_selector(feature_selector, x_val, all_feature_columns)
-            feat_cols = list(x_train.columns)
-
-        prepared.append({
-            "fold_id": fold["fold_id"],
-            "x_train": x_train,
-            "y_train": y_train,
-            "x_val": x_val,
-            "y_val": y_val,
-            "train_rows": int(len(x_train)),
-            "val_rows": int(len(x_val)),
-            "feature_count": int(len(feat_cols)),
-        })
-    return prepared
-
-
-# =============================================================================
-# Cache loaders (read preprocessed data from disk)
-# =============================================================================
-
-
-def _read_frame(path: Path) -> pd.DataFrame:
-    """Read a cached DataFrame. Must match stages.preprocessing.write_frame settings."""
-    return pd.read_csv(path, low_memory=False)
-
-
-def load_preprocessed_outer(
-    preprocessed_dir: Path,
-    branch: str,
-    outer_test_year: int,
-) -> dict[str, Any]:
-    """Load preprocessed outer train/test frames and Preprocessor from cache."""
-    base = preprocessed_dir / "outer" / branch / str(outer_test_year)
-    return {
-        "preprocessor": joblib.load(base / "preprocessor.joblib"),
-        "train_frame": _read_frame(base / "train.csv"),
-        "test_frame": _read_frame(base / "test.csv"),
-    }
-
-
-def load_preprocessed_folds(
-    preprocessed_dir: Path,
-    strategy: str,
-    branch: str,
-    outer_test_year: int,
-) -> list[dict[str, Any]]:
-    """Load preprocessed CV fold frames from cache."""
-    base = preprocessed_dir / "folds" / strategy / branch / str(outer_test_year)
-    folds: list[dict[str, Any]] = []
-    for fold_dir in sorted(base.glob("fold_*")):
-        fold_id_str = fold_dir.name.split("_", 1)[1]
-        try:
-            fold_id: int | str = int(fold_id_str)
-        except ValueError:
-            fold_id = fold_id_str
-        folds.append({
-            "fold_id": fold_id,
-            "train_frame": _read_frame(fold_dir / "train.csv"),
-            "val_frame": _read_frame(fold_dir / "val.csv"),
-        })
-    return folds
-
-
-def load_preprocessed_final(
-    preprocessed_dir: Path,
-    branch: str,
-) -> dict[str, Any]:
-    """Load preprocessed final train/test frames and Preprocessor from cache."""
-    base = preprocessed_dir / "final" / branch
-    return {
-        "preprocessor": joblib.load(base / "preprocessor.joblib"),
-        "train_frame": _read_frame(base / "train.csv"),
-        "test_frame_scored": _read_frame(base / "test_scored.csv"),
-        "test_frame_all": _read_frame(base / "test_all.csv"),
-    }
-
-
-def load_preprocessed_final_folds(
-    preprocessed_dir: Path,
-    strategy: str,
-    branch: str,
-) -> list[dict[str, Any]]:
-    """Load preprocessed final refit fold frames from cache."""
-    base = preprocessed_dir / "final" / "folds" / strategy / branch
-    folds: list[dict[str, Any]] = []
-    for fold_dir in sorted(base.glob("fold_*")):
-        fold_id_str = fold_dir.name.split("_", 1)[1]
-        try:
-            fold_id: int | str = int(fold_id_str)
-        except ValueError:
-            fold_id = fold_id_str
-        folds.append({
-            "fold_id": fold_id,
-            "train_frame": _read_frame(fold_dir / "train.csv"),
-            "val_frame": _read_frame(fold_dir / "val.csv"),
-        })
-    return folds
-
-
-# =============================================================================
-# CV trial and tuning
-# =============================================================================
+# --- CV trial and tuning ---
 
 
 def run_cv_trial(
@@ -449,9 +243,7 @@ def tune_model(
     }, trial_records
 
 
-# =============================================================================
-# Candidate evaluation (single pass, no bootstrap loop)
-# =============================================================================
+# --- Candidate evaluation ---
 
 
 def evaluate_candidate_model(
@@ -472,115 +264,17 @@ def evaluate_candidate_model(
     return train_metrics, test_metrics, model
 
 
-# =============================================================================
-# Final refit with all-country predictions
-# =============================================================================
+# --- Final refit helpers ---
 
 
-def _refit_single_winner(
-    preprocessed_dir: Path,
-    outer_strategy: str,
-    target: str,
-    branch: str,
-    model_name: str,
-    bootstrap_workers: int | None = None,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    pid = os.getpid()
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
-    logging.getLogger("hyperopt").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
-    tag = f"refit({outer_strategy}/{target}/{model_name}/{branch})"
-
-    print(
-        f"[PID:{pid}] {tag} Starting "
-        f"({FINAL_BOOTSTRAP_ITERATIONS} bootstrap iterations)...",
-        flush=True,
-    )
-
-    # Load preprocessed final data from cache
-    final_data = load_preprocessed_final(preprocessed_dir, branch)
-
-    preprocessor = final_data["preprocessor"]
-    train_frame = final_data["train_frame"]
-    test_frame_scored = final_data["test_frame_scored"]
-    test_frame_all = final_data["test_frame_all"]
-
-    # Extract scored test set (countries with actual target values)
-    x_train, y_train, feature_columns = extract_xy(train_frame, target)
-    x_test_scored, y_test_scored, _ = extract_xy(test_frame_scored, target)
-
-    # Extract ALL countries for predictions (including those without targets)
-    all_feat_cols = feature_columns_from_frame(test_frame_all)
-    x_test_all = test_frame_all[all_feat_cols].copy()
-
-    if x_train.empty or x_test_scored.empty:
-        raise RuntimeError(
-            f"Empty train/test for strategy={outer_strategy}, target={target}."
-        )
-
-    # Load preprocessed final folds from cache for retuning
-    fold_frames = load_preprocessed_final_folds(
-        preprocessed_dir, outer_strategy, branch,
-    )
-
-    fold_feat_sets = []
-    for fold in fold_frames:
-        x_fold, _, fc = extract_xy(fold["train_frame"], target)
-        if not x_fold.empty:
-            fold_feat_sets.append(set(fc))
-    if fold_feat_sets:
-        common_feats = sorted(set(feature_columns) & set.intersection(*fold_feat_sets))
-    else:
-        common_feats = list(feature_columns)
-
-    # Single selector fitted on common_feats — used everywhere below
-    selector = fit_feature_selector(x_train[common_feats], y_train)
-    x_train, selected_cols = apply_feature_selector(selector, x_train[common_feats], common_feats)
-    x_test_scored, _ = apply_feature_selector(selector, x_test_scored[common_feats], common_feats)
-    x_test_all, _ = apply_feature_selector(selector, x_test_all[common_feats], common_feats)
-
-    prepared_folds = prepare_cv_fold_data(
-        fold_frames, target,
-        feature_selector=selector,
-        all_feature_columns=common_feats,
-    )
-
-    print(
-        f"[PID:{pid}] {tag} Retuning on all pre-{TEST_YEAR} data "
-        f"({len(prepared_folds)} inner folds)...",
-        flush=True,
-    )
-    tuning_result, _ = tune_model(
-        prepared_folds, outer_strategy, branch, target, model_name,
-    )
-    best_params = tuning_result["best_params"]
-
-    # Build base predictions for ALL countries
-    base_predictions = test_frame_all[[COUNTRY_COL, YEAR_COL]].copy()
-    base_predictions["actual"] = test_frame_all[target]
-    base_predictions["outer_strategy_source"] = outer_strategy
-    base_predictions["target"] = target
-    base_predictions["branch"] = branch
-    base_predictions["model_name"] = model_name
-
-    # Bootstrap
-    bootstrap_results = run_final_bootstrap_iterations(
-        target=target,
-        model_name=model_name,
-        best_params=best_params,
-        x_train=x_train,
-        y_train=y_train,
-        x_test_scored=x_test_scored,
-        y_test_scored=y_test_scored,
-        x_test_all=x_test_all,
-        bootstrap_workers=bootstrap_workers,
-    )
-
+def _aggregate_bootstrap_results(
+    bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], np.ndarray]],
+    base_predictions: pd.DataFrame,
+) -> tuple[dict[str, float], dict[str, float], pd.DataFrame]:
+    """Aggregate bootstrap iteration results into mean metrics and a predictions DataFrame."""
     bootstrap_train_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics: list[dict[str, float]] = []
-    target_prediction_rows: list[pd.DataFrame] = []
+    prediction_rows: list[pd.DataFrame] = []
 
     for iteration_idx, train_metrics, scored_metrics, all_preds in bootstrap_results:
         bootstrap_train_metrics.append(train_metrics)
@@ -588,17 +282,34 @@ def _refit_single_winner(
         iter_preds = base_predictions.copy()
         iter_preds["iteration"] = iteration_idx + 1
         iter_preds["prediction"] = all_preds
-        target_prediction_rows.append(iter_preds)
+        prediction_rows.append(iter_preds)
 
     train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
     test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
     avg_train = {k: float(train_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
     avg_test = {k: float(test_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
+    preds_df = pd.concat(prediction_rows, ignore_index=True)
 
-    target_preds_df = pd.concat(target_prediction_rows, ignore_index=True)
-    pred_summary_df = build_prediction_summary(target_preds_df)
+    return avg_train, avg_test, preds_df
 
-    # Save artifact
+
+def _save_final_artifact(
+    model_name: str,
+    best_params: dict[str, Any],
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    preprocessor: Any,
+    selector: Any,
+    selected_cols: list[str],
+    feature_columns: list[str],
+    target: str,
+    branch: str,
+    outer_strategy: str,
+    avg_train: dict[str, float],
+    avg_test: dict[str, float],
+    pred_summary_df: pd.DataFrame,
+) -> Path:
+    """Fit final model, save artifact to disk, return artifact path."""
     artifact_model = fit_model(
         build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
         x_train, y_train,
@@ -621,10 +332,23 @@ def _refit_single_winner(
     artifact_path = FINAL_ARTIFACTS_DIR / outer_strategy / f"{target}.joblib"
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, artifact_path)
+    return artifact_path
 
-    print(f"[PID:{pid}] {tag} Done. test_mae={avg_test['mae']:.4f}", flush=True)
 
-    final_row = {
+def _build_final_result_row(
+    target: str,
+    outer_strategy: str,
+    branch: str,
+    model_name: str,
+    best_params: dict[str, Any],
+    x_train: pd.DataFrame,
+    x_test_scored: pd.DataFrame,
+    selected_cols: list[str],
+    avg_train: dict[str, float],
+    avg_test: dict[str, float],
+    artifact_path: Path,
+) -> dict[str, Any]:
+    return {
         "target": target,
         "outer_strategy_source": outer_strategy,
         "branch": branch,
@@ -642,7 +366,92 @@ def _refit_single_winner(
         "test_r2": avg_test["r2"],
         "artifact_path": str(artifact_path),
     }
-    return final_row, target_preds_df
+
+
+def _refit_single_winner(
+    preprocessed_dir: Path,
+    outer_strategy: str,
+    target: str,
+    branch: str,
+    model_name: str,
+    bootstrap_workers: int | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    _configure_worker_logging()
+    pid = os.getpid()
+    tag = f"refit({outer_strategy}/{target}/{model_name}/{branch})"
+
+    print(
+        f"[PID:{pid}] {tag} Starting "
+        f"({FINAL_BOOTSTRAP_ITERATIONS} bootstrap iterations)...",
+        flush=True,
+    )
+
+    prepared = load_prepared_final_target(preprocessed_dir, outer_strategy, branch, target)
+    preprocessor = load_final_preprocessor(preprocessed_dir, branch)
+    x_train = prepared["x_train"]
+    y_train = prepared["y_train"]
+    x_test_scored = prepared["x_test_scored"]
+    y_test_scored = prepared["y_test_scored"]
+    x_test_all = prepared["x_test_all"]
+    feature_columns = prepared["feature_columns"]
+    selected_cols = prepared["selected_feature_columns"]
+    selector = prepared["selector"]
+    prepared_folds = prepared["prepared_folds"]
+
+    if x_train.empty or x_test_scored.empty:
+        raise RuntimeError(
+            f"Empty train/test for strategy={outer_strategy}, target={target}."
+        )
+    if len(prepared_folds) < MIN_VALID_FOLDS:
+        raise RuntimeError(
+            f"Only {len(prepared_folds)} prepared folds available for "
+            f"strategy={outer_strategy}, target={target}, branch={branch}."
+        )
+    if not selected_cols or selector is None:
+        raise RuntimeError(
+            f"No selected features available for strategy={outer_strategy}, "
+            f"target={target}, branch={branch}."
+        )
+
+    # Retune on all pre-holdout data
+    print(
+        f"[PID:{pid}] {tag} Retuning on all pre-{TEST_YEAR} data "
+        f"({len(prepared_folds)} inner folds)...",
+        flush=True,
+    )
+    tuning_result, _ = tune_model(prepared_folds, outer_strategy, branch, target, model_name)
+    best_params = tuning_result["best_params"]
+
+    # Bootstrap predictions for ALL countries
+    base_predictions = prepared["prediction_index"].copy()
+    base_predictions["outer_strategy_source"] = outer_strategy
+    base_predictions["target"] = target
+    base_predictions["branch"] = branch
+    base_predictions["model_name"] = model_name
+
+    bootstrap_results = run_final_bootstrap_iterations(
+        target=target, model_name=model_name, best_params=best_params,
+        x_train=x_train, y_train=y_train,
+        x_test_scored=x_test_scored, y_test_scored=y_test_scored,
+        x_test_all=x_test_all, bootstrap_workers=bootstrap_workers,
+    )
+
+    avg_train, avg_test, preds_df = _aggregate_bootstrap_results(bootstrap_results, base_predictions)
+    pred_summary_df = build_prediction_summary(preds_df)
+
+    artifact_path = _save_final_artifact(
+        model_name, best_params, x_train, y_train,
+        preprocessor, selector, selected_cols, feature_columns,
+        target, branch, outer_strategy, avg_train, avg_test, pred_summary_df,
+    )
+
+    print(f"[PID:{pid}] {tag} Done. test_mae={avg_test['mae']:.4f}", flush=True)
+
+    final_row = _build_final_result_row(
+        target, outer_strategy, branch, model_name, best_params,
+        x_train, x_test_scored, selected_cols, avg_train, avg_test, artifact_path,
+    )
+    return final_row, preds_df
 
 
 def refit_final_models(
@@ -702,119 +511,113 @@ def refit_final_models(
     return final_results_df, final_preds_df, final_summary_df
 
 
-# =============================================================================
-# Winner selection (aggregated across outer test years + tolerance rule)
-# =============================================================================
+# --- Winner selection ---
+
+
+def _select_winner_for_pair(
+    successful: pd.DataFrame,
+    outer_strategy: str,
+    target: str,
+) -> dict[str, Any]:
+    """Select best (branch, model_name) for a single (strategy, target) pair.
+
+    Overfitting gate: a candidate is disqualified if ALL of its outer folds are
+    overfit_excluded. Among non-disqualified candidates, apply tolerance rule
+    then prefer the simpler model.
+    """
+    subset = successful[
+        (successful["outer_strategy"] == outer_strategy)
+        & (successful["target"] == target)
+    ].copy()
+    if subset.empty:
+        raise RuntimeError(
+            f"No successful runs for strategy={outer_strategy}, target={target}."
+        )
+
+    # Candidate-level disqualification: ALL folds are overfit
+    overfit_agg = (
+        subset.groupby(["branch", "model_name"], as_index=False)
+        .agg(
+            overfit_fold_count=("overfit_excluded", "sum"),
+            total_folds=("outer_test_year", "nunique"),
+        )
+    )
+    overfit_agg["candidate_overfit_disqualified"] = (
+        overfit_agg["overfit_fold_count"] == overfit_agg["total_folds"]
+    )
+
+    eligible_candidates = overfit_agg[
+        ~overfit_agg["candidate_overfit_disqualified"]
+    ][["branch", "model_name"]]
+    eligible_subset = subset.merge(eligible_candidates, on=["branch", "model_name"])
+
+    if eligible_subset.empty:
+        raise RuntimeError(
+            f"All candidates are overfit in every outer fold for "
+            f"strategy={outer_strategy}, target={target}. "
+            f"No winner can be selected. Inspect overfitting_audit.csv."
+        )
+
+    # Aggregate per (branch, model_name) across outer test years
+    agg = (
+        eligible_subset.groupby(["branch", "model_name"], as_index=False)
+        .agg(
+            mean_outer_test_mae=("outer_test_mae", "mean"),
+            std_outer_test_mae=("outer_test_mae", "std"),
+            n_outer_folds=("outer_test_year", "nunique"),
+        )
+    )
+    agg["std_outer_test_mae"] = agg["std_outer_test_mae"].fillna(0.0)
+
+    # Tolerance-based selection: prefer simpler model among near-best candidates
+    best_mae = float(agg["mean_outer_test_mae"].min())
+    tolerance_threshold = best_mae * (1.0 + SELECTION_TOLERANCE)
+    eligible = agg[agg["mean_outer_test_mae"] <= tolerance_threshold].copy()
+
+    eligible["complexity"] = eligible["model_name"].map(MODEL_COMPLEXITY_RANK)
+    eligible = eligible.sort_values(
+        ["complexity", "mean_outer_test_mae"], ascending=[True, True],
+    )
+    winner = eligible.iloc[0]
+
+    return {
+        "outer_strategy": outer_strategy,
+        "target": target,
+        "branch": str(winner["branch"]),
+        "model_name": str(winner["model_name"]),
+        "mean_outer_test_mae": float(winner["mean_outer_test_mae"]),
+        "std_outer_test_mae": float(winner["std_outer_test_mae"]),
+        "n_outer_folds": int(winner["n_outer_folds"]),
+        "selection_tolerance": SELECTION_TOLERANCE,
+        "tolerance_threshold": tolerance_threshold,
+    }
 
 
 def select_winners(outer_results_df: pd.DataFrame) -> pd.DataFrame:
-    """Select best (branch, model_name) per (strategy, target).
-
-    Overfitting gate: a candidate is disqualified if ALL of its outer folds are marked
-    overfit_excluded=True (cv_mae_gap_ratio >= OVERFIT_GAP_RATIO_THRESHOLD). Disqualifying
-    on any single fold would penalize models for small-sample behavior in early folds;
-    disqualifying only when ALL folds fail targets systematic unsuitability across every
-    training window, including the largest. There is no fallback: if all candidates are
-    disqualified, a RuntimeError is raised so the problem can be investigated.
-
-    Among non-disqualified candidates:
-    1. Aggregate outer_test_mae across outer test years.
-    2. Find the best mean_outer_test_mae.
-    3. Tolerance rule: models within SELECTION_TOLERANCE of best are eligible.
-    4. Among eligible, prefer the simpler model (MODEL_COMPLEXITY_RANK).
-    """
+    """Select best (branch, model_name) per (strategy, target)."""
     successful = outer_results_df[outer_results_df["status"] == "ok"].copy()
     if successful.empty:
         raise RuntimeError("No successful outer runs available.")
 
-    winners: list[dict[str, Any]] = []
-
-    for outer_strategy in ACTIVE_OUTER_STRATEGIES:
-        for target in ACTIVE_TARGETS:
-            subset = successful[
-                (successful["outer_strategy"] == outer_strategy)
-                & (successful["target"] == target)
-            ].copy()
-            if subset.empty:
-                raise RuntimeError(
-                    f"No successful runs for strategy={outer_strategy}, target={target}."
-                )
-
-            # Compute candidate-level disqualification:
-            # disqualified = ALL of the candidate's outer folds are overfit
-            overfit_agg = (
-                subset.groupby(["branch", "model_name"], as_index=False)
-                .agg(
-                    overfit_fold_count=("overfit_excluded", "sum"),
-                    total_folds=("outer_test_year", "nunique"),
-                )
-            )
-            overfit_agg["candidate_overfit_disqualified"] = (
-                overfit_agg["overfit_fold_count"] == overfit_agg["total_folds"]
-            )
-
-            eligible_candidates = overfit_agg[
-                ~overfit_agg["candidate_overfit_disqualified"]
-            ][["branch", "model_name"]]
-            eligible_subset = subset.merge(eligible_candidates, on=["branch", "model_name"])
-
-            if eligible_subset.empty:
-                raise RuntimeError(
-                    f"All candidates are overfit in every outer fold for "
-                    f"strategy={outer_strategy}, target={target}. "
-                    f"No winner can be selected. Inspect overfitting_audit.csv."
-                )
-
-            # Aggregate per (branch, model_name) across outer test years
-            agg = (
-                eligible_subset.groupby(["branch", "model_name"], as_index=False)
-                .agg(
-                    mean_outer_test_mae=("outer_test_mae", "mean"),
-                    std_outer_test_mae=("outer_test_mae", "std"),
-                    n_outer_folds=("outer_test_year", "nunique"),
-                )
-            )
-            agg["std_outer_test_mae"] = agg["std_outer_test_mae"].fillna(0.0)
-
-            # Tolerance-based selection
-            best_mae = float(agg["mean_outer_test_mae"].min())
-            tolerance_threshold = best_mae * (1.0 + SELECTION_TOLERANCE)
-            eligible = agg[agg["mean_outer_test_mae"] <= tolerance_threshold].copy()
-
-            # Among eligible, prefer simpler model
-            eligible["complexity"] = eligible["model_name"].map(MODEL_COMPLEXITY_RANK)
-            eligible = eligible.sort_values(
-                ["complexity", "mean_outer_test_mae"], ascending=[True, True],
-            )
-            winner = eligible.iloc[0]
-
-            winners.append({
-                "outer_strategy": outer_strategy,
-                "target": target,
-                "branch": str(winner["branch"]),
-                "model_name": str(winner["model_name"]),
-                "mean_outer_test_mae": float(winner["mean_outer_test_mae"]),
-                "std_outer_test_mae": float(winner["std_outer_test_mae"]),
-                "n_outer_folds": int(winner["n_outer_folds"]),
-                "selection_tolerance": SELECTION_TOLERANCE,
-                "tolerance_threshold": tolerance_threshold,
-            })
+    winners = [
+        _select_winner_for_pair(successful, strategy, target)
+        for strategy in ACTIVE_OUTER_STRATEGIES
+        for target in ACTIVE_TARGETS
+    ]
 
     if not winners:
         return pd.DataFrame()
     return pd.DataFrame(winners).reset_index(drop=True)
 
 
-# =============================================================================
-# Error row helper
-# =============================================================================
+# --- Error row helper ---
 
 
 def _make_error_row(
     strategy: str, branch: str, target: str, model_name: str,
     error: str, outer_test_year: int | None = None,
 ) -> dict[str, Any]:
-    row: dict[str, Any] = {
+    return {
         "status": "error",
         "outer_strategy": strategy,
         "outer_test_year": outer_test_year,
@@ -826,23 +629,95 @@ def _make_error_row(
         "overfit_excluded": False,
         "overfit_gap_ratio": 0.0,
         "artifact_path": "",
+        **{f: np.nan for f in _ERROR_ROW_NAN_FIELDS},
     }
-    nan_fields = [
-        "penalized_cv_loss", "gap_penalty",
-        "cv_train_mean_mae", "cv_mean_mae",
-        "cv_mae_gap_abs", "cv_mae_gap_ratio", "cv_positive_gap_fold_share",
-        "folds_used", "trial_count", "tuning_elapsed_seconds",
-        "outer_train_rows", "outer_test_rows", "feature_count",
-        "outer_train_mae", "outer_test_mae",
-    ]
-    for f in nan_fields:
-        row[f] = np.nan
-    return row
 
 
-# =============================================================================
-# Worker for a (strategy, branch, target, outer_test_year) combo
-# =============================================================================
+# --- Worker for a (strategy, branch, target, outer_test_year) combo ---
+
+
+def _evaluate_single_model(
+    strategy: str,
+    branch: str,
+    target: str,
+    outer_test_year: int,
+    model_name: str,
+    prepared_folds: list[dict[str, Any]],
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    feat_cols: list[str],
+    selected_cols: list[str],
+    selector: Any,
+    preprocessor: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Tune, evaluate, and build result row for a single model in one combo."""
+    pid = os.getpid()
+    tag = f"({strategy}/{branch})/test={outer_test_year}/target={target}"
+
+    print(f"[PID:{pid}] {tag} tuning {model_name}...", flush=True)
+
+    tuning_result, trial_rows = tune_model(
+        prepared_folds, strategy, branch, target, model_name,
+    )
+    for tr in trial_rows:
+        tr["outer_test_year"] = outer_test_year
+    best_params = tuning_result["best_params"]
+
+    train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
+        model_name, best_params, x_train, y_train, x_test, y_test,
+    )
+
+    print(
+        f"[PID:{pid}] {tag} {model_name}: "
+        f"outer_test_mae={test_metrics['mae']:.4f}",
+        flush=True,
+    )
+
+    artifact = {
+        "model": fitted_model,
+        "preprocessor": preprocessor,
+        "feature_selector": selector,
+        "selected_feature_columns": selected_cols,
+        "target": target,
+        "branch": branch,
+        "model_name": model_name,
+        "params": best_params,
+        "feature_columns": feat_cols,
+        "metrics": {"outer_train": train_metrics, "outer_test": test_metrics},
+        "outer_strategy": strategy,
+        "outer_test_year": outer_test_year,
+    }
+
+    result_row: dict[str, Any] = {
+        "status": "ok",
+        "outer_strategy": strategy,
+        "outer_test_year": outer_test_year,
+        "target": target,
+        "branch": branch,
+        "model_name": model_name,
+        "best_params_json": serialize_params(best_params),
+        "penalized_cv_loss": tuning_result["penalized_cv_loss"],
+        "gap_penalty": tuning_result["gap_penalty"],
+        "cv_train_mean_mae": tuning_result["cv_train_mean_mae"],
+        "cv_mean_mae": tuning_result["cv_mean_mae"],
+        "cv_mae_gap_abs": tuning_result["cv_mae_gap_abs"],
+        "cv_mae_gap_ratio": tuning_result["cv_mae_gap_ratio"],
+        "cv_positive_gap_fold_share": tuning_result["cv_positive_gap_fold_share"],
+        "folds_used": tuning_result["folds_used"],
+        "trial_count": tuning_result["trial_count"],
+        "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
+        "outer_train_rows": int(len(x_train)),
+        "outer_test_rows": int(len(x_test)),
+        "feature_count": int(len(selected_cols)),
+        "outer_train_mae": train_metrics["mae"],
+        "outer_test_mae": test_metrics["mae"],
+        "error": "",
+        "artifact": artifact,
+    }
+    result_row.update(classify_overfitting(result_row))
+    return result_row, trial_rows
 
 
 def _run_combo_worker(
@@ -853,68 +728,49 @@ def _run_combo_worker(
     outer_test_year: int,
     active_models: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    _configure_worker_logging()
     pid = os.getpid()
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
-    logging.getLogger("hyperopt").setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
     tag = f"({strategy}/{branch})/test={outer_test_year}/target={target}"
     all_results: list[dict[str, Any]] = []
     all_trials: list[dict[str, Any]] = []
 
     print(f"[PID:{pid}] {tag} Loading preprocessed data from cache...", flush=True)
 
-    branch_outer = load_preprocessed_outer(preprocessed_dir, branch, outer_test_year)
-    fold_frames = load_preprocessed_folds(
-        preprocessed_dir, strategy, branch, outer_test_year,
-    )
+    prepared = load_prepared_outer_target(preprocessed_dir, strategy, branch, target, outer_test_year)
+    prepared_folds = prepared["prepared_folds"]
 
-    if len(fold_frames) < MIN_VALID_FOLDS:
+    if len(prepared_folds) < MIN_VALID_FOLDS:
         print(
-            f"[PID:{pid}] {tag} Only {len(fold_frames)} cached folds, "
+            f"[PID:{pid}] {tag} Only {len(prepared_folds)} prepared folds, "
             f"need {MIN_VALID_FOLDS}. Skipping.",
             flush=True,
         )
         for m in active_models:
             all_results.append(_make_error_row(
                 strategy, branch, target, m,
-                f"Only {len(fold_frames)} cached folds for test_year={outer_test_year}",
+                f"Only {len(prepared_folds)} prepared folds for test_year={outer_test_year}",
                 outer_test_year=outer_test_year,
             ))
         return all_results, all_trials
 
-    train_frame = branch_outer["train_frame"]
-    test_frame = branch_outer["test_frame"]
-    preprocessor = branch_outer["preprocessor"]
+    x_train = prepared["x_train"]
+    y_train = prepared["y_train"]
+    x_test = prepared["x_test"]
+    y_test = prepared["y_test"]
+    feat_cols = prepared["feature_columns"]
+    selected_cols = prepared["selected_feature_columns"]
+    selector = prepared["selector"]
+    preprocessor = load_outer_preprocessor(preprocessed_dir, branch, outer_test_year)
 
-    x_train, y_train, feat_cols = extract_xy(train_frame, target)
-    x_test, y_test, _ = extract_xy(test_frame, target)
-
-    # Compute intersection of feature columns across outer train and all CV folds
-    fold_feat_sets = []
-    for fold in fold_frames:
-        x_fold, _, fc = extract_xy(fold["train_frame"], target)
-        if not x_fold.empty:
-            fold_feat_sets.append(set(fc))
-    if fold_feat_sets:
-        common_feats = sorted(set(feat_cols) & set.intersection(*fold_feat_sets))
-    else:
-        common_feats = list(feat_cols)
-
-    # Feature selection on common features only
-    selector = fit_feature_selector(x_train[common_feats], y_train)
-    x_train, selected_cols = apply_feature_selector(
-        selector, x_train[common_feats], common_feats,
-    )
-    x_test, _ = apply_feature_selector(selector, x_test[common_feats], common_feats)
-
-    # Prepare CV folds with the same selector
-    prepared_folds = prepare_cv_fold_data(
-        fold_frames, target,
-        feature_selector=selector,
-        all_feature_columns=common_feats,
-    )
+    if x_train.empty or x_test.empty or not selected_cols or selector is None:
+        for m in active_models:
+            all_results.append(_make_error_row(
+                strategy, branch, target, m,
+                f"Missing prepared train/test matrices or selected features for "
+                f"test_year={outer_test_year}",
+                outer_test_year=outer_test_year,
+            ))
+        return all_results, all_trials
 
     print(
         f"[PID:{pid}] {tag}: "
@@ -925,76 +781,12 @@ def _run_combo_worker(
 
     for model_name in active_models:
         try:
-            print(
-                f"[PID:{pid}] {tag} tuning {model_name}...",
-                flush=True,
+            result_row, trial_rows = _evaluate_single_model(
+                strategy, branch, target, outer_test_year, model_name,
+                prepared_folds, x_train, y_train, x_test, y_test,
+                feat_cols, selected_cols, selector, preprocessor,
             )
-            tuning_result, trial_rows = tune_model(
-                prepared_folds, strategy, branch, target, model_name,
-            )
-
-            # Tag trial rows with outer_test_year for traceability
-            for tr in trial_rows:
-                tr["outer_test_year"] = outer_test_year
             all_trials.extend(trial_rows)
-            best_params = tuning_result["best_params"]
-
-            train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
-                model_name, best_params,
-                x_train, y_train, x_test, y_test,
-            )
-
-            print(
-                f"[PID:{pid}] {tag} {model_name}: "
-                f"outer_test_mae={test_metrics['mae']:.4f}",
-                flush=True,
-            )
-
-            artifact = {
-                "model": fitted_model,
-                "preprocessor": preprocessor,
-                "feature_selector": selector,
-                "selected_feature_columns": selected_cols,
-                "target": target,
-                "branch": branch,
-                "model_name": model_name,
-                "params": best_params,
-                "feature_columns": feat_cols,
-                "metrics": {
-                    "outer_train": train_metrics,
-                    "outer_test": test_metrics,
-                },
-                "outer_strategy": strategy,
-                "outer_test_year": outer_test_year,
-            }
-
-            result_row: dict[str, Any] = {
-                "status": "ok",
-                "outer_strategy": strategy,
-                "outer_test_year": outer_test_year,
-                "target": target,
-                "branch": branch,
-                "model_name": model_name,
-                "best_params_json": serialize_params(best_params),
-                "penalized_cv_loss": tuning_result["penalized_cv_loss"],
-                "gap_penalty": tuning_result["gap_penalty"],
-                "cv_train_mean_mae": tuning_result["cv_train_mean_mae"],
-                "cv_mean_mae": tuning_result["cv_mean_mae"],
-                "cv_mae_gap_abs": tuning_result["cv_mae_gap_abs"],
-                "cv_mae_gap_ratio": tuning_result["cv_mae_gap_ratio"],
-                "cv_positive_gap_fold_share": tuning_result["cv_positive_gap_fold_share"],
-                "folds_used": tuning_result["folds_used"],
-                "trial_count": tuning_result["trial_count"],
-                "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
-                "outer_train_rows": int(len(x_train)),
-                "outer_test_rows": int(len(x_test)),
-                "feature_count": int(len(selected_cols)),
-                "outer_train_mae": train_metrics["mae"],
-                "outer_test_mae": test_metrics["mae"],
-                "error": "",
-                "artifact": artifact,
-            }
-            result_row.update(classify_overfitting(result_row))
             all_results.append(result_row)
         except Exception as exc:
             all_results.append(_make_error_row(
@@ -1006,9 +798,7 @@ def _run_combo_worker(
     return all_results, all_trials
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# --- Entry point ---
 
 
 def _consume_worker_output(
@@ -1034,6 +824,26 @@ def _consume_worker_output(
             result_row["artifact_path"] = str(artifact_path)
         all_outer_result_rows.append(result_row)
     all_trial_rows.extend(combo_trials)
+    persist_partial_outputs(all_trial_rows, all_outer_result_rows)
+
+
+def _handle_combo_failure(
+    strategy: str,
+    branch: str,
+    target: str,
+    outer_test_year: int,
+    exc: Exception,
+    all_outer_result_rows: list[dict[str, Any]],
+    all_trial_rows: list[dict[str, Any]],
+) -> None:
+    """Record error rows for all models when a combo fails entirely."""
+    for model_name in ACTIVE_MODELS:
+        all_outer_result_rows.append(
+            _make_error_row(
+                strategy, branch, target, model_name,
+                str(exc), outer_test_year=outer_test_year,
+            )
+        )
     persist_partial_outputs(all_trial_rows, all_outer_result_rows)
 
 
@@ -1064,7 +874,6 @@ def run() -> None:
     logger.info(f"OVERFIT_THRESHOLD={OVERFIT_GAP_RATIO_THRESHOLD}")
     logger.info(f"N_FEATURES={N_FEATURES_TO_SELECT}")
 
-    # Validate TRAIN_START_YEAR before preprocessing
     if TRAIN_START_YEAR is not None:
         if TRAIN_START_YEAR > MAX_TRAIN_START_YEAR:
             raise ValueError(
@@ -1078,9 +887,7 @@ def run() -> None:
             f"TRAIN_START_YEAR={TRAIN_START_YEAR}: will filter training rows after feature engineering"
         )
 
-    # Run preprocessing stage (uses cache if valid)
-    from stages.preprocessing import run_preprocessing_stage
-    preprocessed_dir = run_preprocessing_stage()
+    preprocessed_dir = run_data_preparation_stage()
     logger.info(f"Using preprocessed data from: {preprocessed_dir}")
 
     combos = [
@@ -1126,14 +933,10 @@ def run() -> None:
                         f"[{completed}/{total}] FAILED: "
                         f"{strategy}/{branch}/{target}/{outer_test_year}: {exc}"
                     )
-                    for model_name in ACTIVE_MODELS:
-                        all_outer_result_rows.append(
-                            _make_error_row(
-                                strategy, branch, target, model_name,
-                                str(exc), outer_test_year=outer_test_year,
-                            )
-                        )
-                    persist_partial_outputs(all_trial_rows, all_outer_result_rows)
+                    _handle_combo_failure(
+                        strategy, branch, target, outer_test_year, exc,
+                        all_outer_result_rows, all_trial_rows,
+                    )
     except PermissionError as exc:
         logger.warning(f"Process pool unavailable ({exc}). Running sequentially.")
         for strategy, branch, target, outer_test_year in combos:
@@ -1154,14 +957,10 @@ def run() -> None:
                     f"[{completed}/{total}] FAILED: "
                     f"{strategy}/{branch}/{target}/{outer_test_year}: {inner_exc}"
                 )
-                for model_name in ACTIVE_MODELS:
-                    all_outer_result_rows.append(
-                        _make_error_row(
-                            strategy, branch, target, model_name,
-                            str(inner_exc), outer_test_year=outer_test_year,
-                        )
-                    )
-                persist_partial_outputs(all_trial_rows, all_outer_result_rows)
+                _handle_combo_failure(
+                    strategy, branch, target, outer_test_year, inner_exc,
+                    all_outer_result_rows, all_trial_rows,
+                )
 
     persist_partial_outputs(all_trial_rows, all_outer_result_rows)
 

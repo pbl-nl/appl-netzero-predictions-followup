@@ -5,11 +5,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from stages.training.config import (
-    ACTIVE_OUTER_STRATEGIES,
-    ACTIVE_TARGETS,
-    OVERFIT_GAP_RATIO_THRESHOLD,
-)
+from stages.training.config import OVERFIT_GAP_RATIO_THRESHOLD
 
 
 def classify_overfitting(result_row: dict[str, Any]) -> dict[str, Any]:
@@ -50,14 +46,11 @@ def build_overfitting_audit_df(
 
     audit_df["winner_selected"] = False
     if not winners_df.empty:
-        winner_keys = {
-            (str(row["outer_strategy"]), str(row["target"]), str(row["branch"]), str(row["model_name"]))
-            for _, row in winners_df.iterrows()
-        }
-        for row_idx, row in audit_df.iterrows():
-            key = (str(row["outer_strategy"]), str(row["target"]), str(row["branch"]), str(row["model_name"]))
-            if key in winner_keys:
-                audit_df.at[row_idx, "winner_selected"] = True
+        match_cols = ["outer_strategy", "target", "branch", "model_name"]
+        winner_flags = winners_df[match_cols].drop_duplicates().assign(_is_winner=True)
+        audit_df = audit_df.merge(winner_flags, on=match_cols, how="left")
+        audit_df["winner_selected"] = audit_df["_is_winner"].fillna(False)
+        audit_df = audit_df.drop(columns=["_is_winner"])
 
     audit_columns = [
         "status", "outer_strategy", "outer_test_year",

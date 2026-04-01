@@ -1,31 +1,18 @@
 """
-preprocessing.py – Preprocessor class + preprocessing cache management.
+preprocessing.py - reusable preprocessing classes and constants.
 
 The Preprocessor class implements a three-phase pipeline:
-    clean → impute → engineer → encode/scale
+    clean -> impute -> engineer -> encode/scale
 
 Two imputation branches:
-    simple : Country → year → global median fallback
+    simple : Country -> year -> global median fallback
     mice   : Iterative imputer with panel-aware auxiliary predictors
-
-The cache management layer preprocesses all splits/folds once and persists
-them to disk, keyed by a fingerprint of the data, pipeline code, and config.
-
-Run:  python -m stages.preprocessing          # build or reuse cache
-      python -m stages.preprocessing --force   # force rebuild
 """
 
 from __future__ import annotations
 
-import fcntl
-import hashlib
-import json
 import logging
 import os
-import shutil
-import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,21 +22,17 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-import joblib
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer, SimpleImputer
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, RobustScaler, StandardScaler
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Configurable constants
-# =============================================================================
+# --- Configurable constants ---
 
 DATA_PATH = Path("data/merged/merged.csv")
 
@@ -59,11 +42,7 @@ ID_COLS = [COUNTRY_COL, YEAR_COL]
 TARGET_COLS = ["linear", "optimistic", "pessimistic"]
 CATEGORICAL_FEATURES = ["v2x_regime"]
 
-YEAR_CUTOFF = 2022
 TEST_YEAR = 2022
-VALIDATION_STRATEGY = "2021_holdout"  # Options: "2021_holdout", "random_pre_2022"
-VALIDATION_YEAR = 2021
-RANDOM_VALIDATION_SIZE = 0.20
 RANDOM_STATE = 42
 
 ROW_MISSINGNESS_THRESHOLD = 0.30
@@ -93,9 +72,6 @@ MICE_TOL = 1e-3
 MICE_SKIP_COMPLETE = True
 MICE_COUNTRY_N_COMPONENTS = 5
 MICE_MISSING_THRESHOLD = 0.05  # features above this rate get was_missing flags
-
-SHOW_SAMPLE_ROWS = 3
-TOP_MISSINGNESS_ROWS = 10
 
 RATE_FEATURES = {
     "ghg_growth",
@@ -154,12 +130,7 @@ CATEGORICAL_ALLOWED_VALUES: dict[str, set[int]] = {
 
 BRANCH_NAMES = ("simple", "mice")
 
-CACHE_ROOT = Path("data/preprocessed")
-
-
-# =============================================================================
-# Utility functions
-# =============================================================================
+# --- Utility functions ---
 
 
 def safe_mode(series: pd.Series) -> Any:
@@ -181,80 +152,7 @@ def get_continuous_features(df: pd.DataFrame, feature_columns: list[str]) -> lis
     ]
 
 
-# =============================================================================
-# Data loading
-# =============================================================================
-
-
-def load_panel_data(path: Path = DATA_PATH, verbose: bool = True) -> pd.DataFrame:
-    if verbose:
-        logger.info("=" * 80)
-        logger.info("Load Panel Data")
-        logger.info("=" * 80)
-
-    df = pd.read_csv(path)
-    if YEAR_COL not in df.columns or COUNTRY_COL not in df.columns:
-        raise ValueError(f"Expected {COUNTRY_COL!r} and {YEAR_COL!r} in {path}")
-
-    df = df[df[YEAR_COL] <= YEAR_CUTOFF].copy()
-    df = df.sort_values(ID_COLS).reset_index(drop=True)
-
-    duplicate_count = df.duplicated(ID_COLS).sum()
-    if verbose:
-        logger.info(f"Path: {path}")
-        logger.info(f"Shape after year <= {YEAR_CUTOFF}: {df.shape}")
-        logger.info(f"Duplicate country-year rows: {duplicate_count}")
-    if duplicate_count:
-        raise ValueError("Duplicate country-year rows detected.")
-
-    if verbose:
-        feature_columns = get_feature_columns(df)
-        miss = df[feature_columns].isna().mean().sort_values(ascending=False).head(TOP_MISSINGNESS_ROWS)
-        logger.info(f"Top feature missingness:\n{miss.to_string()}")
-        for col in TARGET_COLS:
-            logger.info(f"Target {col} missing: {int(df[col].isna().sum())}")
-
-    return df
-
-
-def split_raw_panel(
-    df: pd.DataFrame,
-    validation_strategy: str = VALIDATION_STRATEGY,
-    verbose: bool = True,
-) -> dict[str, pd.DataFrame]:
-    test_df = df[df[YEAR_COL] == TEST_YEAR].copy()
-    pre_test_df = df[df[YEAR_COL] < TEST_YEAR].copy()
-
-    if validation_strategy == "2021_holdout":
-        train_df = pre_test_df[pre_test_df[YEAR_COL] < VALIDATION_YEAR].copy()
-        val_df = pre_test_df[pre_test_df[YEAR_COL] == VALIDATION_YEAR].copy()
-    elif validation_strategy == "random_pre_2022":
-        train_idx, val_idx = train_test_split(
-            pre_test_df.index,
-            test_size=RANDOM_VALIDATION_SIZE,
-            random_state=RANDOM_STATE,
-            shuffle=True,
-        )
-        train_df = pre_test_df.loc[sorted(train_idx)].copy()
-        val_df = pre_test_df.loc[sorted(val_idx)].copy()
-    else:
-        raise ValueError(f"Unsupported validation strategy: {validation_strategy}")
-
-    if verbose:
-        for name, frame in [("train", train_df), ("val", val_df), ("test", test_df)]:
-            all_missing = frame[TARGET_COLS].isna().all(axis=1).sum()
-            logger.info(
-                f"{name}: rows={len(frame)}, "
-                f"year_range=({int(frame[YEAR_COL].min())}, {int(frame[YEAR_COL].max())}), "
-                f"all_targets_missing={int(all_missing)}"
-            )
-
-    return {"train": train_df, "val": val_df, "test": test_df}
-
-
-# =============================================================================
-# Grouped imputation
-# =============================================================================
+# --- Grouped imputation ---
 
 
 class CountryYearFallbackImputer:
@@ -289,9 +187,7 @@ class CountryYearFallbackImputer:
         return self.fit(df).transform(df)
 
 
-# =============================================================================
-# Preprocessor
-# =============================================================================
+# --- Preprocessor ---
 
 
 class Preprocessor:
@@ -317,7 +213,7 @@ class Preprocessor:
         self.active_branches_ = list(active_branches)
         self.train_start_year_: int | None = train_start_year
 
-        # Fitted state — set during fit_transform
+        # Column metadata
         self.feature_columns_: list[str] = []
         self.continuous_features_: list[str] = []
         self.retained_raw_features_: list[str] = []
@@ -334,22 +230,22 @@ class Preprocessor:
         self.year_mean_: float = 0.0
         self.year_std_: float = 1.0
 
-        # Names of all synthetic (non-engineerable) columns
+        # Synthetic feature names (non-engineerable columns)
         self.synthetic_feature_names_: list[str] = []
 
-        # Imputers — simple_imputer_ is always fitted (used by both branches)
+        # Imputers
         self.simple_imputer_: CountryYearFallbackImputer | None = None
         self.mice_numeric_imputer_: IterativeImputer | None = None
         self.mice_categorical_imputer_: SimpleImputer | None = None
         self.numeric_global_fallback_: pd.Series | None = None
 
-        # MICE enrichment helpers
+        # MICE enrichment state
         self.mice_scaler_means_: pd.Series | None = None
         self.mice_scaler_stds_: pd.Series | None = None
-        self.mice_missing_flags_: list[str] = []       # features with was_missing indicators
-        self.mice_aux_col_names_: list[str] = []       # panel-aware auxiliary column names
-        self.mice_input_cols_: list[str] = []          # full ordered MICE input column set
-        self.mice_regime_col_: str | None = None       # v2x_regime predictor column name
+        self.mice_missing_flags_: list[str] = []
+        self.mice_aux_col_names_: list[str] = []
+        self.mice_input_cols_: list[str] = []
+        self.mice_regime_col_: str | None = None
 
         # Encoders / scalers per branch
         self.encoder_: dict[str, OneHotEncoder] = {}
@@ -359,6 +255,12 @@ class Preprocessor:
     # -----------------------------------------------------------------
     # Synthetic feature helpers (country PCA + year features)
     # -----------------------------------------------------------------
+
+    def _reset_country_embeddings(self) -> None:
+        self.country_embedding_map_ = {}
+        self.country_n_pca_components_ = 0
+        self.pca_component_names_ = []
+
     def _build_country_embeddings(self, cleaned_train_df: pd.DataFrame) -> None:
         """Build country PCA embeddings from cleaned training data."""
         year_vals = cleaned_train_df[YEAR_COL].values.astype(float)
@@ -368,9 +270,7 @@ class Preprocessor:
 
         feats = [c for c in self.retained_continuous_features_ if c in cleaned_train_df.columns]
         if not feats or COUNTRY_COL not in cleaned_train_df.columns:
-            self.country_embedding_map_ = {}
-            self.country_n_pca_components_ = 0
-            self.pca_component_names_ = []
+            self._reset_country_embeddings()
             return
 
         grouped = cleaned_train_df.groupby(COUNTRY_COL)[feats]
@@ -392,9 +292,7 @@ class Preprocessor:
             summary_scaled.shape[1],
         )
         if n_components < 1:
-            self.country_embedding_map_ = {}
-            self.country_n_pca_components_ = 0
-            self.pca_component_names_ = []
+            self._reset_country_embeddings()
             return
 
         pca = PCA(n_components=n_components, random_state=RANDOM_STATE)
@@ -639,30 +537,26 @@ class Preprocessor:
         self, df: pd.DataFrame, up_to_year: int | None = None,
     ) -> pd.DataFrame:
         """Inject synthetic ghost rows for years absent from a country's time series."""
-        id_and_meta = set([COUNTRY_COL, YEAR_COL, "_to_drop"] + TARGET_COLS)
-        feature_cols = [c for c in df.columns if c not in id_and_meta]
-        frames = []
+        ghost_pieces: list[pd.DataFrame] = []
         for country, grp in df.groupby(COUNTRY_COL, sort=False):
             years_present = set(int(y) for y in grp[YEAR_COL])
             if not years_present:
-                frames.append(grp)
                 continue
             min_year = min(years_present)
             max_year = max(max(years_present), up_to_year) if up_to_year is not None else max(years_present)
             missing_years = sorted(set(range(min_year, max_year + 1)) - years_present)
-            if not missing_years:
-                frames.append(grp)
-                continue
-            ghost = pd.DataFrame({COUNTRY_COL: country, YEAR_COL: missing_years})
-            for col in feature_cols:
-                ghost[col] = np.nan
-            for col in TARGET_COLS:
-                ghost[col] = np.nan
-            ghost["_to_drop"] = True
-            frames.append(pd.concat([grp, ghost], ignore_index=True))
-        if not frames:
+            if missing_years:
+                ghost_pieces.append(pd.DataFrame({
+                    COUNTRY_COL: country,
+                    YEAR_COL: missing_years,
+                    "_to_drop": True,
+                }))
+
+        if not ghost_pieces:
             return df.copy()
-        result = pd.concat(frames, ignore_index=True)
+
+        ghosts = pd.concat(ghost_pieces, ignore_index=True)
+        result = pd.concat([df, ghosts], ignore_index=True)
         return result.sort_values(ID_COLS).reset_index(drop=True)
 
     # -----------------------------------------------------------------
@@ -671,27 +565,31 @@ class Preprocessor:
     def _fit_imputers(self, cleaned_train: pd.DataFrame) -> None:
         self.numeric_global_fallback_ = cleaned_train[self.retained_continuous_features_].median()
         retained_cats = [c for c in CATEGORICAL_FEATURES if c in self.retained_raw_features_]
+        self._fit_simple_imputer(cleaned_train, retained_cats)
+        if "mice" in self.active_branches_:
+            self._fit_mice_imputer(cleaned_train, retained_cats)
 
-        # Always fit simple imputer — used directly by simple branch and as
-        # auxiliary context provider for the MICE branch.
+    def _fit_simple_imputer(
+        self, cleaned_train: pd.DataFrame, retained_cats: list[str],
+    ) -> None:
         self.simple_imputer_ = CountryYearFallbackImputer(
             numeric_features=self.retained_continuous_features_,
             categorical_features=retained_cats,
         )
         self.simple_imputer_.fit(cleaned_train)
 
-        if "mice" in self.active_branches_ and self.retained_continuous_features_:
-            # Missingness flags: features above threshold get was_missing indicators
+    def _fit_mice_imputer(
+        self, cleaned_train: pd.DataFrame, retained_cats: list[str],
+    ) -> None:
+        if self.retained_continuous_features_:
             miss_rates = cleaned_train[self.retained_continuous_features_].isna().mean()
             self.mice_missing_flags_ = [
                 c for c in self.retained_continuous_features_
                 if miss_rates.get(c, 0.0) > MICE_MISSING_THRESHOLD
             ]
 
-            # Build enriched fit matrix: original features + panel-aware aux + regime
+            # Panel-aware auxiliary predictors
             mice_fit_df = cleaned_train[self.retained_continuous_features_].copy()
-
-            # Panel-aware auxiliary predictors: country median per feature (no NaN)
             aux_col_names: list[str] = []
             for col in self.retained_continuous_features_:
                 c_fill = cleaned_train[COUNTRY_COL].map(self.simple_imputer_.country_stats_[col])
@@ -742,7 +640,7 @@ class Preprocessor:
             )
             self.mice_numeric_imputer_.fit(scaled.values)
 
-        if "mice" in self.active_branches_ and retained_cats:
+        if retained_cats:
             self.mice_categorical_imputer_ = SimpleImputer(strategy="most_frequent")
             self.mice_categorical_imputer_.fit(cleaned_train[retained_cats])
 
@@ -759,48 +657,14 @@ class Preprocessor:
             if self.mice_numeric_imputer_ is None and self.retained_continuous_features_:
                 raise RuntimeError("MICE imputer has not been fit.")
 
-            # Add binary missingness indicators before values are overwritten
             for col in self.mice_missing_flags_:
                 if col in out.columns:
                     out[f"{col}_was_missing"] = out[col].isna().astype(float)
 
             if self.retained_continuous_features_:
-                # Build enriched MICE input: original features + aux + regime
-                mice_in = out[self.retained_continuous_features_].copy()
-
-                for col, aux_name in zip(self.retained_continuous_features_, self.mice_aux_col_names_):
-                    c_fill = out[COUNTRY_COL].map(self.simple_imputer_.country_stats_[col])
-                    y_fill = out[YEAR_COL].map(self.simple_imputer_.year_stats_[col])
-                    glob = self.simple_imputer_.global_stats_[col]
-                    mice_in[aux_name] = c_fill.fillna(y_fill).fillna(glob)
-
-                if self.mice_regime_col_ is not None:
-                    regime_col = "v2x_regime"
-                    if retained_cats and self.mice_categorical_imputer_ is not None:
-                        cats_imp = self.mice_categorical_imputer_.transform(out[retained_cats])
-                        cats_df = pd.DataFrame(cats_imp, columns=retained_cats, index=out.index)
-                        regime_vals = cats_df.get(regime_col, pd.Series(np.nan, index=out.index))
-                    else:
-                        regime_vals = out.get(regime_col, pd.Series(np.nan, index=out.index))
-                    mice_in["_regime"] = pd.to_numeric(regime_vals, errors="coerce").fillna(0.0)
-
-                scaled = (
-                    (mice_in[self.mice_input_cols_] - self.mice_scaler_means_)
-                    / self.mice_scaler_stds_
-                )
-                imputed_scaled = self.mice_numeric_imputer_.transform(scaled.values)
-
-                # Extract only original continuous features (first n_orig columns)
-                n_orig = len(self.retained_continuous_features_)
-                orig_means = self.mice_scaler_means_.values[:n_orig]
-                orig_stds = self.mice_scaler_stds_.values[:n_orig]
-                out[self.retained_continuous_features_] = (
-                    imputed_scaled[:, :n_orig] * orig_stds + orig_means
-                )
-                if self.numeric_global_fallback_ is not None:
-                    out[self.retained_continuous_features_] = out[
-                        self.retained_continuous_features_
-                    ].fillna(self.numeric_global_fallback_)
+                mice_in = self._build_mice_input(out)
+                self._attach_regime_to_mice_input(mice_in, out, retained_cats)
+                out = self._apply_mice_transform(out, mice_in)
 
             if retained_cats and self.mice_categorical_imputer_ is not None:
                 out[retained_cats] = self.mice_categorical_imputer_.transform(out[retained_cats])
@@ -815,6 +679,52 @@ class Preprocessor:
                     lower=min(allowed), upper=max(allowed),
                 )
 
+        return out
+
+    def _build_mice_input(self, out: pd.DataFrame) -> pd.DataFrame:
+        """Build enriched MICE input: original features + panel-aware aux columns."""
+        mice_in = out[self.retained_continuous_features_].copy()
+        for col, aux_name in zip(self.retained_continuous_features_, self.mice_aux_col_names_):
+            c_fill = out[COUNTRY_COL].map(self.simple_imputer_.country_stats_[col])
+            y_fill = out[YEAR_COL].map(self.simple_imputer_.year_stats_[col])
+            glob = self.simple_imputer_.global_stats_[col]
+            mice_in[aux_name] = c_fill.fillna(y_fill).fillna(glob)
+        return mice_in
+
+    def _attach_regime_to_mice_input(
+        self, mice_in: pd.DataFrame, out: pd.DataFrame, retained_cats: list[str],
+    ) -> None:
+        """Attach v2x_regime as a numeric column to the MICE input matrix."""
+        if self.mice_regime_col_ is None:
+            return
+        regime_col = "v2x_regime"
+        if retained_cats and self.mice_categorical_imputer_ is not None:
+            cats_imp = self.mice_categorical_imputer_.transform(out[retained_cats])
+            cats_df = pd.DataFrame(cats_imp, columns=retained_cats, index=out.index)
+            regime_vals = cats_df.get(regime_col, pd.Series(np.nan, index=out.index))
+        else:
+            regime_vals = out.get(regime_col, pd.Series(np.nan, index=out.index))
+        mice_in["_regime"] = pd.to_numeric(regime_vals, errors="coerce").fillna(0.0)
+
+    def _apply_mice_transform(self, out: pd.DataFrame, mice_in: pd.DataFrame) -> pd.DataFrame:
+        """Scale, apply MICE imputer, inverse-scale, and write back to out."""
+        scaled = (
+            (mice_in[self.mice_input_cols_] - self.mice_scaler_means_)
+            / self.mice_scaler_stds_
+        )
+        imputed_scaled = self.mice_numeric_imputer_.transform(scaled.values)
+
+        # Extract only original continuous features (first n_orig columns)
+        n_orig = len(self.retained_continuous_features_)
+        orig_means = self.mice_scaler_means_.values[:n_orig]
+        orig_stds = self.mice_scaler_stds_.values[:n_orig]
+        out[self.retained_continuous_features_] = (
+            imputed_scaled[:, :n_orig] * orig_stds + orig_means
+        )
+        if self.numeric_global_fallback_ is not None:
+            out[self.retained_continuous_features_] = out[
+                self.retained_continuous_features_
+            ].fillna(self.numeric_global_fallback_)
         return out
 
     # -----------------------------------------------------------------
@@ -950,481 +860,11 @@ class Preprocessor:
         raise ValueError(f"Unsupported scaler: {SCALER_CHOICE}")
 
 
-# =============================================================================
-# Validation helpers
-# =============================================================================
-
-
-def validate_branch_outputs(
-    train_outputs: dict[str, pd.DataFrame],
-    val_outputs: dict[str, pd.DataFrame],
-    test_outputs: dict[str, pd.DataFrame],
-) -> None:
-    for branch in train_outputs:
-        train_df = train_outputs[branch]
-        val_df = val_outputs[branch]
-        test_df = test_outputs[branch]
-        train_feats = [c for c in train_df.columns if c not in ID_COLS + TARGET_COLS]
-        val_feats = [c for c in val_df.columns if c not in ID_COLS + TARGET_COLS]
-        test_feats = [c for c in test_df.columns if c not in ID_COLS + TARGET_COLS]
-        if train_feats != val_feats or train_feats != test_feats:
-            raise AssertionError(f"Feature columns mismatch across splits for branch {branch}.")
-        for name, frame, feats in [("train", train_df, train_feats),
-                                    ("val", val_df, val_feats),
-                                    ("test", test_df, test_feats)]:
-            nan_count = int(frame[feats].isna().sum().sum())
-            logger.info(f"{branch}/{name}: rows={len(frame)}, features={len(feats)}, NaNs={nan_count}")
-            if nan_count:
-                raise AssertionError(f"NaNs remain in final features for {branch}/{name}.")
-
-
-def summarize_target_shapes(outputs: dict[str, pd.DataFrame], split_name: str) -> None:
-    for branch, frame in outputs.items():
-        for target in TARGET_COLS:
-            usable = int(frame[target].notna().sum())
-            logger.info(f"{split_name}/{branch}/{target}: usable rows={usable}")
-
-
-def run_pipeline_for_strategy(df: pd.DataFrame, validation_strategy: str) -> dict[str, Any]:
-    splits = split_raw_panel(df, validation_strategy=validation_strategy)
-    preprocessor = Preprocessor()
-    train_outputs = preprocessor.fit_transform(splits["train"])
-    val_history = splits["train"]
-    test_history = pd.concat([splits["train"], splits["val"]], ignore_index=True)
-    val_outputs = preprocessor.transform(splits["val"], history_df=val_history, split_name="val")
-    test_outputs = preprocessor.transform(splits["test"], history_df=test_history, split_name="test")
-    validate_branch_outputs(train_outputs, val_outputs, test_outputs)
-    summarize_target_shapes(train_outputs, "train")
-    summarize_target_shapes(val_outputs, "val")
-    summarize_target_shapes(test_outputs, "test")
-    return {
-        "pipeline": preprocessor,
-        "splits": splits,
-        "train_outputs": train_outputs,
-        "val_outputs": val_outputs,
-        "test_outputs": test_outputs,
-    }
-
-
-# =============================================================================
-# Cache I/O helpers
-# =============================================================================
-
-
-def write_frame(df: pd.DataFrame, path: Path) -> None:
-    df.to_csv(path, index=False)
-
-
-def read_frame(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, low_memory=False)
-
-
-# =============================================================================
-# Cache fingerprint
-# =============================================================================
-
-
-def _file_sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 16), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _build_fingerprint_config() -> dict[str, Any]:
-    from stages.training.config import (
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        N_TEMPORAL_CV_FOLDS,
-        OUTER_TEST_YEARS,
-        TEST_YEAR as _TEST_YEAR,
-        TRAIN_START_YEAR,
-    )
-    return {
-        "data_sha256": _file_sha256(DATA_PATH),
-        "pipeline_sha256": _file_sha256(Path("stages/preprocessing.py")),
-        "core_sha256": _file_sha256(Path("stages/training/core.py")),
-        "branches": sorted(ACTIVE_BRANCHES),
-        "strategies": sorted(ACTIVE_OUTER_STRATEGIES),
-        "outer_test_years": sorted(OUTER_TEST_YEARS),
-        "test_year": _TEST_YEAR,
-        "train_start_year": TRAIN_START_YEAR,
-        "n_temporal_cv_folds": N_TEMPORAL_CV_FOLDS,
-        "random_state": RANDOM_STATE,
-        "row_missingness_threshold": ROW_MISSINGNESS_THRESHOLD,
-        "sparse_column_threshold": SPARSE_COLUMN_THRESHOLD,
-        "outlier_method": OUTLIER_METHOD,
-        "iqr_multiplier": IQR_MULTIPLIER,
-        "country_outlier_min_obs": COUNTRY_OUTLIER_MIN_OBS,
-        "year_outlier_min_obs": YEAR_OUTLIER_MIN_OBS,
-        "lag_periods": LAG_PERIODS,
-        "rolling_windows": ROLLING_WINDOWS,
-        "rolling_min_periods": ROLLING_MIN_PERIODS,
-        "structural_na_fill_value": STRUCTURAL_NA_FILL_VALUE,
-        "enable_diff_features": ENABLE_DIFF_FEATURES,
-        "enable_pct_change_features": ENABLE_PCT_CHANGE_FEATURES,
-        "scaler_choice": SCALER_CHOICE,
-        "mice_max_iter": MICE_MAX_ITER,
-        "mice_tol": MICE_TOL,
-        "mice_skip_complete": MICE_SKIP_COMPLETE,
-        "mice_country_n_components": MICE_COUNTRY_N_COMPONENTS,
-        "mice_missing_threshold": MICE_MISSING_THRESHOLD,
-        "interaction_pairs": sorted(INTERACTION_PAIRS),
-    }
-
-
-def compute_fingerprint() -> str:
-    config = _build_fingerprint_config()
-    canonical = json.dumps(config, sort_keys=True, default=str)
-    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
-
-
-# =============================================================================
-# Cache validation
-# =============================================================================
-
-
-def enumerate_cache_units(
-    branches: list[str],
-    strategies: list[str],
-    outer_test_years: list[int],
-) -> dict[str, list]:
-    return {
-        "outer": [(b, y) for b in branches for y in outer_test_years],
-        "fold_sets": [
-            (s, b, y) for s in strategies for b in branches for y in outer_test_years
-        ],
-        "final": list(branches),
-        "final_fold_sets": [(s, b) for s in strategies for b in branches],
-    }
-
-
-def _expected_files_for_unit(
-    cache_dir: Path, unit_type: str, unit_key: tuple | str,
-) -> list[Path]:
-    if unit_type == "outer":
-        branch, year = unit_key
-        base = cache_dir / "outer" / branch / str(year)
-        return [base / "train.csv", base / "test.csv", base / "preprocessor.joblib"]
-    if unit_type == "fold_sets":
-        strategy, branch, year = unit_key
-        base = cache_dir / "folds" / strategy / branch / str(year)
-        return [base]
-    if unit_type == "final":
-        branch = unit_key
-        base = cache_dir / "final" / branch
-        return [
-            base / "train.csv",
-            base / "test_scored.csv",
-            base / "test_all.csv",
-            base / "preprocessor.joblib",
-        ]
-    if unit_type == "final_fold_sets":
-        strategy, branch = unit_key
-        base = cache_dir / "final" / "folds" / strategy / branch
-        return [base]
-    return []
-
-
-def validate_cache(cache_dir: Path) -> bool:
-    from stages.training.config import ACTIVE_BRANCHES, ACTIVE_OUTER_STRATEGIES, OUTER_TEST_YEARS
-
-    manifest_path = cache_dir / "manifest.json"
-    if not manifest_path.exists():
-        return False
-    try:
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-    if not manifest.get("complete"):
-        return False
-    manifest_fp = manifest.get("fingerprint")
-    if manifest_fp != cache_dir.name:
-        logger.info(f"Cache dir/manifest mismatch: dir={cache_dir.name}, manifest={manifest_fp}")
-        return False
-    current_fp = compute_fingerprint()
-    if manifest_fp != current_fp:
-        logger.info(f"Cache fingerprint mismatch: cached={manifest_fp}, current={current_fp}")
-        return False
-    units = enumerate_cache_units(ACTIVE_BRANCHES, ACTIVE_OUTER_STRATEGIES, OUTER_TEST_YEARS)
-    for unit_type, unit_list in units.items():
-        for unit_key in unit_list:
-            for path in _expected_files_for_unit(cache_dir, unit_type, unit_key):
-                if not path.exists():
-                    logger.info(f"Cache missing: {path}")
-                    return False
-                if path.is_dir() and not any(path.iterdir()):
-                    logger.info(f"Cache empty dir: {path}")
-                    return False
-    return True
-
-
-# =============================================================================
-# Preprocessing workers
-# =============================================================================
-
-
-def _preprocess_outer_unit(
-    raw_df: pd.DataFrame,
-    branch: str,
-    outer_test_year: int,
-    base_dir: Path,
-) -> None:
-    import warnings
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
-    from stages.training.config import TEST_YEAR as _TEST_YEAR, TRAIN_START_YEAR, YEAR_COL as _YEAR_COL
-    from stages.training.core import make_nested_outer_split, prepare_branch_outer_frames
-
-    t0 = time.monotonic()
-    pid = os.getpid()
-    tag = f"outer/{branch}/{outer_test_year}"
-
-    raw_pre_test = raw_df[raw_df[_YEAR_COL] < _TEST_YEAR].copy()
-    split = make_nested_outer_split(raw_pre_test, outer_test_year)
-    result = prepare_branch_outer_frames(split, branch, train_start_year=TRAIN_START_YEAR)
-
-    out_dir = base_dir / "outer" / branch / str(outer_test_year)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_frame(result["train_frame"], out_dir / "train.csv")
-    write_frame(result["test_frame"], out_dir / "test.csv")
-    joblib.dump(result["preprocessor"], out_dir / "preprocessor.joblib")
-
-    elapsed = time.monotonic() - t0
-    print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s", flush=True)
-
-
-def _preprocess_fold_set(
-    raw_df: pd.DataFrame,
-    strategy: str,
-    branch: str,
-    outer_test_year: int,
-    base_dir: Path,
-) -> None:
-    import warnings
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
-    from stages.training.config import TEST_YEAR as _TEST_YEAR, TRAIN_START_YEAR, YEAR_COL as _YEAR_COL
-    from stages.training.core import (
-        make_cv_folds, make_nested_outer_split, prepare_branch_fold_frames,
-    )
-
-    t0 = time.monotonic()
-    pid = os.getpid()
-    tag = f"folds/{strategy}/{branch}/{outer_test_year}"
-
-    raw_pre_test = raw_df[raw_df[_YEAR_COL] < _TEST_YEAR].copy()
-    split = make_nested_outer_split(raw_pre_test, outer_test_year)
-    raw_folds = make_cv_folds(split["outer_train"], strategy)
-    fold_frames = prepare_branch_fold_frames(raw_folds, branch, train_start_year=TRAIN_START_YEAR)
-
-    out_dir = base_dir / "folds" / strategy / branch / str(outer_test_year)
-    for fold in fold_frames:
-        fold_dir = out_dir / f"fold_{fold['fold_id']}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        write_frame(fold["train_frame"], fold_dir / "train.csv")
-        write_frame(fold["val_frame"], fold_dir / "val.csv")
-
-    elapsed = time.monotonic() - t0
-    print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s ({len(fold_frames)} folds)", flush=True)
-
-
-def _preprocess_final_unit(
-    raw_df: pd.DataFrame,
-    branch: str,
-    base_dir: Path,
-) -> None:
-    import warnings
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
-    from stages.training.config import TEST_YEAR as _TEST_YEAR, TRAIN_START_YEAR, YEAR_COL as _YEAR_COL
-
-    t0 = time.monotonic()
-    pid = os.getpid()
-    tag = f"final/{branch}"
-
-    final_train_raw = raw_df[raw_df[_YEAR_COL] < _TEST_YEAR].copy()
-    final_test_raw = raw_df[raw_df[_YEAR_COL] == _TEST_YEAR].copy()
-
-    preprocessor = Preprocessor(active_branches=[branch], train_start_year=TRAIN_START_YEAR)
-    train_outputs = preprocessor.fit_transform(final_train_raw)
-    test_outputs_scored = preprocessor.transform(
-        final_test_raw, history_df=final_train_raw, drop_rows=True,
-        split_name=f"final_test_{branch}",
-    )
-    test_outputs_all = preprocessor.transform(
-        final_test_raw, history_df=final_train_raw, drop_rows=False,
-        split_name=f"final_test_all_{branch}",
-    )
-
-    out_dir = base_dir / "final" / branch
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_frame(train_outputs[branch], out_dir / "train.csv")
-    write_frame(test_outputs_scored[branch], out_dir / "test_scored.csv")
-    write_frame(test_outputs_all[branch], out_dir / "test_all.csv")
-    joblib.dump(preprocessor, out_dir / "preprocessor.joblib")
-
-    elapsed = time.monotonic() - t0
-    print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s", flush=True)
-
-
-def _preprocess_final_fold_set(
-    raw_df: pd.DataFrame,
-    strategy: str,
-    branch: str,
-    base_dir: Path,
-) -> None:
-    import warnings
-    from sklearn.exceptions import ConvergenceWarning
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
-
-    from stages.training.config import TEST_YEAR as _TEST_YEAR, TRAIN_START_YEAR, YEAR_COL as _YEAR_COL
-    from stages.training.core import make_cv_folds, prepare_branch_fold_frames
-
-    t0 = time.monotonic()
-    pid = os.getpid()
-    tag = f"final/folds/{strategy}/{branch}"
-
-    final_train_raw = raw_df[raw_df[_YEAR_COL] < _TEST_YEAR].copy()
-    raw_folds = make_cv_folds(final_train_raw, strategy)
-    fold_frames = prepare_branch_fold_frames(raw_folds, branch, train_start_year=TRAIN_START_YEAR)
-
-    out_dir = base_dir / "final" / "folds" / strategy / branch
-    for fold in fold_frames:
-        fold_dir = out_dir / f"fold_{fold['fold_id']}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        write_frame(fold["train_frame"], fold_dir / "train.csv")
-        write_frame(fold["val_frame"], fold_dir / "val.csv")
-
-    elapsed = time.monotonic() - t0
-    print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s ({len(fold_frames)} folds)", flush=True)
-
-
-# =============================================================================
-# Cache orchestration
-# =============================================================================
-
-
-def _build_cache(base_dir: Path, fingerprint: str) -> None:
-    """Build all preprocessed artifacts into base_dir."""
-    from stages.training.config import (
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        DEFAULT_CPU_WORKERS,
-        OUTER_TEST_YEARS,
-    )
-
-    stage_t0 = time.monotonic()
-    raw_df = load_panel_data(verbose=True)
-    units = enumerate_cache_units(ACTIVE_BRANCHES, ACTIVE_OUTER_STRATEGIES, OUTER_TEST_YEARS)
-
-    tasks: list[tuple[Any, ...]] = []
-    for branch, year in units["outer"]:
-        tasks.append((_preprocess_outer_unit, raw_df, branch, year, base_dir))
-    for strategy, branch, year in units["fold_sets"]:
-        tasks.append((_preprocess_fold_set, raw_df, strategy, branch, year, base_dir))
-    for branch in units["final"]:
-        tasks.append((_preprocess_final_unit, raw_df, branch, base_dir))
-    for strategy, branch in units["final_fold_sets"]:
-        tasks.append((_preprocess_final_fold_set, raw_df, strategy, branch, base_dir))
-
-    logger.info(f"Dispatching {len(tasks)} preprocessing units across {DEFAULT_CPU_WORKERS} workers")
-    max_workers = min(len(tasks), DEFAULT_CPU_WORKERS)
-
-    try:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(fn, *args): idx for idx, (fn, *args) in enumerate(tasks)
-            }
-            for future in as_completed(futures):
-                future.result()
-    except PermissionError:
-        logger.warning("Process pool unavailable. Running sequentially.")
-        for fn, *args in tasks:
-            fn(*args)
-
-    stage_elapsed = time.monotonic() - stage_t0
-
-    manifest = {
-        "schema_version": 1,
-        "fingerprint": fingerprint,
-        "complete": True,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "config": _build_fingerprint_config(),
-        "expected_units": {
-            k: [list(u) if isinstance(u, tuple) else u for u in v]
-            for k, v in units.items()
-        },
-        "total_elapsed_seconds": stage_elapsed,
-    }
-    with open(base_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2, default=str)
-
-    logger.info(f"Preprocessing stage complete in {stage_elapsed:.1f}s")
-
-
-def run_preprocessing_stage(force: bool = False) -> Path:
-    """Run preprocessing stage. Returns path to valid cache directory."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    fingerprint = compute_fingerprint()
-    cache_dir = CACHE_ROOT / fingerprint
-    lock_path = CACHE_ROOT / f"{fingerprint}.lock"
-
-    if not force and validate_cache(cache_dir):
-        logger.info(f"Valid preprocessing cache found: {cache_dir}")
-        return cache_dir
-
-    logger.info(f"Building preprocessing cache: {cache_dir}")
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        if not force and validate_cache(cache_dir):
-            logger.info(f"Cache built by another process: {cache_dir}")
-            return cache_dir
-        tmp_dir = CACHE_ROOT / f"{fingerprint}.tmp"
-        if tmp_dir.exists():
-            logger.info(f"Removing stale temp dir: {tmp_dir}")
-            shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-        _build_cache(tmp_dir, fingerprint)
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-        tmp_dir.rename(cache_dir)
-        logger.info(f"Preprocessing cache published: {cache_dir}")
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-        try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    return cache_dir
-
-
-# =============================================================================
-# CLI entry point
-# =============================================================================
+CountryYearFallbackImputer.__module__ = "stages.preprocessing"
+Preprocessor.__module__ = "stages.preprocessing"
 
 
 if __name__ == "__main__":
-    import sys
-    force = "--force" in sys.argv
-    cache_path = run_preprocessing_stage(force=force)
-    print(f"Cache directory: {cache_path}")
+    raise SystemExit(
+        "Use `python -m stages.training.data_preparation` to build the preprocessing cache."
+    )

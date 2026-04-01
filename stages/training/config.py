@@ -12,17 +12,16 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from stages.preprocessing import (
-    COUNTRY_COL, ID_COLS, RANDOM_STATE as PIPELINE_RANDOM_STATE,
-    TARGET_COLS, TEST_YEAR, YEAR_COL, Preprocessor,
-    load_panel_data, split_raw_panel,
+    COUNTRY_COL,
+    RANDOM_STATE as PIPELINE_RANDOM_STATE,
+    TEST_YEAR,
+    YEAR_COL,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Constants
-# =============================================================================
+# --- Constants ---
 
 DEFAULT_CPU_WORKERS = max(1, (os.cpu_count() or 2) - 1)
 FINAL_BOOTSTRAP_ITERATIONS = 200
@@ -31,8 +30,8 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 5000
 
-ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp"]
-# ACTIVE_MODELS = ["huber", "bayesian_ridge", "extra_trees", "gradient_boosting", "hist_gradient_boosting", "adaboost"]
+# ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp"]
+ACTIVE_MODELS = ["huber", "bayesian_ridge", "extra_trees", "gradient_boosting", "hist_gradient_boosting", "adaboost"]
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -102,9 +101,7 @@ OVERFIT_GAP_RATIO_THRESHOLD = 0.50
 # Feature selection
 N_FEATURES_TO_SELECT = 30
 
-# =============================================================================
-# Output paths
-# =============================================================================
+# --- Output paths ---
 
 def _build_run_tag() -> str:
     tag = os.environ.get("RUN_TAG", "").strip()

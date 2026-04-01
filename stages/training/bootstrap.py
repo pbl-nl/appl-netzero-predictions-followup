@@ -26,6 +26,8 @@ from stages.training.helpers import (
 )
 logger = logging.getLogger(__name__)
 
+# ProcessPoolExecutor.initializer copies data once per worker via _init_worker(),
+# avoiding repeated serialization of large DataFrames for each submitted task.
 _WORKER_STATE: dict[str, Any] | None = None
 
 

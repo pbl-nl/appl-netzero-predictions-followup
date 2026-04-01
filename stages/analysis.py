@@ -12,7 +12,6 @@ Usage:
     python -m stages.analysis
 """
 
-import os
 import warnings
 from pathlib import Path
 
@@ -24,7 +23,6 @@ import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import seaborn as sns
-from statsmodels.stats.stattools import durbin_watson
 
 warnings.filterwarnings("ignore")
 
