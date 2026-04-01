@@ -34,7 +34,9 @@ raw/
 old/
 analysis/
 preprocessed/
-
+results/**/*
+!results/**/
+!results/**/*.md
 !8624f431-en_2023.csv
 
 
