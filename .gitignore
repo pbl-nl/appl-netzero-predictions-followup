@@ -32,6 +32,8 @@ processed/
 merged/
 raw/
 old/
+analysis/
+preprocessed/
 
 !8624f431-en_2023.csv
 

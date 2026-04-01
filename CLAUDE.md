@@ -32,17 +32,17 @@ python reproduce_new.py   # old study with new merged data
 
 ### Data Pipeline (`main.py` → `stages/`)
 
-1. **`stages/download.py`** — Downloads raw data from 6 sources + World Bank API into `data/raw/` (threaded)
-2. **`stages/process.py`** — Cleans/normalizes each source into `data/processed/` CSVs
-3. **`stages/merge_target.py`** — Merges all sources with target scenarios from Excel workbook, applies VIF reduction → `data/merged/merged.csv`
+**`stages/data.py`** — Downloads raw data from 6 sources + World Bank API, cleans/normalizes each source, merges with target scenarios from Excel workbook, applies VIF reduction → `data/merged/merged.csv`. Exposes a single `run()` entry point.
 
-### Preprocessing (`stages/pipeline.py`)
+**`stages/analysis.py`** — 14 analysis functions (tables, figures). Outputs go to `data/analysis/`. Run with `python -m stages.analysis`.
+
+### Preprocessing (`stages/preprocessing.py`)
 
 Central `Preprocessor` class with three-phase pipeline: clean → impute → engineer. Two branches:
 - **simple**: Country/year/global median fallback imputation (`CountryYearFallbackImputer`)
-- **mice**: Iterative (MICE) imputation
+- **mice**: Iterative (MICE) imputation with panel-aware auxiliary predictors, v2x_regime as predictor, and missingness indicators
 
-Feature engineering: lag features, rolling windows, % change, difference features, outlier removal (IQR), one-hot encoding (v2x_regime), VIF-based multicollinearity control (cutoff=10), scaling, and SelectKBest feature selection (top 30).
+Feature engineering: lag features, rolling windows, % change, difference features, outlier removal (IQR), one-hot encoding (v2x_regime), VIF-based multicollinearity control (cutoff=10), scaling, and SelectKBest feature selection (top 30). Cache management (SHA256 fingerprinting) is also in this file.
 
 ### Training Pipeline (`stages/training/`)
 
@@ -58,7 +58,6 @@ Entry point: `stages/training/__main__.py` → `core.py::run()`
 - `helpers.py` — Model factories (`build_model`), hyperopt search spaces, evaluation metrics (MAE/RMSE/R²), feature selection
 - `bootstrap.py` — 200-iteration bootstrap refit for uncertainty (mean, std, quantiles)
 - `overfitting.py` — Gap-ratio based overfitting detection (threshold=0.50, cap=3.0)
-- `timing.py` — Performance instrumentation
 
 Training uses `ProcessPoolExecutor` for parallel combo execution.
 
