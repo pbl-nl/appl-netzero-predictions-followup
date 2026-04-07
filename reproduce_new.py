@@ -739,6 +739,7 @@ if __name__ == '__main__':
                            on='Country Code', how='left')
 
     target_variable = 'Cumulative per capita emissions'
+    combined_df[target_variable] = np.log(combined_df[target_variable])
 
     ##########################################################################
     # Filtering the dataset

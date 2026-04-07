@@ -11,7 +11,7 @@ Run:  python -m stages.training.data_preparation
 
 from __future__ import annotations
 
-import fcntl
+from filelock import FileLock
 import hashlib
 import json
 import logging
@@ -1312,9 +1312,10 @@ def run_data_preparation_stage(force: bool = False) -> Path:
     logger.info(f"Building data preparation cache: {cache_dir}")
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    lock_file = str(lock_path) + ".lock"
+    lock = FileLock(lock_file)
+
+    with lock:
         if not force and validate_cache(cache_dir):
             logger.info(f"Cache built by another process: {cache_dir}")
             return cache_dir
@@ -1322,19 +1323,16 @@ def run_data_preparation_stage(force: bool = False) -> Path:
         if tmp_dir.exists():
             logger.info(f"Removing stale temp dir: {tmp_dir}")
             shutil.rmtree(tmp_dir)
-        tmp_dir.mkdir(parents=True)
-        _build_cache(tmp_dir, fingerprint)
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-        tmp_dir.rename(cache_dir)
-        logger.info(f"Data preparation cache published: {cache_dir}")
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
         try:
-            lock_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            tmp_dir.mkdir(parents=True)
+            _build_cache(tmp_dir, fingerprint)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            tmp_dir.rename(cache_dir)
+            logger.info(f"Data preparation cache published: {cache_dir}")
+        finally:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return cache_dir
 
