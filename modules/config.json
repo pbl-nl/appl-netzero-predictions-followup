@@ -24,7 +24,7 @@
     "NDC_NZT": "Reduction rates NZ targets_26March2024.xlsx",
     "income_categories": "CLASS.xlsx",
     "lamb_supp": "Lamb_Minx_Supplementary.xlsx",
-    "num_iterations": 7,
+    "num_iterations": 200,
     "parallelize": true,
     "XGBoost": {
         "num_trials": 80,

@@ -1135,7 +1135,13 @@ if __name__ == '__main__':
     clusters_to_drop = [cl for cl in all_cluster_types if cl != cluster_label]
     indep_dep_enc_df = indep_dep_enc_df.drop(columns=['Country Code'] + clusters_to_drop)
 
-    indep_dep_enc_red_df = indep_dep_enc_df.dropna()
+    # For the Linear Regression and top-7 XGBoost path, we use imputation to preserve observations.
+    _red_imputer = SimpleImputer(strategy='median')
+    indep_dep_enc_red_df = pd.DataFrame(
+        _red_imputer.fit_transform(indep_dep_enc_df),
+        columns=indep_dep_enc_df.columns,
+        index=indep_dep_enc_df.index
+    )
     clusters_red = indep_dep_enc_red_df[cluster_label]
     one_hot_encoded_data_red = indep_dep_enc_red_df[one_hot_encoded_columns]
 
