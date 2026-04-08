@@ -1,6 +1,7 @@
 {
     "input_path": "data/old_data",
     "output_path": "data/old_reproduce",
+    "figure_data_path": "data/old_reproduce/figure_data",
     "merged_csv": "data/merged/merged.csv",
     "revised_nzt_workbook": "data/netzero/Reduction rates NZ target revised_23Feb2026.xlsx",
     "reproduce2_output_path": "data/new_reproduce",
@@ -26,6 +27,7 @@
     "lamb_supp": "Lamb_Minx_Supplementary.xlsx",
     "num_iterations": 200,
     "parallelize": true,
+    "max_parallel_workers": null,
     "XGBoost": {
         "num_trials": 80,
         "num_boost_round": 500,

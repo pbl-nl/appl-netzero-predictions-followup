@@ -9,6 +9,7 @@ CONFIG_PATH = os.path.join(MODULES_DIR, "config.json")
 PATH_KEYS = (
     "input_path",
     "output_path",
+    "figure_data_path",
     "merged_csv",
     "revised_nzt_workbook",
     "reproduce2_output_path",

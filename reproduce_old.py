@@ -7,6 +7,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import io
 import sys
 import contextlib
+import json
 
 import pandas as pd
 import numpy as np
@@ -127,7 +128,7 @@ def _get_safe_stratify_labels(clusters, min_splits=5):
 
 
 def run_iteration(iteration, X, y, X_red, y_red, clusters, clusters_red,
-                  one_hot_encoded_columns, XGBoost_hyperparameter_space):
+                  one_hot_encoded_columns, XGBoost_hyperparameter_space, cluster_label):
     random_seed = 123 + iteration
     print(f"  Starting iteration {iteration + 1} (seed={random_seed})")
 
@@ -145,16 +146,28 @@ def run_iteration(iteration, X, y, X_red, y_red, clusters, clusters_red,
     dtest = xgb.DMatrix(X_test, label=y_test)
     local_all_results = {iteration: []}
 
-    final_model_XGBoost, evals_result, best_rmse, best_hyperparams_XGBoost = apply_XGBoost(
+    xgb_full_result = apply_XGBoost(
         X_train, y_train, X_test, y_test, XGBoost_hyperparameter_space,
-        clusters, random_seed, local_all_results, iteration
+        clusters, random_seed, local_all_results, iteration, cluster_label=cluster_label
     )
 
-    final_model_XGBoost_top, evals_result_top, best_features_dict_XGBoost, best_rmse_top, \
-        best_hyperparams_XGBoost_top, dtest_scaled_top = apply_XGBoost_top(
+    xgb_top_result = apply_XGBoost_top(
         X_train_scaled_red, y_train_red, X_test_scaled_red, y_test_red,
-        XGBoost_hyperparameter_space, clusters, random_seed, local_all_results, iteration
+        XGBoost_hyperparameter_space, clusters, random_seed, local_all_results, iteration,
+        cluster_label=cluster_label,
     )
+
+    final_model_XGBoost = xgb_full_result["final_model"]
+    evals_result = xgb_full_result["evals_result"]
+    best_rmse = xgb_full_result["best_rmse"]
+    best_hyperparams_XGBoost = xgb_full_result["best_hyperparams"]
+
+    final_model_XGBoost_top = xgb_top_result["final_model"]
+    evals_result_top = xgb_top_result["evals_result"]
+    best_features_dict_XGBoost = xgb_top_result["best_features_dict"]
+    best_rmse_top = xgb_top_result["best_rmse"]
+    best_hyperparams_XGBoost_top = xgb_top_result["best_hyperparams"]
+    dtest_scaled_top = xgb_top_result["dtest_top"]
 
     best_features_LR_min_features, final_LR_model_min_features = \
         apply_LR_to_min_features(X_train_scaled_red, y_train_red)
@@ -181,7 +194,467 @@ def run_iteration(iteration, X, y, X_red, y_red, clusters, clusters_red,
         "final_model_XGB_top": final_model_XGBoost_top,
         "training_rmse": evals_result["train"]["rmse"],
         "testing_rmse": evals_result["test"]["rmse"],
+        "split_diagnostics": build_split_diagnostic_rows(
+            iteration=iteration,
+            cluster_label=cluster_label,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            X_train_red=X_train_scaled_red,
+            y_train_red=y_train_red,
+            X_test_red=X_test_scaled_red,
+            y_test_red=y_test_red,
+            train_clusters=safe_clusters.loc[X_train.index],
+            test_clusters=safe_clusters.loc[X_test.index],
+            train_clusters_red=safe_clusters_red.loc[X_train_red.index],
+            test_clusters_red=safe_clusters_red.loc[X_test_red.index],
+        ),
+        "outer_track_results": build_outer_track_rows(
+            iteration=iteration,
+            cluster_label=cluster_label,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            X_train_scaled_red=X_train_scaled_red,
+            y_train_red=y_train_red,
+            X_test_scaled_red=X_test_scaled_red,
+            y_test_red=y_test_red,
+            xgb_full_result=xgb_full_result,
+            xgb_top_result=xgb_top_result,
+            final_LR_model_min_features=final_LR_model_min_features,
+            best_features_LR_min_features=best_features_LR_min_features,
+            final_LR_model_min_features_further=final_LR_model_min_features_further,
+            best_features_LR_min_features_further=best_features_LR_min_features_further,
+        ),
+        "xgb_full_trial_records": xgb_full_result["trial_records"],
+        "xgb_top_trial_records": xgb_top_result["trial_records"],
+        "xgb_full_cv_fold_records": xgb_full_result["cv_fold_records"],
+        "xgb_top_cv_fold_records": xgb_top_result["cv_fold_records"],
+        "xgb_full_cv_learning_curve_rows": xgb_full_result["cv_learning_curve_rows"],
+        "xgb_top_cv_learning_curve_rows": xgb_top_result["cv_learning_curve_rows"],
+        "xgb_full_boosting_curve_rows": xgb_full_result["boosting_curve_rows"],
+        "xgb_top_boosting_curve_rows": xgb_top_result["boosting_curve_rows"],
     }
+
+
+def _to_native(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.Series):
+        return {str(key): _to_native(val) for key, val in value.items()}
+    if isinstance(value, dict):
+        return {str(key): _to_native(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_native(item) for item in value]
+    return value
+
+
+def _json_dumps(value):
+    return json.dumps(_to_native(value), sort_keys=True)
+
+
+def _regression_metrics(y_true, y_pred):
+    mse = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else float("nan")
+    explained_variance = (
+        float(explained_variance_score(y_true, y_pred))
+        if len(y_true) > 1 else float("nan")
+    )
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "explained_variance": explained_variance,
+    }
+
+
+def _relative_gap(higher_is_worse, lower_is_better, epsilon=1e-8):
+    baseline = max(abs(lower_is_better), epsilon)
+    return float((higher_is_worse - lower_is_better) / baseline)
+
+
+def _metric_gap_summary(train_metrics, eval_metrics, prefix):
+    return {
+        f"{prefix}_mse_gap_abs": float(eval_metrics["mse"] - train_metrics["mse"]),
+        f"{prefix}_mse_gap_ratio": _relative_gap(eval_metrics["mse"], train_metrics["mse"]),
+        f"{prefix}_rmse_gap_abs": float(eval_metrics["rmse"] - train_metrics["rmse"]),
+        f"{prefix}_rmse_gap_ratio": _relative_gap(eval_metrics["rmse"], train_metrics["rmse"]),
+        f"{prefix}_mae_gap_abs": float(eval_metrics["mae"] - train_metrics["mae"]),
+        f"{prefix}_mae_gap_ratio": _relative_gap(eval_metrics["mae"], train_metrics["mae"]),
+        f"{prefix}_r2_gap_abs": float(train_metrics["r2"] - eval_metrics["r2"]),
+        f"{prefix}_explained_variance_gap_abs": float(
+            train_metrics["explained_variance"] - eval_metrics["explained_variance"]
+        ),
+    }
+
+
+def _dataset_nan_summary(X, y):
+    return {
+        "rows": int(len(X)),
+        "feature_count": int(X.shape[1]),
+        "nan_cells": int(X.isna().sum().sum()),
+        "nan_rows": int(X.isna().any(axis=1).sum()),
+        "target_nan_count": int(pd.Series(y).isna().sum()),
+    }
+
+
+def _predict_xgboost_metrics(model, X, y):
+    preds = model.predict(xgb.DMatrix(X, label=y))
+    return _regression_metrics(y, preds)
+
+
+def _predict_linear_metrics(model, X, y):
+    preds = model.predict(sm.add_constant(X, has_constant='add'))
+    return _regression_metrics(y, preds)
+
+
+def _summarize_cv_fold_records(cv_fold_records):
+    if not cv_fold_records:
+        return {}
+    df = pd.DataFrame(cv_fold_records)
+    summary = {
+        "cv_folds_used": int(len(df)),
+        "cv_train_mean_mse": float(df["train_mse"].mean()),
+        "cv_train_mean_rmse": float(df["train_rmse"].mean()),
+        "cv_train_mean_mae": float(df["train_mae"].mean()),
+        "cv_train_mean_r2": float(df["train_r2"].mean()),
+        "cv_train_mean_explained_variance": float(df["train_explained_variance"].mean()),
+        "cv_val_mean_mse": float(df["val_mse"].mean()),
+        "cv_val_mean_rmse": float(df["val_rmse"].mean()),
+        "cv_val_mean_mae": float(df["val_mae"].mean()),
+        "cv_val_mean_r2": float(df["val_r2"].mean()),
+        "cv_val_mean_explained_variance": float(df["val_explained_variance"].mean()),
+        "cv_positive_gap_fold_share": float((df["val_mae"] > df["train_mae"]).mean()),
+    }
+    summary.update(_metric_gap_summary(
+        {
+            "mse": summary["cv_train_mean_mse"],
+            "rmse": summary["cv_train_mean_rmse"],
+            "mae": summary["cv_train_mean_mae"],
+            "r2": summary["cv_train_mean_r2"],
+            "explained_variance": summary["cv_train_mean_explained_variance"],
+        },
+        {
+            "mse": summary["cv_val_mean_mse"],
+            "rmse": summary["cv_val_mean_rmse"],
+            "mae": summary["cv_val_mean_mae"],
+            "r2": summary["cv_val_mean_r2"],
+            "explained_variance": summary["cv_val_mean_explained_variance"],
+        },
+        prefix="cv",
+    ))
+    return summary
+
+
+def build_split_diagnostic_rows(
+    iteration,
+    cluster_label,
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    X_train_red,
+    y_train_red,
+    X_test_red,
+    y_test_red,
+    train_clusters,
+    test_clusters,
+    train_clusters_red,
+    test_clusters_red,
+):
+    rows = []
+    for dataset_view, x_tr, y_tr, x_te, y_te, tr_clusters, te_clusters in [
+        ("full", X_train, y_train, X_test, y_test, train_clusters, test_clusters),
+        ("reduced", X_train_red, y_train_red, X_test_red, y_test_red, train_clusters_red, test_clusters_red),
+    ]:
+        train_summary = _dataset_nan_summary(x_tr, y_tr)
+        test_summary = _dataset_nan_summary(x_te, y_te)
+        rows.append({
+            "iteration": int(iteration + 1),
+            "cluster_type": cluster_label,
+            "dataset_view": dataset_view,
+            "train_rows": train_summary["rows"],
+            "test_rows": test_summary["rows"],
+            "feature_count": train_summary["feature_count"],
+            "train_nan_cells": train_summary["nan_cells"],
+            "test_nan_cells": test_summary["nan_cells"],
+            "train_nan_rows": train_summary["nan_rows"],
+            "test_nan_rows": test_summary["nan_rows"],
+            "train_target_nan_count": train_summary["target_nan_count"],
+            "test_target_nan_count": test_summary["target_nan_count"],
+            "train_cluster_counts_json": _json_dumps(pd.Series(tr_clusters).value_counts().to_dict()),
+            "test_cluster_counts_json": _json_dumps(pd.Series(te_clusters).value_counts().to_dict()),
+        })
+    return rows
+
+
+def _build_track_row_base(iteration, cluster_label, model_track, dataset_view, X_train, y_train, X_test, y_test):
+    train_summary = _dataset_nan_summary(X_train, y_train)
+    test_summary = _dataset_nan_summary(X_test, y_test)
+    return {
+        "iteration": int(iteration + 1),
+        "cluster_type": cluster_label,
+        "model_track": model_track,
+        "dataset_view": dataset_view,
+        "train_rows": train_summary["rows"],
+        "test_rows": test_summary["rows"],
+        "feature_count": train_summary["feature_count"],
+        "train_nan_cells": train_summary["nan_cells"],
+        "test_nan_cells": test_summary["nan_cells"],
+        "train_nan_rows": train_summary["nan_rows"],
+        "test_nan_rows": test_summary["nan_rows"],
+        "train_target_nan_count": train_summary["target_nan_count"],
+        "test_target_nan_count": test_summary["target_nan_count"],
+        "selected_features_json": "",
+        "feature_details_json": "",
+        "coefficients_json": "",
+        "p_values_json": "",
+        "params_internal_json": "",
+        "params_decoded_json": "",
+        "tuning_best_rmse": np.nan,
+        "cv_best_boost_round": np.nan,
+        "fit_best_boost_round": np.nan,
+        "cv_folds_used": np.nan,
+        "cv_train_mean_mse": np.nan,
+        "cv_train_mean_rmse": np.nan,
+        "cv_train_mean_mae": np.nan,
+        "cv_train_mean_r2": np.nan,
+        "cv_train_mean_explained_variance": np.nan,
+        "cv_val_mean_mse": np.nan,
+        "cv_val_mean_rmse": np.nan,
+        "cv_val_mean_mae": np.nan,
+        "cv_val_mean_r2": np.nan,
+        "cv_val_mean_explained_variance": np.nan,
+        "cv_positive_gap_fold_share": np.nan,
+        "cv_mse_gap_abs": np.nan,
+        "cv_mse_gap_ratio": np.nan,
+        "cv_rmse_gap_abs": np.nan,
+        "cv_rmse_gap_ratio": np.nan,
+        "cv_mae_gap_abs": np.nan,
+        "cv_mae_gap_ratio": np.nan,
+        "cv_r2_gap_abs": np.nan,
+        "cv_explained_variance_gap_abs": np.nan,
+        "cv_to_test_rmse_gap_abs": np.nan,
+        "cv_to_test_rmse_gap_ratio": np.nan,
+        "cv_to_test_mae_gap_abs": np.nan,
+        "cv_to_test_mae_gap_ratio": np.nan,
+    }
+
+
+def build_outer_track_rows(
+    iteration,
+    cluster_label,
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    X_train_scaled_red,
+    y_train_red,
+    X_test_scaled_red,
+    y_test_red,
+    xgb_full_result,
+    xgb_top_result,
+    final_LR_model_min_features,
+    best_features_LR_min_features,
+    final_LR_model_min_features_further,
+    best_features_LR_min_features_further,
+):
+    rows = []
+
+    full_cv_summary = _summarize_cv_fold_records(xgb_full_result["cv_fold_records"])
+    full_train_metrics = _predict_xgboost_metrics(xgb_full_result["final_model"], X_train, y_train)
+    full_test_metrics = _predict_xgboost_metrics(xgb_full_result["final_model"], X_test, y_test)
+    full_row = _build_track_row_base(
+        iteration, cluster_label, "xgboost_full", "full", X_train, y_train, X_test, y_test,
+    )
+    full_row.update({
+        "selected_features_json": _json_dumps(list(X_train.columns)),
+        "params_internal_json": _json_dumps(xgb_full_result["best_hyperparams"]),
+        "params_decoded_json": _json_dumps(xgb_full_result["best_hyperparams_decoded"]),
+        "tuning_best_rmse": float(xgb_full_result["best_rmse"]),
+        "cv_best_boost_round": int(xgb_full_result["cv_best_boost_round"]),
+        "fit_best_boost_round": int(getattr(xgb_full_result["final_model"], "best_iteration", -1) + 1),
+        "feature_details_json": "",
+    })
+    full_row.update(full_cv_summary)
+    full_row.update({f"outer_train_{k}": v for k, v in full_train_metrics.items()})
+    full_row.update({f"outer_test_{k}": v for k, v in full_test_metrics.items()})
+    full_row.update(_metric_gap_summary(full_train_metrics, full_test_metrics, prefix="outer"))
+    if full_cv_summary:
+        full_row["cv_to_test_rmse_gap_abs"] = float(
+            full_test_metrics["rmse"] - full_cv_summary["cv_val_mean_rmse"]
+        )
+        full_row["cv_to_test_rmse_gap_ratio"] = _relative_gap(
+            full_test_metrics["rmse"], full_cv_summary["cv_val_mean_rmse"],
+        )
+        full_row["cv_to_test_mae_gap_abs"] = float(
+            full_test_metrics["mae"] - full_cv_summary["cv_val_mean_mae"]
+        )
+        full_row["cv_to_test_mae_gap_ratio"] = _relative_gap(
+            full_test_metrics["mae"], full_cv_summary["cv_val_mean_mae"],
+        )
+    rows.append(full_row)
+
+    chosen_top_features = xgb_top_result["chosen_features"]
+    X_train_top = X_train_scaled_red[chosen_top_features]
+    X_test_top = X_test_scaled_red[chosen_top_features]
+    top_cv_summary = _summarize_cv_fold_records(xgb_top_result["cv_fold_records"])
+    top_train_metrics = _predict_xgboost_metrics(xgb_top_result["final_model"], X_train_top, y_train_red)
+    top_test_metrics = _predict_xgboost_metrics(xgb_top_result["final_model"], X_test_top, y_test_red)
+    top_row = _build_track_row_base(
+        iteration, cluster_label, "xgboost_top7", "reduced", X_train_top, y_train_red, X_test_top, y_test_red,
+    )
+    top_row.update({
+        "selected_features_json": _json_dumps(chosen_top_features),
+        "feature_details_json": _json_dumps(xgb_top_result["best_features_dict"]),
+        "params_internal_json": _json_dumps(xgb_top_result["best_hyperparams"]),
+        "params_decoded_json": _json_dumps(xgb_top_result["best_hyperparams_decoded"]),
+        "tuning_best_rmse": float(xgb_top_result["best_rmse"]),
+        "cv_best_boost_round": int(xgb_top_result["cv_best_boost_round"]),
+        "fit_best_boost_round": int(getattr(xgb_top_result["final_model"], "best_iteration", -1) + 1),
+    })
+    top_row.update(top_cv_summary)
+    top_row.update({f"outer_train_{k}": v for k, v in top_train_metrics.items()})
+    top_row.update({f"outer_test_{k}": v for k, v in top_test_metrics.items()})
+    top_row.update(_metric_gap_summary(top_train_metrics, top_test_metrics, prefix="outer"))
+    if top_cv_summary:
+        top_row["cv_to_test_rmse_gap_abs"] = float(
+            top_test_metrics["rmse"] - top_cv_summary["cv_val_mean_rmse"]
+        )
+        top_row["cv_to_test_rmse_gap_ratio"] = _relative_gap(
+            top_test_metrics["rmse"], top_cv_summary["cv_val_mean_rmse"],
+        )
+        top_row["cv_to_test_mae_gap_abs"] = float(
+            top_test_metrics["mae"] - top_cv_summary["cv_val_mean_mae"]
+        )
+        top_row["cv_to_test_mae_gap_ratio"] = _relative_gap(
+            top_test_metrics["mae"], top_cv_summary["cv_val_mean_mae"],
+        )
+    rows.append(top_row)
+
+    X_train_lr7 = X_train_scaled_red[best_features_LR_min_features]
+    X_test_lr7 = X_test_scaled_red[best_features_LR_min_features]
+    lr7_train_metrics = _predict_linear_metrics(final_LR_model_min_features, X_train_lr7, y_train_red)
+    lr7_test_metrics = _predict_linear_metrics(final_LR_model_min_features, X_test_lr7, y_test_red)
+    lr7_row = _build_track_row_base(
+        iteration, cluster_label, "lr_min_features_7", "reduced",
+        X_train_lr7, y_train_red, X_test_lr7, y_test_red,
+    )
+    lr7_row.update({
+        "selected_features_json": _json_dumps(best_features_LR_min_features),
+        "coefficients_json": _json_dumps(final_LR_model_min_features.params.to_dict()),
+        "p_values_json": _json_dumps(final_LR_model_min_features.pvalues.to_dict()),
+    })
+    lr7_row.update({f"outer_train_{k}": v for k, v in lr7_train_metrics.items()})
+    lr7_row.update({f"outer_test_{k}": v for k, v in lr7_test_metrics.items()})
+    lr7_row.update(_metric_gap_summary(lr7_train_metrics, lr7_test_metrics, prefix="outer"))
+    rows.append(lr7_row)
+
+    X_train_lrf = X_train_scaled_red[best_features_LR_min_features_further]
+    X_test_lrf = X_test_scaled_red[best_features_LR_min_features_further]
+    lrf_train_metrics = _predict_linear_metrics(
+        final_LR_model_min_features_further, X_train_lrf, y_train_red,
+    )
+    lrf_test_metrics = _predict_linear_metrics(
+        final_LR_model_min_features_further, X_test_lrf, y_test_red,
+    )
+    lrf_row = _build_track_row_base(
+        iteration, cluster_label, "lr_min_features_further", "reduced",
+        X_train_lrf, y_train_red, X_test_lrf, y_test_red,
+    )
+    lrf_row.update({
+        "selected_features_json": _json_dumps(best_features_LR_min_features_further),
+        "coefficients_json": _json_dumps(final_LR_model_min_features_further.params.to_dict()),
+        "p_values_json": _json_dumps(final_LR_model_min_features_further.pvalues.to_dict()),
+    })
+    lrf_row.update({f"outer_train_{k}": v for k, v in lrf_train_metrics.items()})
+    lrf_row.update({f"outer_test_{k}": v for k, v in lrf_test_metrics.items()})
+    lrf_row.update(_metric_gap_summary(lrf_train_metrics, lrf_test_metrics, prefix="outer"))
+    rows.append(lrf_row)
+
+    return rows
+
+
+def build_training_diagnostics_summary_df(outer_track_results_df):
+    if outer_track_results_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for (cluster_type, model_track), group in outer_track_results_df.groupby(["cluster_type", "model_track"]):
+        row = {
+            "cluster_type": cluster_type,
+            "model_track": model_track,
+            "iterations": int(len(group)),
+            "mean_train_rmse": float(group["outer_train_rmse"].mean()),
+            "std_train_rmse": float(group["outer_train_rmse"].std(ddof=0)),
+            "mean_test_rmse": float(group["outer_test_rmse"].mean()),
+            "std_test_rmse": float(group["outer_test_rmse"].std(ddof=0)),
+            "mean_train_mae": float(group["outer_train_mae"].mean()),
+            "mean_test_mae": float(group["outer_test_mae"].mean()),
+            "mean_train_r2": float(group["outer_train_r2"].mean()),
+            "mean_test_r2": float(group["outer_test_r2"].mean()),
+            "mean_outer_rmse_gap_abs": float(group["outer_rmse_gap_abs"].mean()),
+            "mean_outer_mae_gap_abs": float(group["outer_mae_gap_abs"].mean()),
+            "mean_outer_r2_gap_abs": float(group["outer_r2_gap_abs"].mean()),
+            "mean_cv_val_rmse": float(group["cv_val_mean_rmse"].mean()),
+            "mean_cv_rmse_gap_abs": float(group["cv_rmse_gap_abs"].mean()),
+            "mean_cv_positive_gap_fold_share": float(group["cv_positive_gap_fold_share"].mean()),
+            "mean_cv_to_test_rmse_gap_abs": float(group["cv_to_test_rmse_gap_abs"].mean()),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def write_training_diagnostics_outputs(
+    output_path,
+    split_diagnostics_df,
+    outer_track_results_df,
+    summary_df,
+    xgb_full_trials_df,
+    xgb_top_trials_df,
+    xgb_full_cv_folds_df,
+    xgb_top_cv_folds_df,
+    xgb_full_cv_curve_df,
+    xgb_top_cv_curve_df,
+    xgb_full_boost_curve_df,
+    xgb_top_boost_curve_df,
+    clustering_results_df,
+):
+    split_diagnostics_df.to_csv(os.path.join(output_path, "split_diagnostics.csv"), index=False)
+    outer_track_results_df.to_csv(os.path.join(output_path, "outer_iteration_results.csv"), index=False)
+    summary_df.to_csv(os.path.join(output_path, "training_diagnostics_summary.csv"), index=False)
+    xgb_full_trials_df.to_csv(os.path.join(output_path, "tuning_trials_full_xgboost.csv"), index=False)
+    xgb_top_trials_df.to_csv(os.path.join(output_path, "tuning_trials_top_xgboost.csv"), index=False)
+    xgb_full_cv_folds_df.to_csv(os.path.join(output_path, "cv_fold_metrics_full_xgboost.csv"), index=False)
+    xgb_top_cv_folds_df.to_csv(os.path.join(output_path, "cv_fold_metrics_top_xgboost.csv"), index=False)
+    xgb_full_cv_curve_df.to_csv(os.path.join(output_path, "cv_learning_curve_full_xgboost.csv"), index=False)
+    xgb_top_cv_curve_df.to_csv(os.path.join(output_path, "cv_learning_curve_top_xgboost.csv"), index=False)
+    xgb_full_boost_curve_df.to_csv(os.path.join(output_path, "boosting_curve_full_xgboost.csv"), index=False)
+    xgb_top_boost_curve_df.to_csv(os.path.join(output_path, "boosting_curve_top_xgboost.csv"), index=False)
+
+    audit_path = os.path.join(output_path, "training_diagnostics_audit.xlsx")
+    with pd.ExcelWriter(audit_path) as writer:
+        split_diagnostics_df.to_excel(writer, sheet_name="split_diagnostics", index=False)
+        outer_track_results_df.to_excel(writer, sheet_name="outer_results", index=False)
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+        xgb_full_trials_df.to_excel(writer, sheet_name="xgb_full_trials", index=False)
+        xgb_top_trials_df.to_excel(writer, sheet_name="xgb_top_trials", index=False)
+        xgb_full_cv_folds_df.to_excel(writer, sheet_name="xgb_full_cv_folds", index=False)
+        xgb_top_cv_folds_df.to_excel(writer, sheet_name="xgb_top_cv_folds", index=False)
+        xgb_full_cv_curve_df.to_excel(writer, sheet_name="xgb_full_cv_curve", index=False)
+        xgb_top_cv_curve_df.to_excel(writer, sheet_name="xgb_top_cv_curve", index=False)
+        xgb_full_boost_curve_df.to_excel(writer, sheet_name="xgb_full_boost_curve", index=False)
+        xgb_top_boost_curve_df.to_excel(writer, sheet_name="xgb_top_boost_curve", index=False)
+        clustering_results_df.to_excel(writer, sheet_name="legacy_clustering", index=False)
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1409,16 @@ if __name__ == '__main__':
     final_models_top = []
     training_rmse_all_iterations = []
     testing_rmse_all_iterations = []
+    split_diagnostic_rows = []
+    outer_track_result_rows = []
+    xgb_full_trial_rows = []
+    xgb_top_trial_rows = []
+    xgb_full_cv_fold_rows = []
+    xgb_top_cv_fold_rows = []
+    xgb_full_cv_curve_rows = []
+    xgb_top_cv_curve_rows = []
+    xgb_full_boost_curve_rows = []
+    xgb_top_boost_curve_rows = []
 
     import re
     def clean_cols(df):
@@ -962,7 +1445,7 @@ if __name__ == '__main__':
             parallel_outputs = Parallel(n_jobs=effective_jobs, backend="multiprocessing")(
                 delayed(run_iteration)(
                     it, X, y, X_red, y_red, clusters, clusters_red,
-                    one_hot_encoded_columns, XGBoost_hyperparameter_space
+                    one_hot_encoded_columns, XGBoost_hyperparameter_space, cluster_label
                 ) for it in range(num_iterations)
             )
 
@@ -975,52 +1458,40 @@ if __name__ == '__main__':
             final_models_top.append(out["final_model_XGB_top"])
             training_rmse_all_iterations.append(out["training_rmse"])
             testing_rmse_all_iterations.append(out["testing_rmse"])
+            split_diagnostic_rows.extend(out["split_diagnostics"])
+            outer_track_result_rows.extend(out["outer_track_results"])
+            xgb_full_trial_rows.extend(out["xgb_full_trial_records"])
+            xgb_top_trial_rows.extend(out["xgb_top_trial_records"])
+            xgb_full_cv_fold_rows.extend(out["xgb_full_cv_fold_records"])
+            xgb_top_cv_fold_rows.extend(out["xgb_top_cv_fold_records"])
+            xgb_full_cv_curve_rows.extend(out["xgb_full_cv_learning_curve_rows"])
+            xgb_top_cv_curve_rows.extend(out["xgb_top_cv_learning_curve_rows"])
+            xgb_full_boost_curve_rows.extend(out["xgb_full_boosting_curve_rows"])
+            xgb_top_boost_curve_rows.extend(out["xgb_top_boosting_curve_rows"])
     else:
         print(f"  Running {num_iterations} iterations sequentially...")
         iteration_results = []
         for iteration in range(num_iterations):
-            random_seed = 123 + iteration
-            print(f"Iteration {iteration + 1} for {cluster_label} with seed {random_seed}")
-
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=random_seed, stratify=clusters
+            out = run_iteration(
+                iteration, X, y, X_red, y_red, clusters, clusters_red,
+                one_hot_encoded_columns, XGBoost_hyperparameter_space, cluster_label
             )
-            X_train_red, X_test_red, y_train_red, y_test_red = train_test_split(
-                X_red, y_red, test_size=0.2, random_state=random_seed, stratify=clusters_red
-            )
-            X_train_scaled_red, X_test_scaled_red = scale_data(X_train_red, X_test_red, one_hot_encoded_columns)
-
-            dtrain = xgb.DMatrix(X_train, label=y_train)
-            dtest = xgb.DMatrix(X_test, label=y_test)
-
-            final_model_XGBoost, evals_result, best_rmse, best_hyperparams_XGBoost = \
-                apply_XGBoost(X_train, y_train, X_test, y_test, XGBoost_hyperparameter_space, clusters,
-                              random_seed, all_results, iteration)
-
-            final_model_XGBoost_top, evals_result_top, best_features_dict_XGBoost, best_rmse_top, \
-                best_hyperparams_XGBoost_top, dtest_scaled_top = \
-                apply_XGBoost_top(X_train_scaled_red, y_train_red, X_test_scaled_red, y_test_red,
-                                  XGBoost_hyperparameter_space, clusters, random_seed, all_results, iteration)
-            print(f"iteration {iteration}: top 7 XGBoost features = {best_features_dict_XGBoost}")
-
-            best_features_LR_min_features, final_LR_model_min_features = \
-                apply_LR_to_min_features(X_train_scaled_red, y_train_red)
-
-            best_features_LR_min_features_further, final_LR_model_min_features_further = \
-                apply_LR_to_min_features_and_further(X_train_scaled_red, y_train_red)
-
-            store_iteration_results(dtest, dtest_scaled_top, final_model_XGBoost, best_hyperparams_XGBoost,
-                                    best_features_dict_XGBoost, best_rmse, final_model_XGBoost_top,
-                                    X_test_scaled_red[best_features_LR_min_features],
-                                    final_LR_model_min_features, best_features_LR_min_features,
-                                    X_test_scaled_red[best_features_LR_min_features_further],
-                                    final_LR_model_min_features_further, best_features_LR_min_features_further,
-                                    iteration_results)
-
-            final_models.append(final_model_XGBoost)
-            final_models_top.append(final_model_XGBoost_top)
-            training_rmse_all_iterations.append(evals_result['train']['rmse'])
-            testing_rmse_all_iterations.append(evals_result['test']['rmse'])
+            iteration_results.append(out["iteration_results"])
+            all_results[out["iteration"]].extend(out["local_all_results"])
+            final_models.append(out["final_model_XGB"])
+            final_models_top.append(out["final_model_XGB_top"])
+            training_rmse_all_iterations.append(out["training_rmse"])
+            testing_rmse_all_iterations.append(out["testing_rmse"])
+            split_diagnostic_rows.extend(out["split_diagnostics"])
+            outer_track_result_rows.extend(out["outer_track_results"])
+            xgb_full_trial_rows.extend(out["xgb_full_trial_records"])
+            xgb_top_trial_rows.extend(out["xgb_top_trial_records"])
+            xgb_full_cv_fold_rows.extend(out["xgb_full_cv_fold_records"])
+            xgb_top_cv_fold_rows.extend(out["xgb_top_cv_fold_records"])
+            xgb_full_cv_curve_rows.extend(out["xgb_full_cv_learning_curve_rows"])
+            xgb_top_cv_curve_rows.extend(out["xgb_top_cv_learning_curve_rows"])
+            xgb_full_boost_curve_rows.extend(out["xgb_full_boosting_curve_rows"])
+            xgb_top_boost_curve_rows.extend(out["xgb_top_boosting_curve_rows"])
 
     cluster_iteration_results[cluster_label] = iteration_results
 
@@ -1048,6 +1519,34 @@ if __name__ == '__main__':
 
     clustering_results_df = pd.DataFrame(clustering_data)
     clustering_results_df.to_excel(os.path.join(config["output_path"], "clustering_results.xlsx"), index=False)
+
+    split_diagnostics_df = pd.DataFrame(split_diagnostic_rows)
+    outer_track_results_df = pd.DataFrame(outer_track_result_rows)
+    xgb_full_trials_df = pd.DataFrame(xgb_full_trial_rows)
+    xgb_top_trials_df = pd.DataFrame(xgb_top_trial_rows)
+    xgb_full_cv_folds_df = pd.DataFrame(xgb_full_cv_fold_rows)
+    xgb_top_cv_folds_df = pd.DataFrame(xgb_top_cv_fold_rows)
+    xgb_full_cv_curve_df = pd.DataFrame(xgb_full_cv_curve_rows)
+    xgb_top_cv_curve_df = pd.DataFrame(xgb_top_cv_curve_rows)
+    xgb_full_boost_curve_df = pd.DataFrame(xgb_full_boost_curve_rows)
+    xgb_top_boost_curve_df = pd.DataFrame(xgb_top_boost_curve_rows)
+    training_diagnostics_summary_df = build_training_diagnostics_summary_df(outer_track_results_df)
+
+    write_training_diagnostics_outputs(
+        output_path=config["output_path"],
+        split_diagnostics_df=split_diagnostics_df,
+        outer_track_results_df=outer_track_results_df,
+        summary_df=training_diagnostics_summary_df,
+        xgb_full_trials_df=xgb_full_trials_df,
+        xgb_top_trials_df=xgb_top_trials_df,
+        xgb_full_cv_folds_df=xgb_full_cv_folds_df,
+        xgb_top_cv_folds_df=xgb_top_cv_folds_df,
+        xgb_full_cv_curve_df=xgb_full_cv_curve_df,
+        xgb_top_cv_curve_df=xgb_top_cv_curve_df,
+        xgb_full_boost_curve_df=xgb_full_boost_curve_df,
+        xgb_top_boost_curve_df=xgb_top_boost_curve_df,
+        clustering_results_df=clustering_results_df,
+    )
 
     final_models_path = os.path.join(config["output_path"], "final_models.pkl")
     joblib.dump(final_models, final_models_path)

@@ -1,4 +1,5 @@
 import os
+import json
 import datetime
 import joblib
 import numpy as np
@@ -6,10 +7,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import explained_variance_score, mean_absolute_error, mean_squared_error, r2_score
 import statsmodels.api as sm
 import xgboost as xgb
-from hyperopt import STATUS_OK, fmin, tpe, Trials
+from hyperopt import STATUS_OK, Trials, fmin, space_eval, tpe
 from functools import partial
+from time import monotonic
 
 from modules.config_loader import load_config
 
@@ -17,21 +20,265 @@ from modules.config_loader import load_config
 config = load_config()
 
 
+def _to_native(value):
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: _to_native(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_to_native(item) for item in value]
+    return value
+
+
+def _scalarize_trial_vals(vals):
+    scalarized = {}
+    for key, value in vals.items():
+        if isinstance(value, list):
+            scalarized[key] = value[0] if value else None
+        else:
+            scalarized[key] = value
+    return _to_native(scalarized)
+
+
+def _relative_gap(higher_is_worse, lower_is_better, epsilon=1e-8):
+    baseline = max(abs(lower_is_better), epsilon)
+    return float((higher_is_worse - lower_is_better) / baseline)
+
+
+def _regression_metrics(y_true, y_pred):
+    mse = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else float("nan")
+    explained_variance = (
+        float(explained_variance_score(y_true, y_pred))
+        if len(y_true) > 1 else float("nan")
+    )
+    return {
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "r2": r2,
+        "explained_variance": explained_variance,
+    }
+
+
+def _metric_gap_summary(train_metrics, eval_metrics, prefix):
+    return {
+        f"{prefix}_mse_gap_abs": float(eval_metrics["mse"] - train_metrics["mse"]),
+        f"{prefix}_mse_gap_ratio": _relative_gap(eval_metrics["mse"], train_metrics["mse"]),
+        f"{prefix}_rmse_gap_abs": float(eval_metrics["rmse"] - train_metrics["rmse"]),
+        f"{prefix}_rmse_gap_ratio": _relative_gap(eval_metrics["rmse"], train_metrics["rmse"]),
+        f"{prefix}_mae_gap_abs": float(eval_metrics["mae"] - train_metrics["mae"]),
+        f"{prefix}_mae_gap_ratio": _relative_gap(eval_metrics["mae"], train_metrics["mae"]),
+        f"{prefix}_r2_gap_abs": float(train_metrics["r2"] - eval_metrics["r2"]),
+        f"{prefix}_explained_variance_gap_abs": float(
+            train_metrics["explained_variance"] - eval_metrics["explained_variance"]
+        ),
+    }
+
+
+def _trial_record_from_hyperopt_trial(
+    trial,
+    hyperparameter_space,
+    iteration,
+    cluster_label,
+    model_track,
+    train_rows,
+    feature_count,
+    fold_count,
+):
+    result = trial["result"]
+    raw_params = _scalarize_trial_vals(trial["misc"]["vals"])
+    decoded_params = _to_native(space_eval(hyperparameter_space, raw_params))
+    return {
+        "iteration": int(iteration + 1),
+        "cluster_type": cluster_label,
+        "model_track": model_track,
+        "trial_number": int(trial["tid"] + 1),
+        "status": str(result.get("status", "")),
+        "train_rows": int(train_rows),
+        "feature_count": int(feature_count),
+        "fold_count": int(fold_count),
+        "loss": float(result.get("loss", np.nan)),
+        "best_boost_round": int(result.get("best_boost_round", 0)),
+        "cv_rounds_run": int(result.get("cv_rounds_run", 0)),
+        "cv_train_rmse_mean": float(result.get("cv_train_rmse_mean", np.nan)),
+        "cv_val_rmse_mean": float(result.get("cv_val_rmse_mean", np.nan)),
+        "cv_rmse_gap_abs": float(result.get("cv_rmse_gap_abs", np.nan)),
+        "cv_rmse_gap_ratio": float(result.get("cv_rmse_gap_ratio", np.nan)),
+        "trial_elapsed_seconds": float(result.get("elapsed_seconds", np.nan)),
+        "params_internal_json": json.dumps(raw_params, sort_keys=True),
+        "params_decoded_json": json.dumps(decoded_params, sort_keys=True),
+        "max_depth_internal": raw_params.get("max_depth", np.nan),
+        "max_depth_decoded": decoded_params.get("max_depth", np.nan),
+        "min_child_weight_internal": raw_params.get("min_child_weight", np.nan),
+        "min_child_weight_decoded": decoded_params.get("min_child_weight", np.nan),
+        "learning_rate": decoded_params.get("learning_rate", np.nan),
+        "reg_alpha": decoded_params.get("reg_alpha", np.nan),
+        "reg_lambda": decoded_params.get("reg_lambda", np.nan),
+        "gamma": decoded_params.get("gamma", np.nan),
+        "subsample": decoded_params.get("subsample", np.nan),
+        "colsample_bytree": decoded_params.get("colsample_bytree", np.nan),
+    }
+
+
+def _build_legacy_plot_records(trial_records):
+    legacy_records = []
+    for record in trial_records:
+        legacy_records.append({
+            "loss": record["loss"],
+            "max_depth": record["max_depth_internal"],
+            "min_child_weight": record["min_child_weight_internal"],
+            "learning_rate": record["learning_rate"],
+            "reg_alpha": record["reg_alpha"],
+            "reg_lambda": record["reg_lambda"],
+            "gamma": record["gamma"],
+            "subsample": record["subsample"],
+            "colsample_bytree": record["colsample_bytree"],
+        })
+    return legacy_records
+
+
+def _run_cv_history(dtrain, folds, params, seed, iteration, cluster_label, model_track):
+    params_json = json.dumps(_to_native(params), sort_keys=True)
+    cv_results = xgb.cv(
+        params={**params, "eval_metric": "rmse"},
+        dtrain=dtrain,
+        num_boost_round=config["XGBoost"]["num_boost_round"],
+        folds=folds,
+        metrics="rmse",
+        early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"],
+        seed=seed,
+    )
+    rows = []
+    for round_idx, (_, row) in enumerate(cv_results.iterrows(), start=1):
+        rows.append({
+            "iteration": int(iteration + 1),
+            "cluster_type": cluster_label,
+            "model_track": model_track,
+            "boost_round": int(round_idx),
+            "params_decoded_json": params_json,
+            "train_rmse_mean": float(row["train-rmse-mean"]),
+            "train_rmse_std": float(row["train-rmse-std"]),
+            "val_rmse_mean": float(row["test-rmse-mean"]),
+            "val_rmse_std": float(row["test-rmse-std"]),
+        })
+    return cv_results, rows
+
+
+def _evaluate_best_params_across_folds(
+    X,
+    y,
+    folds,
+    params,
+    iteration,
+    cluster_label,
+    model_track,
+):
+    params_json = json.dumps(_to_native(params), sort_keys=True)
+    rows = []
+    for fold_number, (train_idx, val_idx) in enumerate(folds, start=1):
+        X_fold_train = X.iloc[train_idx]
+        X_fold_val = X.iloc[val_idx]
+        y_fold_train = y.iloc[train_idx]
+        y_fold_val = y.iloc[val_idx]
+
+        dtrain = xgb.DMatrix(X_fold_train, label=y_fold_train)
+        dval = xgb.DMatrix(X_fold_val, label=y_fold_val)
+        evals_result = {}
+        model = xgb.train(
+            params={**params, "eval_metric": "rmse"},
+            dtrain=dtrain,
+            num_boost_round=config["XGBoost"]["num_boost_round"],
+            evals=[(dtrain, "train"), (dval, "val")],
+            evals_result=evals_result,
+            verbose_eval=False,
+            early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"],
+        )
+
+        train_pred = model.predict(dtrain)
+        val_pred = model.predict(dval)
+        train_metrics = _regression_metrics(y_fold_train, train_pred)
+        val_metrics = _regression_metrics(y_fold_val, val_pred)
+
+        row = {
+            "iteration": int(iteration + 1),
+            "cluster_type": cluster_label,
+            "model_track": model_track,
+            "fold_number": int(fold_number),
+            "params_decoded_json": params_json,
+            "train_rows": int(len(X_fold_train)),
+            "val_rows": int(len(X_fold_val)),
+            "feature_count": int(X.shape[1]),
+            "best_boost_round": int(getattr(model, "best_iteration", -1) + 1),
+            "best_score_rmse": float(getattr(model, "best_score", np.nan)),
+            "train_mse": train_metrics["mse"],
+            "train_rmse": train_metrics["rmse"],
+            "train_mae": train_metrics["mae"],
+            "train_r2": train_metrics["r2"],
+            "train_explained_variance": train_metrics["explained_variance"],
+            "val_mse": val_metrics["mse"],
+            "val_rmse": val_metrics["rmse"],
+            "val_mae": val_metrics["mae"],
+            "val_r2": val_metrics["r2"],
+            "val_explained_variance": val_metrics["explained_variance"],
+        }
+        row.update(_metric_gap_summary(train_metrics, val_metrics, prefix="cv"))
+        rows.append(row)
+    return rows
+
+
+def _build_boosting_curve_rows(evals_result, iteration, cluster_label, model_track):
+    rows = []
+    for split_name in ("train", "test"):
+        rmse_values = evals_result.get(split_name, {}).get("rmse", [])
+        for round_idx, rmse in enumerate(rmse_values, start=1):
+            rows.append({
+                "iteration": int(iteration + 1),
+                "cluster_type": cluster_label,
+                "model_track": model_track,
+                "split": split_name,
+                "boost_round": int(round_idx),
+                "rmse": float(rmse),
+                "mse": float(rmse) ** 2,
+            })
+    return rows
+
+
 # Define XGBoost objective function
 def objective_XGBoost(params, dtrain, folds, seed):
+    started = monotonic()
     # params['device'] = 'cuda'
     # params['tree_method'] = 'hist'
+    params = dict(params)
     params['max_depth'] = int(params['max_depth'])
     params['min_child_weight'] = int(params['min_child_weight'])
     params['eval_metric'] = 'rmse'
     cv_results = xgb.cv(params=params, dtrain=dtrain, num_boost_round=config["XGBoost"]["num_boost_round"], folds=folds,
                         metrics='rmse', early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"], seed=seed)
-    return {'loss': cv_results['test-rmse-mean'].min(),
-            'status': STATUS_OK,
-            'num_boost_rounds': cv_results['test-rmse-mean'].idxmin()}
+    best_idx = int(cv_results['test-rmse-mean'].idxmin())
+    best_train_rmse = float(cv_results.loc[best_idx, 'train-rmse-mean'])
+    best_val_rmse = float(cv_results.loc[best_idx, 'test-rmse-mean'])
+    return {
+        'loss': best_val_rmse,
+        'status': STATUS_OK,
+        'best_boost_round': best_idx + 1,
+        'cv_rounds_run': int(len(cv_results)),
+        'cv_train_rmse_mean': best_train_rmse,
+        'cv_val_rmse_mean': best_val_rmse,
+        'cv_rmse_gap_abs': float(best_val_rmse - best_train_rmse),
+        'cv_rmse_gap_ratio': _relative_gap(best_val_rmse, best_train_rmse),
+        'elapsed_seconds': float(monotonic() - started),
+    }
 
 
-def apply_XGBoost(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration):
+def apply_XGBoost(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration,
+                  cluster_label="KMeans Clusters"):
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dtest = xgb.DMatrix(X_test, label=y_test)
 
@@ -43,20 +290,45 @@ def apply_XGBoost(X_train, y_train, X_test, y_test, hyperparameter_space, cluste
     # Use partial to bind dtrain to the objective function
     objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain, folds=folds, seed=seed)
     best_hyperparams = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
-                            max_evals=config["XGBoost"]["num_trials"], trials=trials)
+                            max_evals=config["XGBoost"]["num_trials"], trials=trials, show_progressbar=False)
+    best_hyperparams_decoded = _to_native(space_eval(hyperparameter_space, best_hyperparams))
     best_rmse = min([trial['result']['loss'] for trial in trials.trials])
 
-    # Collect data for this iteration instead of seed
-    for trial in trials.trials:
-        if trial['result']['status'] == 'ok':
-            trial_result = {
-                'loss': trial['result']['loss'],
-                **{k: v[0] for k, v in trial['misc']['vals'].items()}
-            }
-            # print(f"Appending result to iteration {iteration}")
-            all_results[iteration].append(trial_result)
+    trial_records = [
+        _trial_record_from_hyperopt_trial(
+            trial=trial,
+            hyperparameter_space=hyperparameter_space,
+            iteration=iteration,
+            cluster_label=cluster_label,
+            model_track="xgboost_full",
+            train_rows=len(X_train),
+            feature_count=X_train.shape[1],
+            fold_count=len(folds),
+        )
+        for trial in trials.trials
+    ]
+    legacy_plot_records = _build_legacy_plot_records(trial_records)
+    all_results[iteration].extend(legacy_plot_records)
 
     evals_result = {}
+    cv_results, cv_learning_curve_rows = _run_cv_history(
+        dtrain=dtrain,
+        folds=folds,
+        params=best_hyperparams_decoded,
+        seed=seed,
+        iteration=iteration,
+        cluster_label=cluster_label,
+        model_track="xgboost_full",
+    )
+    cv_fold_records = _evaluate_best_params_across_folds(
+        X=X_train,
+        y=y_train,
+        folds=folds,
+        params=best_hyperparams_decoded,
+        iteration=iteration,
+        cluster_label=cluster_label,
+        model_track="xgboost_full",
+    )
 
     # Perform hyperparameter optimisation
     final_model = xgb.train(params={**best_hyperparams, 'eval_metric': 'rmse'},
@@ -67,10 +339,32 @@ def apply_XGBoost(X_train, y_train, X_test, y_test, hyperparameter_space, cluste
                             verbose_eval=False,
                             early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"])
 
-    return final_model, evals_result, best_rmse, best_hyperparams
+    return {
+        "final_model": final_model,
+        "evals_result": evals_result,
+        "best_rmse": float(best_rmse),
+        "best_hyperparams": _to_native(best_hyperparams),
+        "best_hyperparams_decoded": best_hyperparams_decoded,
+        "trial_records": trial_records,
+        "cv_fold_records": cv_fold_records,
+        "cv_learning_curve_rows": cv_learning_curve_rows,
+        "boosting_curve_rows": _build_boosting_curve_rows(
+            evals_result=evals_result,
+            iteration=iteration,
+            cluster_label=cluster_label,
+            model_track="xgboost_full",
+        ),
+        "legacy_plot_records": legacy_plot_records,
+        "cv_best_boost_round": int(cv_results['test-rmse-mean'].idxmin() + 1),
+        "cv_train_rmse_mean": float(
+            cv_results.loc[cv_results['test-rmse-mean'].idxmin(), 'train-rmse-mean']
+        ),
+        "cv_val_rmse_mean": float(cv_results['test-rmse-mean'].min()),
+    }
 
 
-def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration):
+def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, clusters, seed, all_results, iteration,
+                      cluster_label="KMeans Clusters"):
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dtest = xgb.DMatrix(X_test, label=y_test)
 
@@ -82,7 +376,8 @@ def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, cl
     # Use partial to bind dtrain to the objective function
     objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain, folds=folds, seed=seed)
     best_hyperparams = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
-                            max_evals=config["XGBoost"]["num_trials"], trials=trials)
+                            max_evals=config["XGBoost"]["num_trials"], trials=trials, show_progressbar=False)
+    best_hyperparams_decoded = _to_native(space_eval(hyperparameter_space, best_hyperparams))
     # best_rmse = min([trial['result']['loss'] for trial in trials.trials])
 
     # # Collect data for this iteration instead of seed
@@ -149,20 +444,43 @@ def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, cl
     # Use partial to bind dtrain to the objective function
     objective_XGBoost_with_data = partial(objective_XGBoost, dtrain=dtrain_top, folds=folds, seed=seed)
     best_hyperparams_top = fmin(fn=objective_XGBoost_with_data, space=hyperparameter_space, algo=tpe.suggest,
-                                max_evals=config["XGBoost"]["num_trials"], trials=trials)
+                                max_evals=config["XGBoost"]["num_trials"], trials=trials, show_progressbar=False)
+    best_hyperparams_top_decoded = _to_native(space_eval(hyperparameter_space, best_hyperparams_top))
     best_rmse_top = min([trial['result']['loss'] for trial in trials.trials])
 
-    # # Collect data for this iteration instead of seed
-    # for trial in trials.trials:
-    #     if trial['result']['status'] == 'ok':
-    #         trial_result = {
-    #             'loss': trial['result']['loss'],
-    #             **{k: v[0] for k, v in trial['misc']['vals'].items()}
-    #         }
-    #         # print(f"Appending result to iteration {iteration}")
-    #         # all_results[iteration].append(trial_result)
+    trial_records = [
+        _trial_record_from_hyperopt_trial(
+            trial=trial,
+            hyperparameter_space=hyperparameter_space,
+            iteration=iteration,
+            cluster_label=cluster_label,
+            model_track="xgboost_top7",
+            train_rows=len(X_train_top),
+            feature_count=X_train_top.shape[1],
+            fold_count=len(folds),
+        )
+        for trial in trials.trials
+    ]
 
     evals_result_top = {}
+    cv_results_top, cv_learning_curve_rows = _run_cv_history(
+        dtrain=dtrain_top,
+        folds=folds,
+        params=best_hyperparams_top_decoded,
+        seed=seed,
+        iteration=iteration,
+        cluster_label=cluster_label,
+        model_track="xgboost_top7",
+    )
+    cv_fold_records = _evaluate_best_params_across_folds(
+        X=X_train_top,
+        y=y_train,
+        folds=folds,
+        params=best_hyperparams_top_decoded,
+        iteration=iteration,
+        cluster_label=cluster_label,
+        model_track="xgboost_top7",
+    )
 
     # Perform hyperparameter optimisation
     final_model_top = xgb.train(params={**best_hyperparams_top, 'eval_metric': 'rmse'},
@@ -174,7 +492,29 @@ def apply_XGBoost_top(X_train, y_train, X_test, y_test, hyperparameter_space, cl
                                 early_stopping_rounds=config["XGBoost"]["early_stopping_rounds"]
                                 )
 
-    return final_model_top, evals_result_top, chosen_features_dict, best_rmse_top, best_hyperparams_top, dtest_top
+    return {
+        "final_model": final_model_top,
+        "evals_result": evals_result_top,
+        "best_features_dict": chosen_features_dict,
+        "best_rmse": float(best_rmse_top),
+        "best_hyperparams": _to_native(best_hyperparams_top),
+        "best_hyperparams_decoded": best_hyperparams_top_decoded,
+        "dtest_top": dtest_top,
+        "dtrain_top": dtrain_top,
+        "chosen_features": chosen_features,
+        "trial_records": trial_records,
+        "cv_fold_records": cv_fold_records,
+        "cv_learning_curve_rows": cv_learning_curve_rows,
+        "boosting_curve_rows": _build_boosting_curve_rows(
+            evals_result=evals_result_top,
+            iteration=iteration,
+            cluster_label=cluster_label,
+            model_track="xgboost_top7",
+        ),
+        "cv_best_boost_round": int(cv_results_top['test-rmse-mean'].idxmin() + 1),
+        "cv_train_rmse_mean": float(cv_results_top.loc[cv_results_top['test-rmse-mean'].idxmin(), 'train-rmse-mean']),
+        "cv_val_rmse_mean": float(cv_results_top['test-rmse-mean'].min()),
+    }
 
 
 def save_checkpoint(checkpoint_dir, final_models, cluster_iteration_results, all_results,
