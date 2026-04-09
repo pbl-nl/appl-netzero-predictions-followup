@@ -28,13 +28,11 @@ If Git LFS was already installed before cloning, the large files may already be 
 ### Windows
 
 ```powershell
-py -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
-
-If `py` is not available, use `python` instead.
 
 If PowerShell blocks activation, run:
 
@@ -71,10 +69,11 @@ These files are stored with Git LFS. A normal clone is only enough if Git LFS is
 
 ### Files created automatically
 
-- `python main.py` downloads public-source raw data into `data/raw/`
+- `python main.py` processes existing local inputs in `data/raw/`
 - `python main.py` writes processed files into `data/processed/`
 - `python main.py` writes the merged panel to `data/merged/merged.csv`
-- `stages/data.py` can create `data/netzero/population_estimate.csv` automatically if it is missing
+- `python -m stages.data` downloads public-source raw data into `data/raw/`
+- `stages/data.py` can create `data/netzero/population_estimate.csv` automatically if it is missing when downloads are enabled
 
 ### Legacy file note
 
@@ -151,20 +150,65 @@ Outputs:
 
 Where `<timestamp>` is auto-generated in `YYYYMMDD_HHMMSS` format.
 
+### 4. Post-Analysis
+
+Converts training outputs into thesis-ready artifacts. Requires a completed training run.
+
+Run (auto-discovers latest training results):
+
+```bash
+python -m stages.post_analysis
+```
+
+Common options:
+
+```bash
+# Use a specific training results directory
+python -m stages.post_analysis --results-dir results/training_<timestamp>
+
+# Skip SHAP computation (much faster for quick iteration)
+python -m stages.post_analysis --no-shap
+
+# Filter to a subset of models / targets / strategies / branches
+python -m stages.post_analysis --models extra_trees bayesian_ridge --targets linear
+
+# Compare two training runs side by side
+python -m stages.post_analysis \
+    --results-dir results/training_<tag1> \
+    --compare results/training_<tag2>
+
+# Skip specific analysis steps
+python -m stages.post_analysis --skip interpretability benchmark
+```
+
+Outputs to `results/post_analysis_<timestamp>/`:
+
+| Subdirectory          | Contents                                                           |
+| --------------------- | ------------------------------------------------------------------ |
+| `model_comparison/` | Performance tables, heatmaps, model rankings, gap scatter          |
+| `sensitivity/`      | Branch, strategy, and scenario sensitivity tables and plots        |
+| `net_zero_years/`   | Implied net-zero year predictions (inverse budget mapping)         |
+| `benchmark/`        | Gap vs. announced targets, acceptability bands, choropleth maps    |
+| `interpretability/` | SHAP beeswarm/bar plots, built-in feature importance               |
+| `uncertainty/`      | Bootstrap CI width analysis, country ranking, world maps           |
+| `summary/`          | `post_analysis_results.xlsx` (multi-sheet), `key_findings.csv` |
+
 ## What `main.py` Does
 
 `python main.py` runs these steps:
 
-1. download public data into `data/raw/`
+1. use existing local files in `data/raw/`
 2. process raw files into `data/processed/`
 3. merge processed data and target inputs into `data/merged/merged.csv`
 
 It does not run `reproduce_old.py`, `reproduce_new.py`, or `python -m stages.training`.
+`python -m stages.data` remains the download-first entrypoint unless `run(skip_download=True)` is called explicitly.
 
 ## Troubleshooting
 
 - If a required CSV is missing or looks like a Git LFS pointer file, run `git lfs pull`.
-- `python main.py` needs internet access for automatic downloads and for population data fallback if `data/netzero/population_estimate.csv` is missing.
+- `python main.py` now expects local raw files and `data/netzero/population_estimate.csv` to already exist.
+- `python -m stages.data` still needs internet access for automatic downloads and for population data fallback if `data/netzero/population_estimate.csv` is missing.
 - If `python -m stages.training` fails immediately, make sure `data/merged/merged.csv` exists and rerun `python main.py`.
 - If `reproduce_new.py` fails after `python main.py`, verify that `data/old_data/` is still populated. `reproduce_new.py` is not fully self-contained from `merged.csv`.
 - If dependency installation fails, recreate the environment with Python 3.12.

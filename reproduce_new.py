@@ -190,6 +190,7 @@ TARGET_START_YEAR = 2022
 TARGET_MID_YEAR = 2030
 TARGET_SCALE = 1e6
 TARGET_EMISSIONS_COL = f"GHG emissions incl LULUCF {TARGET_START_YEAR}"
+EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3 = {"CPV", "MNG"}
 
 
 def load_revised_lulucf_data(file_path):
@@ -362,6 +363,59 @@ def calculate_net_zero_year_start_year(row, target_variable, start_year, mid_yea
         return np.nan
 
     return ((a_total - a_start_to_mid) * p_mid) / denominator + mid_year + 1
+
+
+def compute_recent_ghg_growth_average(merged_df, cutoff_year, window_size=5):
+    ghg_growth_col = "GHG growth (annual %)"
+    window_end = int(cutoff_year)
+    window_start = window_end - window_size + 1
+
+    if ghg_growth_col not in merged_df.columns:
+        return pd.DataFrame(columns=["Country Code", ghg_growth_col])
+
+    ghg_growth_df = merged_df[["Country Code", "Year", ghg_growth_col]].copy()
+    ghg_growth_df["Year"] = pd.to_numeric(ghg_growth_df["Year"], errors="coerce")
+    ghg_growth_df = ghg_growth_df[
+        ghg_growth_df["Year"].between(window_start, window_end, inclusive="both")
+    ]
+
+    ghg_growth_avg_df = (
+        ghg_growth_df.groupby("Country Code", as_index=False)[ghg_growth_col]
+        .mean()
+    )
+
+    return ghg_growth_avg_df
+
+
+def compute_effective_energy_intensity(merged_df):
+    energy_intensity_col = "Energy intensity level of primary energy (MJ/$2017 PPP GDP)"
+
+    if energy_intensity_col not in merged_df.columns:
+        return pd.DataFrame(columns=["Country Code", energy_intensity_col])
+
+    energy_df = merged_df[["Country Code", "Year", energy_intensity_col]].copy()
+    energy_df["Year"] = pd.to_numeric(energy_df["Year"], errors="coerce")
+
+    effective_rows = []
+    for country_code, group in energy_df.groupby("Country Code"):
+        country_series = group.dropna(subset=[energy_intensity_col]).sort_values("Year")
+
+        if country_series.empty:
+            effective_value = np.nan
+        else:
+            latest_value = country_series.iloc[-1][energy_intensity_col]
+            if latest_value != 0:
+                effective_value = latest_value
+            else:
+                non_zero_series = country_series[country_series[energy_intensity_col] != 0]
+                effective_value = non_zero_series.iloc[-1][energy_intensity_col] if not non_zero_series.empty else 0
+
+        effective_rows.append({
+            "Country Code": country_code,
+            energy_intensity_col: effective_value,
+        })
+
+    return pd.DataFrame(effective_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +755,27 @@ if __name__ == '__main__':
     full_data_merged_cap_cleaned_df = most_recent_data_and_trends_with_coverage(merged_cap_cleaned_df,
                                                                                 trends_cap_cleaned_significant_df)
 
+    ghg_growth_avg_df = compute_recent_ghg_growth_average(merged_cap_cleaned_df, DATA_YEAR_CUTOFF)
+    energy_intensity_effective_df = compute_effective_energy_intensity(merged_cap_cleaned_df)
+
+    if "GHG growth (annual %)" in full_data_merged_cap_cleaned_df.columns:
+        full_data_merged_cap_cleaned_df = full_data_merged_cap_cleaned_df.drop(columns=["GHG growth (annual %)"])
+    full_data_merged_cap_cleaned_df = full_data_merged_cap_cleaned_df.merge(
+        ghg_growth_avg_df,
+        on="Country Code",
+        how="left",
+    )
+
+    if "Energy intensity level of primary energy (MJ/$2017 PPP GDP)" in full_data_merged_cap_cleaned_df.columns:
+        full_data_merged_cap_cleaned_df = full_data_merged_cap_cleaned_df.drop(
+            columns=["Energy intensity level of primary energy (MJ/$2017 PPP GDP)"]
+        )
+    full_data_merged_cap_cleaned_df = full_data_merged_cap_cleaned_df.merge(
+        energy_intensity_effective_df,
+        on="Country Code",
+        how="left",
+    )
+
     log_vars = ['GDP per capita (constant 2015 US$)', 'Population density (people per sq. km of land area)',
                 'Coal rents (% of GDP)', 'Fossil-fuel pre-tax subsidies (consumption and production) USD per capita',
                 'Total sovereign green bonds issuance (billion US$)', 'Oil and Gas Rents (% of GDP)',
@@ -846,6 +921,12 @@ if __name__ == '__main__':
 
     indep_dep_df = pd.merge(filtered_vif_df, nzt_filtered[['Country Code', target_variable]],
                             on='Country Code', how='inner')
+
+    excluded_training_mask = indep_dep_df['Country Code'].isin(EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3)
+    if excluded_training_mask.any():
+        excluded_training_countries = sorted(indep_dep_df.loc[excluded_training_mask, 'Country Code'].unique())
+        print(f"Excluding countries from clustering/training: {excluded_training_countries}")
+    indep_dep_df = indep_dep_df[~excluded_training_mask]
 
     outlier = ['SGP', 'ISL', 'COM', 'NAM']
     is_outlier = indep_dep_df['Country Code'].isin(outlier)
@@ -1424,9 +1505,22 @@ if __name__ == '__main__':
         plt.savefig(filename)
         plt.close(fig)
 
-    missing_countries = LULUCF_df[~LULUCF_df['Country Code'].isin(nzt_filtered['Country Code'])]
-    missing_countries_data = pd.merge(filtered_vif_df, missing_countries['Country Code'],
+    natural_missing_country_codes = set(
+        LULUCF_df.loc[~LULUCF_df['Country Code'].isin(nzt_filtered['Country Code']), 'Country Code']
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+    missing_country_codes = sorted(natural_missing_country_codes | EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3)
+    missing_country_codes_df = pd.DataFrame({'Country Code': missing_country_codes})
+
+    missing_countries_data = pd.merge(filtered_vif_df, missing_country_codes_df,
                                       on='Country Code', how='inner')
+    routed_missing_countries = set(missing_countries_data['Country Code'].dropna().astype(str).str.upper())
+    unrouted_excluded_countries = sorted(EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3 - routed_missing_countries)
+    if unrouted_excluded_countries:
+        print(f"WARNING: Excluded countries missing from X_missing routing: {unrouted_excluded_countries}")
     X_missing = missing_countries_data.drop(columns=['Country Code'])
     X_missing.columns = [col.replace('[', '').replace(']', '').replace('<', '') for col in X_missing.columns]
     # Reorder columns to match training feature order (XGBoost validates exact order)

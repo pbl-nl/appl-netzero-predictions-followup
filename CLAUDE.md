@@ -30,6 +30,15 @@ python reproduce_new.py   # old study with new merged data (requires main.py fir
 
 # Rebuild preprocessor cache (force)
 python -m stages.training.data_preparation --force
+
+# Post-analysis (run after training — auto-discovers latest results)
+python -m stages.post_analysis
+
+# Post-analysis with options
+python -m stages.post_analysis --results-dir results/training_<tag>
+python -m stages.post_analysis --no-shap          # skip SHAP (faster)
+python -m stages.post_analysis --models extra_trees --targets linear
+python -m stages.post_analysis --compare results/training_<other_tag>
 ```
 
 **Python 3.10-3.12 required** (3.13+ not supported). Always use `.venv` in project root.
@@ -53,6 +62,16 @@ main.py -> stages/data.py::run()
              |-- overfitting.py: gap-ratio classification
              '-- bootstrap.py: 200-iteration uncertainty quantification
                    '-> results/training_<timestamp>/
+                         |
+                         '-> stages/post_analysis/__main__.py
+                               |-- model_comparison.py: cross-model performance tables + plots
+                               |-- sensitivity.py: branch/strategy/scenario sensitivity
+                               |-- net_zero.py: inverse budget→TNZ year mapping
+                               |-- benchmark.py: gap vs. national targets + choropleth
+                               |-- interpretability.py: SHAP + feature importance
+                               |-- uncertainty.py: bootstrap CI analysis + maps
+                               '-- report.py: Excel export + key_findings.csv
+                                     '-> results/post_analysis_<timestamp>/
 ```
 
 ### Data Pipeline (`main.py` -> `stages/data.py`)
@@ -110,6 +129,32 @@ Training uses `ProcessPoolExecutor` for parallel combo execution.
 ### Results
 
 All outputs go to `results/training_<timestamp>/`: `final_results.csv`, `final_bootstrap_predictions.csv`, `final_prediction_summary.csv`, `trials.csv`, `outer_results.csv`, `overfitting_audit.csv`, `winners.csv`, and `artifacts/` (serialized models under `outer_winners/` and `final/`).
+
+### Post-Analysis Pipeline (`stages/post_analysis/`)
+
+Entry point: `python -m stages.post_analysis [OPTIONS]`
+
+Converts training outputs into thesis-ready artifacts. Auto-discovers the latest `results/training_*/` directory if `--results-dir` is not specified. All analyses run independently; failures are caught and logged without aborting the run.
+
+**Key modules**:
+- `config.py` — All configurable constants: tolerances, SHAP settings, colour palettes, subdirectory names
+- `loader.py` — `discover_latest_results_dir()`, `load_training_outputs()`, `load_artifact()`, `apply_filters()`
+- `model_comparison.py` — Performance heatmaps, model rankings, train/test gap scatter, outer CV boxplots
+- `sensitivity.py` — Branch (simple vs. MICE), strategy (temporal vs. random), scenario sensitivity tables + heatmaps
+- `net_zero.py` — Inverse mapping: `invert_prediction_to_tnz()` via `scipy.optimize.brentq`; reuses `stages.data` path functions
+- `benchmark.py` — TNZ gap vs. announced targets, acceptability bands, choropleth maps
+- `interpretability.py` — SHAP (TreeExplainer / LinearExplainer / KernelExplainer dispatch), built-in feature importance
+- `uncertainty.py` — Bootstrap CI width analysis, country ranking, geopandas maps
+- `report.py` — Multi-sheet Excel workbook + `key_findings.csv`
+
+**Important column name difference**: `outer_results.csv` / `winners.csv` use `outer_strategy`; `final_results.csv` / `final_prediction_summary.csv` use `outer_strategy_source`. `loader.apply_filters()` handles both.
+
+**Output structure**:
+```
+results/post_analysis_<timestamp>/
+  model_comparison/   sensitivity/   net_zero_years/   benchmark/
+  interpretability/   uncertainty/   summary/
+```
 
 ### Legacy Code (`modules/`)
 

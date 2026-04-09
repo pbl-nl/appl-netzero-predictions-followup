@@ -814,9 +814,18 @@ def load_nz_data() -> pd.DataFrame:
     return result[["iso3", "nz_ghg_year", "currpol_2030_median"]].drop_duplicates(subset=["iso3"])
 
 
-def load_population_projections() -> pd.DataFrame:
+def load_population_projections(skip_download: bool = False) -> pd.DataFrame:
     netzero_population_path = NETZERO_DIR / "population_estimate.csv"
     if not netzero_population_path.exists():
+        if skip_download:
+            print("population_estimate.csv not found – Do you want to download it from UN WPP?")
+            print("If you don't want to download it, then script will raise FileNotFoundError.")
+            user_input = input("Enter 'y' to download, or anything else to skip: ").strip().lower()
+            if user_input != 'y':
+                raise FileNotFoundError(
+                    "Skip mode disables population download fallback; "
+                    "data/netzero/population_estimate.csv must already exist."
+                )
         log.info("population_estimate.csv not found – downloading from UN WPP …")
         resp = requests.get(POPULATION_URL, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
@@ -936,7 +945,7 @@ def cumulative_per_capita_path(
 # =============================================================================
 
 
-def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
+def compute_target_columns(merged: pd.DataFrame, skip_download: bool = False) -> pd.DataFrame:
     scenario_cols = ["country", "year"] + list(SCENARIO_ALPHAS.keys())
     if "total_ghg_emissions" not in merged.columns or "population_total" not in merged.columns:
         return pd.DataFrame(columns=scenario_cols)
@@ -946,7 +955,7 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
     history["population_total"] = pd.to_numeric(history["population_total"], errors="coerce")
 
     nz_data = load_nz_data()
-    population = load_population_projections()
+    population = load_population_projections(skip_download=skip_download)
 
     nz_map = dict(zip(nz_data["iso3"], nz_data["nz_ghg_year"]))
     currpol_map = dict(zip(nz_data["iso3"], nz_data["currpol_2030_median"]))
@@ -1028,14 +1037,17 @@ def compute_target_columns(merged: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
-def run() -> None:
+def run(skip_download: bool = False) -> None:
     # 1. Download
     os.makedirs(RAW_DIR, exist_ok=True)
-    static_sources = build_sources()
-    world_bank_sources = [dict(s) for s in WORLD_BANK_SOURCES]
-    failed = download_all(static_sources, world_bank_sources)
-    if failed:
-        raise SystemExit(1)
+    if skip_download:
+        print("DOWNLOAD SKIPPED: USING EXISTING LOCAL DATA ONLY", flush=True)
+    else:
+        static_sources = build_sources()
+        world_bank_sources = [dict(s) for s in WORLD_BANK_SOURCES]
+        failed = download_all(static_sources, world_bank_sources)
+        if failed:
+            raise SystemExit(1)
 
     # 2. Process
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -1048,7 +1060,7 @@ def run() -> None:
 
     # 3. Merge + targets
     merged = build_merged_panel()
-    targets = compute_target_columns(merged)
+    targets = compute_target_columns(merged, skip_download=skip_download)
     final_df = merged.merge(targets, on=["country", "year"], how="left")
     final_df = final_df.sort_values(["country", "year"]).reset_index(drop=True)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,3 @@
 from stages.data import run
 
-run()
+run(skip_download=True)
