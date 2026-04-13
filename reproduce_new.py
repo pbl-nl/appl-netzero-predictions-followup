@@ -190,7 +190,7 @@ TARGET_START_YEAR = 2022
 TARGET_MID_YEAR = 2030
 TARGET_SCALE = 1e6
 TARGET_EMISSIONS_COL = f"GHG emissions incl LULUCF {TARGET_START_YEAR}"
-EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3 = {"CPV", "MNG"}
+EXCLUDED_FROM_CLUSTERING_AND_TRAINING_ISO3 = {"CPV", "MNG", "AND", "LIE", "SYC", "FSM"}
 
 
 def load_revised_lulucf_data(file_path):
@@ -1873,8 +1873,8 @@ if __name__ == '__main__':
         'Balanced States': 'brown'
     }
     cluster_mapping = {
-        1: 'Hart-to-Abate Economies', 2: 'Coal-Dependent Economies',
-        3: 'Resource-Rich\nAuthoritarian States', 4: 'Low-emitting Economies', 0: 'Balanced States'
+        2: 'Hart-to-Abate Economies', 1: 'Coal-Dependent Economies',
+        4: 'Resource-Rich\nAuthoritarian States', 3: 'Low-emitting Economies', 0: 'Balanced States'
     }
     visualise_data['Cluster Name'] = visualise_data['KMeans Clusters'].map(cluster_mapping)
 
