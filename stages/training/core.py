@@ -20,6 +20,8 @@ from stages.training.config import (
     ACTIVE_MODELS,
     ACTIVE_OUTER_STRATEGIES,
     ACTIVE_TARGETS,
+    CANDIDATE_PRIMARY_COUNT,
+    CORE_METRICS,
     DEFAULT_CPU_WORKERS,
     MAX_TRAIN_START_YEAR,
     TRAIN_START_YEAR,
@@ -34,15 +36,15 @@ from stages.training.config import (
     MAX_TUNING_TRIALS_PER_MODEL,
     MIN_TUNING_TRIALS,
     MIN_VALID_FOLDS,
-    MODEL_COMPLEXITY_RANK,
     MODEL_RANDOM_STATE,
     N_FEATURES_TO_SELECT,
     N_TEMPORAL_CV_FOLDS,
     OUTER_ARTIFACTS_DIR,
+    OUTER_GAP_ABS_THRESHOLD,
+    OUTER_GAP_REL_THRESHOLD,
     OUTER_TEST_YEARS,
-    OVERFIT_GAP_RATIO_THRESHOLD,
+    OVERFIT_INNER_GAP_RATIO_THRESHOLD,
     OVERFITTING_AUDIT_PATH,
-    SELECTION_TOLERANCE,
     TEST_YEAR,
     TUNING_BUDGET_SECONDS,
     WINNERS_PATH,
@@ -69,7 +71,7 @@ from stages.training.helpers import (
     serialize_params,
     summarize_cv_metrics,
 )
-from stages.training.overfitting import build_overfitting_audit_df, classify_overfitting
+from stages.training.overfitting import build_overfitting_audit_df, classify_fold_gaps
 from stages.training.bootstrap import (
     build_prediction_summary,
     run_final_bootstrap_iterations,
@@ -77,14 +79,23 @@ from stages.training.bootstrap import (
 logger = logging.getLogger(__name__)
 
 
-_ERROR_ROW_NAN_FIELDS = frozenset({
-    "penalized_cv_loss", "gap_penalty",
-    "cv_train_mean_mae", "cv_mean_mae",
-    "cv_mae_gap_abs", "cv_mae_gap_ratio", "cv_positive_gap_fold_share",
-    "folds_used", "trial_count", "tuning_elapsed_seconds",
-    "outer_train_rows", "outer_test_rows", "feature_count",
-    "outer_train_mae", "outer_test_mae",
-})
+_ERROR_ROW_NAN_FIELDS = frozenset(
+    {
+        "penalized_cv_loss", "gap_penalty",
+        "inner_positive_gap_fold_share",
+        "folds_used", "trial_count", "tuning_elapsed_seconds",
+        "outer_train_rows", "outer_test_rows", "feature_count",
+    }
+    | {f"inner_train_mean_{m}" for m in CORE_METRICS}
+    | {f"inner_val_mean_{m}" for m in CORE_METRICS}
+    | {f"inner_val_std_{m}" for m in CORE_METRICS}
+    | {f"inner_train_val_gap_abs_{m}" for m in CORE_METRICS}
+    | {f"inner_train_val_gap_rel_{m}" for m in CORE_METRICS}
+    | {f"outer_train_{m}" for m in CORE_METRICS}
+    | {f"outer_test_{m}" for m in CORE_METRICS}
+    | {f"outer_generalization_gap_abs_{m}" for m in CORE_METRICS}
+    | {f"outer_generalization_gap_rel_{m}" for m in CORE_METRICS}
+)
 
 
 def _configure_worker_logging() -> None:
@@ -113,11 +124,12 @@ def run_cv_trial(
         )
         train_metrics, _ = predict_evaluate(model, fold["x_train"], fold["y_train"])
         val_metrics, _ = predict_evaluate(model, fold["x_val"], fold["y_val"])
-        fold_metrics.append({
-            "fold_id": fold["fold_id"],
-            "train_mae": train_metrics["mae"],
-            "val_mae": val_metrics["mae"],
-        })
+        row: dict[str, float] = {"fold_id": fold["fold_id"]}
+        for metric, value in train_metrics.items():
+            row[f"train_{metric}"] = float(value)
+        for metric, value in val_metrics.items():
+            row[f"val_{metric}"] = float(value)
+        fold_metrics.append(row)
 
     if len(fold_metrics) < MIN_VALID_FOLDS:
         return {
@@ -173,14 +185,18 @@ def tune_model(
             result = run_cv_trial(prepared_folds, model_name, params)
             if result["status"] == "ok":
                 obj = compute_penalized_cv_objective(result)
+                summary_fields = {
+                    k: v for k, v in result.items()
+                    if k.startswith("inner_train_mean_")
+                    or k.startswith("inner_val_mean_")
+                    or k.startswith("inner_val_std_")
+                    or k.startswith("inner_train_val_gap_")
+                    or k == "inner_positive_gap_fold_share"
+                    or k == "folds_used"
+                }
                 record.update({
                     "status": "ok",
-                    "cv_train_mean_mae": result["cv_train_mean_mae"],
-                    "cv_mean_mae": result["cv_mean_mae"],
-                    "cv_mae_gap_abs": result["cv_mae_gap_abs"],
-                    "cv_mae_gap_ratio": result["cv_mae_gap_ratio"],
-                    "cv_positive_gap_fold_share": result["cv_positive_gap_fold_share"],
-                    "folds_used": result["folds_used"],
+                    **summary_fields,
                     "penalized_cv_loss": obj["penalized_cv_loss"],
                     "gap_penalty": obj["gap_penalty"],
                     "error": "",
@@ -225,22 +241,27 @@ def tune_model(
     tuning_elapsed = float(time.monotonic() - tuning_started)
     logger.info(
         f"  Best CV: loss={best['penalized_cv_loss']:.4f} "
-        f"mae={best['cv_mean_mae']:.4f} after {len(trial_records)} trials "
+        f"mae={best['inner_val_mean_mae']:.4f} after {len(trial_records)} trials "
         f"in {tuning_elapsed:.1f}s"
     )
-    return {
+    tuning_result: dict[str, Any] = {
         "best_params": best_params,
         "penalized_cv_loss": float(best["penalized_cv_loss"]),
         "gap_penalty": float(best["gap_penalty"]),
-        "cv_train_mean_mae": float(best["cv_train_mean_mae"]),
-        "cv_mean_mae": float(best["cv_mean_mae"]),
-        "cv_mae_gap_abs": float(best["cv_mae_gap_abs"]),
-        "cv_mae_gap_ratio": float(best["cv_mae_gap_ratio"]),
-        "cv_positive_gap_fold_share": float(best["cv_positive_gap_fold_share"]),
+        "inner_positive_gap_fold_share": float(best["inner_positive_gap_fold_share"]),
         "folds_used": int(best["folds_used"]),
         "trial_count": int(len(trial_records)),
         "tuning_elapsed_seconds": tuning_elapsed,
-    }, trial_records
+    }
+    for key, value in best.items():
+        if (
+            key.startswith("inner_train_mean_")
+            or key.startswith("inner_val_mean_")
+            or key.startswith("inner_val_std_")
+            or key.startswith("inner_train_val_gap_")
+        ):
+            tuning_result[key] = float(value)
+    return tuning_result, trial_records
 
 
 # --- Candidate evaluation ---
@@ -286,8 +307,14 @@ def _aggregate_bootstrap_results(
 
     train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
     test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
-    avg_train = {k: float(train_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
-    avg_test = {k: float(test_metrics_df[k].mean()) for k in ["mae", "rmse", "r2"]}
+    avg_train = {
+        k: float(train_metrics_df[k].mean()) for k in CORE_METRICS
+        if k in train_metrics_df.columns
+    }
+    avg_test = {
+        k: float(test_metrics_df[k].mean()) for k in CORE_METRICS
+        if k in test_metrics_df.columns
+    }
     preds_df = pd.concat(prediction_rows, ignore_index=True)
 
     return avg_train, avg_test, preds_df
@@ -305,6 +332,8 @@ def _save_final_artifact(
     target: str,
     branch: str,
     outer_strategy: str,
+    candidate_rank: int,
+    candidate_role: str,
     avg_train: dict[str, float],
     avg_test: dict[str, float],
     pred_summary_df: pd.DataFrame,
@@ -322,14 +351,17 @@ def _save_final_artifact(
         "target": target,
         "branch": branch,
         "model_name": model_name,
+        "candidate_rank": candidate_rank,
+        "candidate_role": candidate_role,
         "params": best_params,
         "feature_columns": feature_columns,
-        "metrics": {"train": avg_train, "test": avg_test},
+        "metrics": {"final_train": avg_train, "final_test": avg_test},
         "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
         "prediction_summary": pred_summary_df,
         "outer_strategy_source": outer_strategy,
     }
-    artifact_path = FINAL_ARTIFACTS_DIR / outer_strategy / f"{target}.joblib"
+    filename = f"{target}_{branch}_{model_name}_rank{candidate_rank}.joblib"
+    artifact_path = FINAL_ARTIFACTS_DIR / outer_strategy / filename
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, artifact_path)
     return artifact_path
@@ -340,6 +372,8 @@ def _build_final_result_row(
     outer_strategy: str,
     branch: str,
     model_name: str,
+    candidate_rank: int,
+    candidate_role: str,
     best_params: dict[str, Any],
     x_train: pd.DataFrame,
     x_test_scored: pd.DataFrame,
@@ -348,24 +382,24 @@ def _build_final_result_row(
     avg_test: dict[str, float],
     artifact_path: Path,
 ) -> dict[str, Any]:
-    return {
+    row: dict[str, Any] = {
         "target": target,
         "outer_strategy_source": outer_strategy,
         "branch": branch,
         "model_name": model_name,
+        "candidate_rank": int(candidate_rank),
+        "candidate_role": candidate_role,
         "best_params_json": serialize_params(best_params),
         "final_train_rows": int(len(x_train)),
         "final_test_rows": int(len(x_test_scored)),
         "feature_count": int(len(selected_cols)),
         "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
-        "final_train_mae": avg_train["mae"],
-        "final_train_rmse": avg_train["rmse"],
-        "final_train_r2": avg_train["r2"],
-        "test_mae": avg_test["mae"],
-        "test_rmse": avg_test["rmse"],
-        "test_r2": avg_test["r2"],
         "artifact_path": str(artifact_path),
     }
+    for metric in CORE_METRICS:
+        row[f"final_train_{metric}"] = float(avg_train.get(metric, float("nan")))
+        row[f"final_test_{metric}"] = float(avg_test.get(metric, float("nan")))
+    return row
 
 
 def _refit_single_winner(
@@ -374,11 +408,13 @@ def _refit_single_winner(
     target: str,
     branch: str,
     model_name: str,
+    candidate_rank: int,
+    candidate_role: str,
     bootstrap_workers: int | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     _configure_worker_logging()
     pid = os.getpid()
-    tag = f"refit({outer_strategy}/{target}/{model_name}/{branch})"
+    tag = f"refit({outer_strategy}/{target}/{model_name}/{branch}/rank={candidate_rank})"
 
     print(
         f"[PID:{pid}] {tag} Starting "
@@ -428,6 +464,8 @@ def _refit_single_winner(
     base_predictions["target"] = target
     base_predictions["branch"] = branch
     base_predictions["model_name"] = model_name
+    base_predictions["candidate_rank"] = int(candidate_rank)
+    base_predictions["candidate_role"] = candidate_role
 
     bootstrap_results = run_final_bootstrap_iterations(
         target=target, model_name=model_name, best_params=best_params,
@@ -442,13 +480,19 @@ def _refit_single_winner(
     artifact_path = _save_final_artifact(
         model_name, best_params, x_train, y_train,
         preprocessor, selector, selected_cols, feature_columns,
-        target, branch, outer_strategy, avg_train, avg_test, pred_summary_df,
+        target, branch, outer_strategy, int(candidate_rank), candidate_role,
+        avg_train, avg_test, pred_summary_df,
     )
 
-    print(f"[PID:{pid}] {tag} Done. test_mae={avg_test['mae']:.4f}", flush=True)
+    print(
+        f"[PID:{pid}] {tag} Done. final_test_mae={avg_test.get('mae', float('nan')):.4f}",
+        flush=True,
+    )
 
     final_row = _build_final_result_row(
-        target, outer_strategy, branch, model_name, best_params,
+        target, outer_strategy, branch, model_name,
+        int(candidate_rank), candidate_role,
+        best_params,
         x_train, x_test_scored, selected_cols, avg_train, avg_test, artifact_path,
     )
     return final_row, preds_df
@@ -475,6 +519,7 @@ def refit_final_models(
                     _refit_single_winner, preprocessed_dir,
                     str(row["outer_strategy"]), str(row["target"]),
                     str(row["branch"]), str(row["model_name"]),
+                    int(row["candidate_rank"]), str(row["candidate_role"]),
                     bootstrap_workers=1,
                 ): idx
                 for idx, row in winners_df.iterrows()
@@ -490,6 +535,7 @@ def refit_final_models(
                 preprocessed_dir,
                 str(row["outer_strategy"]), str(row["target"]),
                 str(row["branch"]), str(row["model_name"]),
+                int(row["candidate_rank"]), str(row["candidate_role"]),
             )
             final_rows.append(final_row)
             prediction_rows.append(target_preds_df)
@@ -503,7 +549,7 @@ def refit_final_models(
 
     if final_rows:
         final_results_df = pd.DataFrame(final_rows).sort_values(
-            by=["outer_strategy_source", "target"],
+            by=["outer_strategy_source", "target", "candidate_rank"],
         ).reset_index(drop=True)
     else:
         final_results_df = empty_final_results_df()
@@ -511,19 +557,33 @@ def refit_final_models(
     return final_results_df, final_preds_df, final_summary_df
 
 
-# --- Winner selection ---
+# --- Candidate selection ---
 
 
-def _select_winner_for_pair(
+def _outer_gap_flagged_all_folds(subset: pd.DataFrame, branch: str, model_name: str) -> bool:
+    """True iff every successful outer fold for this (branch, model_name)
+    combination is flagged by the outer generalization gap audit."""
+    fold_rows = subset[
+        (subset["branch"] == branch) & (subset["model_name"] == model_name)
+    ]
+    if fold_rows.empty:
+        return False
+    return bool(fold_rows["outer_gap_flagged"].fillna(False).all())
+
+
+def _select_candidates_for_pair(
     successful: pd.DataFrame,
     outer_strategy: str,
     target: str,
-) -> dict[str, Any]:
-    """Select best (branch, model_name) for a single (strategy, target) pair.
+) -> list[dict[str, Any]]:
+    """Return top CANDIDATE_PRIMARY_COUNT candidates plus non-flagged backups
+    for a single (strategy, target) pair.
 
-    Overfitting gate: a candidate is disqualified if ALL of its outer folds are
-    overfit_excluded. Among non-disqualified candidates, apply tolerance rule
-    then prefer the simpler model.
+    Ranking: mean outer_test_mae across outer folds, ascending. The top
+    CANDIDATE_PRIMARY_COUNT rows are tagged role=primary. For each primary
+    whose candidate_all_folds_outer_gap_flagged is True, the next-best
+    non-flagged candidate (in rank order) is appended as role=backup. No
+    duplicates; if no non-flagged backup exists, only primaries are returned.
     """
     subset = successful[
         (successful["outer_strategy"] == outer_strategy)
@@ -534,80 +594,94 @@ def _select_winner_for_pair(
             f"No successful runs for strategy={outer_strategy}, target={target}."
         )
 
-    # Candidate-level disqualification: ALL folds are overfit
-    overfit_agg = (
-        subset.groupby(["branch", "model_name"], as_index=False)
-        .agg(
-            overfit_fold_count=("overfit_excluded", "sum"),
-            total_folds=("outer_test_year", "nunique"),
-        )
-    )
-    overfit_agg["candidate_overfit_disqualified"] = (
-        overfit_agg["overfit_fold_count"] == overfit_agg["total_folds"]
-    )
+    metric_aggs: dict[str, tuple[str, str]] = {}
+    for metric in CORE_METRICS:
+        col = f"outer_test_{metric}"
+        if col in subset.columns:
+            metric_aggs[f"mean_outer_test_{metric}"] = (col, "mean")
+            metric_aggs[f"std_outer_test_{metric}"] = (col, "std")
 
-    eligible_candidates = overfit_agg[
-        ~overfit_agg["candidate_overfit_disqualified"]
-    ][["branch", "model_name"]]
-    eligible_subset = subset.merge(eligible_candidates, on=["branch", "model_name"])
-
-    if eligible_subset.empty:
-        raise RuntimeError(
-            f"All candidates are overfit in every outer fold for "
-            f"strategy={outer_strategy}, target={target}. "
-            f"No winner can be selected. Inspect overfitting_audit.csv."
-        )
-
-    # Aggregate per (branch, model_name) across outer test years
     agg = (
-        eligible_subset.groupby(["branch", "model_name"], as_index=False)
-        .agg(
-            mean_outer_test_mae=("outer_test_mae", "mean"),
-            std_outer_test_mae=("outer_test_mae", "std"),
-            n_outer_folds=("outer_test_year", "nunique"),
+        subset.groupby(["branch", "model_name"], as_index=False)
+        .agg(n_outer_folds=("outer_test_year", "nunique"), **metric_aggs)
+    )
+    for metric in CORE_METRICS:
+        std_col = f"std_outer_test_{metric}"
+        if std_col in agg.columns:
+            agg[std_col] = agg[std_col].fillna(0.0)
+
+    agg = agg.sort_values(
+        by="mean_outer_test_mae", ascending=True,
+    ).reset_index(drop=True)
+
+    agg["candidate_all_folds_outer_gap_flagged"] = agg.apply(
+        lambda r: _outer_gap_flagged_all_folds(subset, r["branch"], r["model_name"]),
+        axis=1,
+    )
+
+    primary_df = agg.head(CANDIDATE_PRIMARY_COUNT).copy()
+    primary_df["candidate_rank"] = list(range(1, len(primary_df) + 1))
+    primary_df["candidate_role"] = "primary"
+
+    primary_keys = set(zip(primary_df["branch"], primary_df["model_name"]))
+    used_keys = set(primary_keys)
+
+    # Precompute the pool of non-flagged candidates ranked by mean_outer_test_mae
+    non_flagged_pool = agg[~agg["candidate_all_folds_outer_gap_flagged"]].copy()
+    non_flagged_pool = non_flagged_pool[
+        ~non_flagged_pool.apply(
+            lambda r: (r["branch"], r["model_name"]) in primary_keys, axis=1,
         )
+    ].reset_index(drop=True)
+
+    backup_rows: list[pd.Series] = []
+    flagged_primaries = primary_df["candidate_all_folds_outer_gap_flagged"].sum()
+    pool_idx = 0
+    next_rank = len(primary_df) + 1
+    for _ in range(int(flagged_primaries)):
+        while pool_idx < len(non_flagged_pool):
+            candidate = non_flagged_pool.iloc[pool_idx]
+            pool_idx += 1
+            key = (candidate["branch"], candidate["model_name"])
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+            backup = candidate.copy()
+            backup["candidate_rank"] = next_rank
+            backup["candidate_role"] = "backup"
+            backup_rows.append(backup)
+            next_rank += 1
+            break
+
+    combined = primary_df if not backup_rows else pd.concat(
+        [primary_df, pd.DataFrame(backup_rows)], ignore_index=True,
     )
-    agg["std_outer_test_mae"] = agg["std_outer_test_mae"].fillna(0.0)
 
-    # Tolerance-based selection: prefer simpler model among near-best candidates
-    best_mae = float(agg["mean_outer_test_mae"].min())
-    tolerance_threshold = best_mae * (1.0 + SELECTION_TOLERANCE)
-    eligible = agg[agg["mean_outer_test_mae"] <= tolerance_threshold].copy()
-
-    eligible["complexity"] = eligible["model_name"].map(MODEL_COMPLEXITY_RANK)
-    eligible = eligible.sort_values(
-        ["complexity", "mean_outer_test_mae"], ascending=[True, True],
-    )
-    winner = eligible.iloc[0]
-
-    return {
-        "outer_strategy": outer_strategy,
-        "target": target,
-        "branch": str(winner["branch"]),
-        "model_name": str(winner["model_name"]),
-        "mean_outer_test_mae": float(winner["mean_outer_test_mae"]),
-        "std_outer_test_mae": float(winner["std_outer_test_mae"]),
-        "n_outer_folds": int(winner["n_outer_folds"]),
-        "selection_tolerance": SELECTION_TOLERANCE,
-        "tolerance_threshold": tolerance_threshold,
-    }
+    combined.insert(0, "outer_strategy", outer_strategy)
+    combined.insert(1, "target", target)
+    return combined.to_dict(orient="records")
 
 
 def select_winners(outer_results_df: pd.DataFrame) -> pd.DataFrame:
-    """Select best (branch, model_name) per (strategy, target)."""
+    """Return top-3-to-6 candidates per (strategy, target).
+
+    The output schema extends the legacy winners.csv: every primary candidate
+    (rank 1..CANDIDATE_PRIMARY_COUNT) plus non-flagged backups when a primary
+    is flagged by the outer-generalization-gap audit. All returned candidates
+    go through final refit.
+    """
     successful = outer_results_df[outer_results_df["status"] == "ok"].copy()
     if successful.empty:
         raise RuntimeError("No successful outer runs available.")
 
-    winners = [
-        _select_winner_for_pair(successful, strategy, target)
-        for strategy in ACTIVE_OUTER_STRATEGIES
-        for target in ACTIVE_TARGETS
-    ]
+    rows: list[dict[str, Any]] = []
+    for strategy in ACTIVE_OUTER_STRATEGIES:
+        for target in ACTIVE_TARGETS:
+            rows.extend(_select_candidates_for_pair(successful, strategy, target))
 
-    if not winners:
+    if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(winners).reset_index(drop=True)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 # --- Error row helper ---
@@ -626,8 +700,8 @@ def _make_error_row(
         "model_name": model_name,
         "best_params_json": "",
         "error": error,
-        "overfit_excluded": False,
-        "overfit_gap_ratio": 0.0,
+        "inner_gap_flagged": False,
+        "outer_gap_flagged": False,
         "artifact_path": "",
         **{f: np.nan for f in _ERROR_ROW_NAN_FIELDS},
     }
@@ -700,23 +774,30 @@ def _evaluate_single_model(
         "best_params_json": serialize_params(best_params),
         "penalized_cv_loss": tuning_result["penalized_cv_loss"],
         "gap_penalty": tuning_result["gap_penalty"],
-        "cv_train_mean_mae": tuning_result["cv_train_mean_mae"],
-        "cv_mean_mae": tuning_result["cv_mean_mae"],
-        "cv_mae_gap_abs": tuning_result["cv_mae_gap_abs"],
-        "cv_mae_gap_ratio": tuning_result["cv_mae_gap_ratio"],
-        "cv_positive_gap_fold_share": tuning_result["cv_positive_gap_fold_share"],
+        "inner_positive_gap_fold_share": tuning_result.get("inner_positive_gap_fold_share", float("nan")),
         "folds_used": tuning_result["folds_used"],
         "trial_count": tuning_result["trial_count"],
         "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
         "outer_train_rows": int(len(x_train)),
         "outer_test_rows": int(len(x_test)),
         "feature_count": int(len(selected_cols)),
-        "outer_train_mae": train_metrics["mae"],
-        "outer_test_mae": test_metrics["mae"],
         "error": "",
         "artifact": artifact,
     }
-    result_row.update(classify_overfitting(result_row))
+    for key, value in tuning_result.items():
+        if (
+            key.startswith("inner_train_mean_")
+            or key.startswith("inner_val_mean_")
+            or key.startswith("inner_val_std_")
+            or key.startswith("inner_train_val_gap_")
+        ):
+            result_row[key] = float(value)
+    for metric in CORE_METRICS:
+        if metric in train_metrics:
+            result_row[f"outer_train_{metric}"] = float(train_metrics[metric])
+        if metric in test_metrics:
+            result_row[f"outer_test_{metric}"] = float(test_metrics[metric])
+    result_row.update(classify_fold_gaps(result_row))
     return result_row, trial_rows
 
 
@@ -867,11 +948,15 @@ def run() -> None:
     logger.info(f"OUTER_TEST_YEARS={OUTER_TEST_YEARS}")
     logger.info(f"N_TEMPORAL_CV_FOLDS={N_TEMPORAL_CV_FOLDS}")
     logger.info(f"TRAIN_START_YEAR={TRAIN_START_YEAR}")
-    logger.info(f"SELECTION_TOLERANCE={SELECTION_TOLERANCE}")
+    logger.info(f"CANDIDATE_PRIMARY_COUNT={CANDIDATE_PRIMARY_COUNT}")
     logger.info(f"BOOTSTRAP_ITERATIONS={FINAL_BOOTSTRAP_ITERATIONS}")
     logger.info(f"TUNING_BUDGET={TUNING_BUDGET_SECONDS}s")
     logger.info(f"GAP_PENALTY_WEIGHT={GAP_PENALTY_WEIGHT}, GAP_RATIO_CAP={GAP_RATIO_CAP}")
-    logger.info(f"OVERFIT_THRESHOLD={OVERFIT_GAP_RATIO_THRESHOLD}")
+    logger.info(
+        f"OVERFIT_INNER_GAP_RATIO_THRESHOLD={OVERFIT_INNER_GAP_RATIO_THRESHOLD} "
+        f"OUTER_GAP_ABS_THRESHOLD={OUTER_GAP_ABS_THRESHOLD} "
+        f"OUTER_GAP_REL_THRESHOLD={OUTER_GAP_REL_THRESHOLD}"
+    )
     logger.info(f"N_FEATURES={N_FEATURES_TO_SELECT}")
 
     if TRAIN_START_YEAR is not None:
@@ -984,11 +1069,11 @@ def run() -> None:
     logger.info("=" * 80)
     if not winners_df.empty:
         logger.info(
-            f"\nWinners:\n"
-            f"{winners_df[['outer_strategy', 'target', 'branch', 'model_name', 'mean_outer_test_mae', 'std_outer_test_mae']].to_string(index=False)}"
+            f"\nCandidates:\n"
+            f"{winners_df[['outer_strategy', 'target', 'branch', 'model_name', 'candidate_rank', 'candidate_role', 'mean_outer_test_mae', 'std_outer_test_mae']].to_string(index=False)}"
         )
     if not final_results_df.empty:
         logger.info(
             f"\nFinal results:\n"
-            f"{final_results_df[['outer_strategy_source', 'target', 'model_name', 'test_mae', 'test_r2']].to_string(index=False)}"
+            f"{final_results_df[['outer_strategy_source', 'target', 'branch', 'model_name', 'candidate_rank', 'candidate_role', 'final_test_mae', 'final_test_r2']].to_string(index=False)}"
         )

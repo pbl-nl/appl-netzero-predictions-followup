@@ -110,19 +110,23 @@ Key thresholds: `ROW_MISSINGNESS_THRESHOLD=0.30`, `SPARSE_COLUMN_THRESHOLD=0.95`
 Entry point: `__main__.py` -> `core.py::run()`
 
 **Nested CV structure** (`core.py`):
-- Outer loop: 4 test years (2018-2021) x 2 strategies (temporal/random CV) x 2 branches x 3 targets x 6 models = 288 evaluations
+- Outer loop: 4 test years (2018-2021) x 2 strategies (temporal/random CV) x 2 branches x 3 targets x `len(ACTIVE_MODELS)` models
 - Inner loop: Hyperopt (TPE) tuning with time-budgeted search (`TUNING_BUDGET_SECONDS=240s`)
-- Penalized CV loss: `cv_mean_mae * (1 + gap_penalty)` where gap_penalty derives from train/val overfitting gap
-- Winner selection per (strategy, branch, target): lowest penalized CV loss among non-overfit models (`gap_ratio < 0.50`), ties broken by `MODEL_COMPLEXITY_RANK`
+- Penalized CV loss: `inner_val_mean_mae * (1 + gap_penalty)` where gap_penalty derives from the inner train/val gap (audit-only for selection)
+- Candidate selection per (strategy, target): rank all (branch, model) combos by mean `outer_test_mae` across outer folds; take top `CANDIDATE_PRIMARY_COUNT=3` as **primary**. For any primary whose `candidate_all_folds_outer_gap_flagged=True`, append the next-best non-flagged combo as **backup**. Result: 3–6 rows per pair in `winners.csv`, ALL of which are refit at the final stage.
+- Metrics tracked at every stage (inner_train, inner_val, outer_train, outer_test, final_train, final_test): `mae`, `mse`, `rmse`, `r2`, `explained_variance`.
+- Two overfitting audits, both non-gating:
+  - **Inner train-vs-val gap** (audit-only): `inner_train_val_gap_rel_mae ≥ OVERFIT_INNER_GAP_RATIO_THRESHOLD=0.50` → `inner_gap_flagged`; aggregates to `candidate_all_folds_inner_gap_flagged`.
+  - **Outer generalization gap** (primary audit): `outer_test_mae − inner_val_mean_mae`; `outer_gap_flagged` fires when abs > `OUTER_GAP_ABS_THRESHOLD=0.1` **AND** rel > `OUTER_GAP_REL_THRESHOLD=0.5`. `candidate_all_folds_outer_gap_flagged` triggers the backup-candidate promotion above.
 
 **Final refit**: Winners are retrained on all pre-2022 data, with 2022 as final holdout. Test set is preprocessed twice: "scored" (with row dropping) for metrics, "all-country" (without dropping) for full predictions.
 
 **Key modules**:
 - `config.py` — All hyperparameters, active models/targets/branches, tuning budgets, output paths
-- `helpers.py` — `build_model()`, `get_hyperopt_space()`, `evaluate_metrics()` (MAE/RMSE/R2), `compute_penalized_cv_objective()`
+- `helpers.py` — `build_model()`, `get_hyperopt_space()`, `evaluate_metrics()` (MAE/MSE/RMSE/R²/explained_variance), `compute_penalized_cv_objective()`
 - `data_preparation.py` — Preprocessor caching (joblib + MD5 config hash validation), fold generation (`make_expanding_year_folds`, `make_random_folds`)
 - `bootstrap.py` — 200-iteration bootstrap refit via `ProcessPoolExecutor`; produces mean, std, p05, p95 per country
-- `overfitting.py` — `classify_overfitting()` with threshold=0.50, cap=3.0; `build_overfitting_audit_df()`
+- `overfitting.py` — `classify_fold_gaps()` producing `inner_gap_flagged` + `outer_gap_flagged` and their gap numerics; `build_overfitting_audit_df()` adds candidate-level aggregates and `selected_as_primary`/`selected_as_backup` flags
 
 Training uses `ProcessPoolExecutor` for parallel combo execution.
 
@@ -149,6 +153,8 @@ Converts training outputs into thesis-ready artifacts. Auto-discovers the latest
 
 **Important column name difference**: `outer_results.csv` / `winners.csv` use `outer_strategy`; `final_results.csv` / `final_prediction_summary.csv` use `outer_strategy_source`. `loader.apply_filters()` handles both.
 
+**Metric schema (stage-explicit)**: every metric column is prefixed by stage — `inner_train_mean_{metric}`, `inner_val_mean_{metric}`, `inner_val_std_{metric}`, `outer_train_{metric}`, `outer_test_{metric}`, `final_train_{metric}`, `final_test_{metric}` — where `{metric} ∈ {mae, mse, rmse, r2, explained_variance}`. Gap columns use `{between}_gap_{abs|rel}_{metric}` (e.g. `inner_train_val_gap_rel_mae`, `outer_generalization_gap_abs_mae`). Audit flags: `inner_gap_flagged`, `outer_gap_flagged`, `candidate_all_folds_inner_gap_flagged`, `candidate_all_folds_outer_gap_flagged`. `winners.csv` additionally carries `candidate_rank` and `candidate_role` (`primary`/`backup`), and these propagate into `final_results.csv`, `final_bootstrap_predictions.csv`, `final_prediction_summary.csv`.
+
 **Output structure**:
 ```
 results/post_analysis_<timestamp>/
@@ -166,11 +172,11 @@ The reproduction scripts (`reproduce_old.py`, `reproduce_new.py`) are ~100K-line
 
 ## Key Design Decisions
 
-- **Overfitting prevention** is a core concern: penalized CV loss, gap-ratio thresholds (0.50), and systematic auditing via `overfitting_audit.csv`
+- **Overfitting prevention** is handled at tuning time via the `gap_penalty` inside `compute_penalized_cv_objective` (biases Hyperopt against pathological inner train/val gaps). The `inner_train_val_gap_rel_mae ≥ 0.50` flag (`inner_gap_flagged`) is reported in `overfitting_audit.csv` for transparency but is never enforced. The **outer generalization gap** (`outer_gap_flagged`: `outer_test_mae − inner_val_mean_mae` absolute > 0.1 AND relative > 0.5) is the primary audit signal, and its candidate-level aggregate (`candidate_all_folds_outer_gap_flagged`) triggers appending a non-flagged backup candidate per `CANDIDATE_PRIMARY_COUNT=3` primary; the direct measurement (mean `outer_test_mae`) still governs ranking.
 - **Three target variables** (linear, optimistic, pessimistic) represent different net-zero scenario assumptions via scenario alpha values
 - **Year 2022 is the final holdout** — never used in outer CV folds, only for final evaluation
 - **No formal test suite** — validation relies on nested CV metrics and reproduction scripts
-- **Active models**: huber, bayesian_ridge, extra_trees, gradient_boosting, hist_gradient_boosting, adaboost
+- **Model registry**: `ACTIVE_MODELS` in `config.py` is the source of truth; the available registry is `ridge, elasticnet, xgboost, svr, random_forest, mlp, extra_trees, hist_gradient_boosting, adaboost, lightgbm, catboost, kernel_ridge` (the old `huber, bayesian_ridge, gradient_boosting, ngboost, stacking` entries were removed)
 - **Git LFS** tracks all files under `data/` and `results/`; if CSVs appear as pointer files, run `git lfs pull`
 - **Preprocessor cache** in `data/preprocessed/` is invalidated by config hash changes; force rebuild with `--force` flag
 - **Commit style**: short prefixes like `ADDED:`, `CHANGED:`, `FIXED:`, `REMOVED:`

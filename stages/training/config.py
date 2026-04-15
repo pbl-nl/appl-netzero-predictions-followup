@@ -30,8 +30,8 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 5000
 
-# ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp"]
-ACTIVE_MODELS = ["huber", "bayesian_ridge", "extra_trees", "gradient_boosting", "hist_gradient_boosting", "adaboost"]
+# ACTIVE_MODELS = []
+ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp", "extra_trees", "hist_gradient_boosting", "adaboost", "lightgbm", "catboost", "kernel_ridge"]
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -53,22 +53,25 @@ TRAIN_START_YEAR: int | None = None
 # NEVER CHANGE THIS VALUE — it is derived from OUTER_TEST_YEARS and N_TEMPORAL_CV_FOLDS
 MAX_TRAIN_START_YEAR = min(OUTER_TEST_YEARS) - N_TEMPORAL_CV_FOLDS - 1  # = 2012
 
-# Overfitting-control selection rule for winner selection
-# Models within SELECTION_TOLERANCE of the best mean outer test MAE are treated as
-# equivalent; among them the simplest model is preferred.
-SELECTION_TOLERANCE = 0.01  # 1% relative tolerance
+# Candidate selection rule
+# For each (strategy, target) pair, rank all (branch, model_name) combos by mean
+# outer_test_mae across outer folds. Take top CANDIDATE_PRIMARY_COUNT as primary.
+# For any primary with candidate_all_folds_outer_gap_flagged=True, append the
+# next-best non-flagged candidate as backup. Result: between 3 and 6 per pair.
+CANDIDATE_PRIMARY_COUNT = 3
+SELECTION_TOLERANCE = 0.01  # legacy knob, kept for reference tables
 MODEL_COMPLEXITY_RANK: dict[str, int] = {
     "ridge": 1,
     "elasticnet": 2,
-    "bayesian_ridge": 3,
-    "huber": 4,
     "svr": 5,
+    "kernel_ridge": 5,
     "adaboost": 6,
     "random_forest": 7,
     "extra_trees": 8,
-    "gradient_boosting": 9,
     "hist_gradient_boosting": 10,
     "xgboost": 11,
+    "lightgbm": 11,
+    "catboost": 12,
     "mlp": 12,
 }
 MAX_LOSS = 1e12
@@ -76,27 +79,42 @@ MODEL_RANDOM_STATE = PIPELINE_RANDOM_STATE
 MODEL_N_JOBS = 1
 
 MAX_TUNING_TRIALS_PER_MODEL: dict[str, int] = {
-    "ridge": 20,
-    "elasticnet": 30,
-    "xgboost": 40,
-    "svr": 20,
-    "random_forest": 30,
-    "mlp": 30,
-    "huber": 20,
-    "bayesian_ridge": 15,
-    "extra_trees": 30,
-    "gradient_boosting": 35,
-    "hist_gradient_boosting": 35,
-    "adaboost": 25,
+    "ridge": 25,
+    "elasticnet": 40,
+    "xgboost": 50,
+    "svr": 30,
+    "random_forest": 40,
+    "mlp": 40,
+    "extra_trees": 40,
+    "hist_gradient_boosting": 45,
+    "adaboost": 35,
+    "kernel_ridge": 35,
+    "lightgbm": 50,
+    "catboost": 45,
 }
 
-# Penalization: penalized_loss = cv_mean_mae * (1 + gap_penalty)
-# where gap_penalty = clamp(cv_mae_gap_ratio, 0, GAP_RATIO_CAP) * GAP_PENALTY_WEIGHT
+# Penalization: penalized_loss = inner_val_mean_mae * (1 + gap_penalty)
+# where gap_penalty = clamp(inner_train_val_gap_rel_mae, 0, GAP_RATIO_CAP) * GAP_PENALTY_WEIGHT
 GAP_PENALTY_WEIGHT = 0.5
 GAP_RATIO_CAP = 3.0
 
-# Overfitting: exclude if cv_mae_gap_ratio >= threshold
-OVERFIT_GAP_RATIO_THRESHOLD = 0.50
+# Stabilizer for relative gap denominators. Used wherever a gap_rel metric is
+# computed to avoid blowing up when the denominator MAE is very small.
+REL_GAP_FLOOR = 0.05
+
+# Inner train-vs-validation gap flag (audit-only): per-fold flag set when the
+# relative MAE gap between inner training and inner validation exceeds the
+# threshold. This signal does NOT gate candidate selection; it is reported for
+# transparency. Tuning-time gap_penalty biases Hyperopt against pathological fits.
+OVERFIT_INNER_GAP_RATIO_THRESHOLD = 0.50
+
+# Outer generalization gap flag (primary audit): fires when the held-out outer
+# test error both exceeds the inner validation error by an absolute margin AND
+# the relative gap exceeds the relative threshold. Both must be true — absolute
+# is primary (keeps us from flagging trivially small gaps), relative is the
+# stabilizer.
+OUTER_GAP_ABS_THRESHOLD = 0.1
+OUTER_GAP_REL_THRESHOLD = 0.5
 
 # Feature selection
 N_FEATURES_TO_SELECT = 30
@@ -124,22 +142,27 @@ OVERFITTING_AUDIT_PATH = OUTPUT_DIR / "overfitting_audit.csv"
 OUTER_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "outer_winners"
 FINAL_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "final"
 
+# Five core metrics tracked at every evaluation stage.
+CORE_METRICS = ("mae", "mse", "rmse", "r2", "explained_variance")
+
 FINAL_RESULTS_COLUMNS = [
     "target",
     "outer_strategy_source",
     "branch",
     "model_name",
+    "candidate_rank",
+    "candidate_role",
     "best_params_json",
     "final_train_rows",
     "final_test_rows",
     "feature_count",
     "bootstrap_iterations",
-    "final_train_mae",
-    "final_train_rmse",
-    "final_train_r2",
-    "test_mae",
-    "test_rmse",
-    "test_r2",
+    # final_train_{metric} for each of the 5 metrics
+    "final_train_mae", "final_train_mse", "final_train_rmse",
+    "final_train_r2", "final_train_explained_variance",
+    # final_test_{metric} for each of the 5 metrics
+    "final_test_mae", "final_test_mse", "final_test_rmse",
+    "final_test_r2", "final_test_explained_variance",
     "artifact_path",
 ]
 FINAL_PREDICTIONS_COLUMNS = [
@@ -150,6 +173,8 @@ FINAL_PREDICTIONS_COLUMNS = [
     "target",
     "branch",
     "model_name",
+    "candidate_rank",
+    "candidate_role",
     "iteration",
     "prediction",
 ]
@@ -158,6 +183,8 @@ FINAL_PREDICTION_SUMMARY_COLUMNS = [
     "target",
     "branch",
     "model_name",
+    "candidate_rank",
+    "candidate_role",
     COUNTRY_COL,
     YEAR_COL,
     "actual",

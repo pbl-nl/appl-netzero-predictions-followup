@@ -16,3 +16,5 @@ geopandas==1.1.2
 pip==26.0.1
 setuptools==80.9.0
 filelock==3.25.2
+lightgbm==4.5.0
+catboost==1.2.10

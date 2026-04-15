@@ -10,18 +10,26 @@ from hyperopt.pyll.base import scope
 from sklearn.ensemble import (
     AdaBoostRegressor,
     ExtraTreesRegressor,
-    GradientBoostingRegressor,
     HistGradientBoostingRegressor,
     RandomForestRegressor,
 )
-from sklearn.linear_model import BayesianRidge, ElasticNet, HuberRegressor, Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.metrics import (
+    explained_variance_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
 from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
 
 from stages.training.config import (
+    CORE_METRICS,
     FINAL_PREDICTION_SUMMARY_COLUMNS,
     FINAL_PREDICTIONS_COLUMNS,
     FINAL_RESULTS_COLUMNS,
@@ -32,6 +40,7 @@ from stages.training.config import (
     OUTPUT_DIR,
     OUTER_ARTIFACTS_DIR,
     FINAL_ARTIFACTS_DIR,
+    REL_GAP_FLOOR,
     SVR_MAX_ITER,
     TRIALS_PATH,
 )
@@ -70,40 +79,61 @@ def serialize_params(params: dict[str, Any]) -> str:
 
 
 def evaluate_metrics(y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    """Compute the five core metrics: mae, mse, rmse, r2, explained_variance."""
+    mse = float(mean_squared_error(y_true, y_pred))
+    rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_true, y_pred))
-    r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else float("nan")
-    return {"mae": mae, "rmse": rmse, "r2": r2}
-
-
-def relative_gap(higher: float, lower: float, epsilon: float = 1e-8) -> float:
-    return float((higher - lower) / max(abs(lower), epsilon))
-
-
-def metric_gap_summary(
-    train_metrics: dict[str, float],
-    eval_metrics: dict[str, float],
-    prefix: str,
-) -> dict[str, float]:
+    if len(y_true) > 1:
+        r2 = float(r2_score(y_true, y_pred))
+        ev = float(explained_variance_score(y_true, y_pred))
+    else:
+        r2 = float("nan")
+        ev = float("nan")
     return {
-        f"{prefix}_mae_gap_abs": float(eval_metrics["mae"] - train_metrics["mae"]),
-        f"{prefix}_mae_gap_ratio": relative_gap(eval_metrics["mae"], train_metrics["mae"]),
+        "mae": mae,
+        "mse": mse,
+        "rmse": rmse,
+        "r2": r2,
+        "explained_variance": ev,
     }
+
+
+def _relative_gap_floored(numerator: float, denominator: float, floor: float = REL_GAP_FLOOR) -> float:
+    """Relative gap with a denominator floor to stabilize small-magnitude ratios."""
+    return float(numerator / max(abs(denominator), floor))
 
 
 def summarize_cv_metrics(fold_metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Aggregate inner-CV fold metrics into inner_train/inner_val mean/std plus
+    the audit-only inner train-vs-validation gap.
+
+    Each fold_metrics entry has keys: fold_id, train_{metric}, val_{metric} for
+    every metric in CORE_METRICS.
+    """
     df = pd.DataFrame(fold_metrics)
-    positive_gap_share = float((df["val_mae"] > df["train_mae"]).mean())
     train_mae = float(df["train_mae"].mean())
     val_mae = float(df["val_mae"].mean())
-    summary = {
-        "cv_train_mean_mae": train_mae,
-        "cv_mean_mae": val_mae,
-        "cv_mae_gap_abs": float(val_mae - train_mae),
-        "cv_mae_gap_ratio": relative_gap(val_mae, train_mae),
-        "cv_positive_gap_fold_share": positive_gap_share,
+    positive_gap_share = float((df["val_mae"] > df["train_mae"]).mean())
+
+    summary: dict[str, float] = {
+        "inner_positive_gap_fold_share": positive_gap_share,
         "folds_used": int(len(fold_metrics)),
     }
+    for metric in CORE_METRICS:
+        train_col = f"train_{metric}"
+        val_col = f"val_{metric}"
+        if train_col not in df.columns or val_col not in df.columns:
+            continue
+        train_mean = float(df[train_col].mean())
+        val_mean = float(df[val_col].mean())
+        val_std = float(df[val_col].std(ddof=0))
+        summary[f"inner_train_mean_{metric}"] = train_mean
+        summary[f"inner_val_mean_{metric}"] = val_mean
+        summary[f"inner_val_std_{metric}"] = val_std
+        summary[f"inner_train_val_gap_abs_{metric}"] = float(val_mean - train_mean)
+        summary[f"inner_train_val_gap_rel_{metric}"] = _relative_gap_floored(
+            val_mean - train_mean, train_mean
+        )
     return summary
 
 
@@ -111,9 +141,9 @@ def summarize_cv_metrics(fold_metrics: list[dict[str, float]]) -> dict[str, floa
 
 
 def compute_penalized_cv_objective(cv_summary: dict[str, Any]) -> dict[str, float]:
-    gap_ratio = max(0.0, cv_summary["cv_mae_gap_ratio"])
+    gap_ratio = max(0.0, cv_summary.get("inner_train_val_gap_rel_mae", 0.0))
     gap_penalty = min(gap_ratio, GAP_RATIO_CAP) * GAP_PENALTY_WEIGHT
-    penalized_loss = cv_summary["cv_mean_mae"] * (1.0 + gap_penalty)
+    penalized_loss = cv_summary["inner_val_mean_mae"] * (1.0 + gap_penalty)
     return {
         "penalized_cv_loss": penalized_loss,
         "gap_penalty": gap_penalty,
@@ -184,106 +214,119 @@ def empty_final_prediction_summary_df() -> pd.DataFrame:
 
 def get_hyperopt_space(model_name: str) -> dict[str, Any]:
     if model_name == "ridge":
-        return {"alpha": hp.loguniform("alpha", np.log(1.0), np.log(1e4))}
+        return {"alpha": hp.loguniform("alpha", np.log(1e-5), np.log(1e3))}
     if model_name == "elasticnet":
         return {
-            "alpha": hp.loguniform("alpha", np.log(1e-2), np.log(1e2)),
-            "l1_ratio": hp.uniform("l1_ratio", 0.40, 0.95),
+            "alpha": hp.loguniform("alpha", np.log(1e-5), np.log(1e2)),
+            "l1_ratio": hp.uniform("l1_ratio", 0.0, 1.0),
         }
     if model_name == "xgboost":
         return {
-            "n_estimators": scope.int(hp.quniform("n_estimators", 25, 120, 5)),
-            "max_depth": scope.int(hp.quniform("max_depth", 1, 2, 1)),
-            "learning_rate": hp.loguniform("learning_rate", np.log(0.02), np.log(0.08)),
-            "subsample": hp.uniform("subsample", 0.50, 0.85),
-            "colsample_bytree": hp.uniform("colsample_bytree", 0.40, 0.80),
-            "reg_lambda": hp.loguniform("reg_lambda", np.log(5.0), np.log(100.0)),
-            "reg_alpha": hp.loguniform("reg_alpha", np.log(0.1), np.log(20.0)),
-            "min_child_weight": hp.quniform("min_child_weight", 10.0, 40.0, 2.0),
-            "gamma": hp.uniform("gamma", 1.0, 10.0),
+            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 500, 10)),
+            "max_depth": scope.int(hp.quniform("max_depth", 2, 10, 1)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
+            "subsample": hp.uniform("subsample", 0.5, 1.0),
+            "colsample_bytree": hp.uniform("colsample_bytree", 0.4, 1.0),
+            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-4), np.log(100.0)),
+            "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-4), np.log(50.0)),
+            "min_child_weight": hp.quniform("min_child_weight", 1.0, 50.0, 1.0),
+            "gamma": hp.uniform("gamma", 0.0, 10.0),
         }
     if model_name == "svr":
         return {
-            "kernel": hp.choice("kernel", ["linear", "rbf"]),
-            "C": hp.loguniform("C", np.log(0.05), np.log(5.0)),
-            "epsilon": hp.loguniform("epsilon", np.log(0.05), np.log(0.5)),
-            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(5e-2)),
+            "kernel": hp.choice("kernel", ["linear", "rbf", "poly", "sigmoid"]),
+            "C": hp.loguniform("C", np.log(1e-3), np.log(1e3)),
+            "epsilon": hp.loguniform("epsilon", np.log(1e-4), np.log(1.0)),
+            "gamma": hp.loguniform("gamma", np.log(1e-6), np.log(10.0)),
         }
     if model_name == "random_forest":
         return {
-            "n_estimators": scope.int(hp.quniform("n_estimators", 100, 300, 25)),
-            "max_depth": hp.choice("max_depth", [3, 4, 5]),
-            "min_samples_split": scope.int(hp.quniform("min_samples_split", 20, 100, 5)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 60, 5)),
-            "max_features": hp.choice("max_features", [0.2, 0.3, 0.4, "sqrt"]),
+            "n_estimators": scope.int(hp.quniform("n_estimators", 100, 500, 25)),
+            "max_depth": hp.choice("max_depth", [None, 5, 10, 15, 20]),
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 2, 100, 2)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 1, 60, 1)),
+            "max_features": hp.choice("max_features", [0.2, 0.3, 0.5, 0.7, "sqrt", "log2"]),
         }
     if model_name == "mlp":
         return {
             "hidden_layer_sizes": hp.choice(
                 "hidden_layer_sizes",
-                [(16,), (32,), (32, 16), (64,), (64, 32)],
+                [(16,), (32,), (64,), (128,),
+                 (32, 16), (64, 32), (100, 100), (128, 64),
+                 (64, 64, 64), (128, 64, 32)],
             ),
             "activation": hp.choice("activation", ["relu", "tanh"]),
-            "alpha": hp.loguniform("alpha", np.log(1e-3), np.log(10.0)),
-            "learning_rate_init": hp.loguniform("learning_rate_init", np.log(1e-4), np.log(1e-3)),
-            "batch_size": hp.choice("batch_size", [64, 128, 256]),
-        }
-    if model_name == "huber":
-        return {
-            "epsilon": hp.uniform("epsilon", 1.1, 2.0),
-            "alpha": hp.loguniform("alpha", np.log(1e-2), np.log(1e3)),
-            "max_iter": scope.int(hp.quniform("max_iter", 200, 500, 50)),
-        }
-    if model_name == "bayesian_ridge":
-        return {
-            "alpha_1": hp.loguniform("alpha_1", np.log(1e-7), np.log(1e-4)),
-            "alpha_2": hp.loguniform("alpha_2", np.log(1e-7), np.log(1e-4)),
-            "lambda_1": hp.loguniform("lambda_1", np.log(1e-7), np.log(1e-4)),
-            "lambda_2": hp.loguniform("lambda_2", np.log(1e-7), np.log(1e-4)),
+            "alpha": hp.loguniform("alpha", np.log(1e-6), np.log(1e-1)),
+            "learning_rate_init": hp.loguniform(
+                "learning_rate_init", np.log(1e-5), np.log(1e-1),
+            ),
+            "batch_size": hp.choice("batch_size", [32, 64, 128, 256]),
         }
     if model_name == "extra_trees":
         return {
-            "n_estimators": scope.int(hp.quniform("n_estimators", 100, 300, 25)),
-            "max_depth": hp.choice("max_depth", [3, 4, 5]),
-            "min_samples_split": scope.int(hp.quniform("min_samples_split", 20, 100, 5)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 60, 5)),
-            "max_features": hp.choice("max_features", [0.2, 0.3, 0.4, "sqrt"]),
-        }
-    if model_name == "gradient_boosting":
-        return {
-            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 200, 10)),
-            "max_depth": scope.int(hp.quniform("max_depth", 1, 3, 1)),
-            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.1)),
-            "subsample": hp.uniform("subsample", 0.5, 0.85),
-            "min_samples_split": scope.int(hp.quniform("min_samples_split", 20, 80, 5)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 15, 50, 5)),
-            "max_features": hp.choice("max_features", [0.3, 0.5, 0.7, "sqrt"]),
+            "n_estimators": scope.int(hp.quniform("n_estimators", 100, 500, 25)),
+            "max_depth": hp.choice("max_depth", [None, 5, 10, 15, 20]),
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 2, 100, 2)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 1, 60, 1)),
+            "max_features": hp.choice("max_features", [0.2, 0.3, 0.5, 0.7, "sqrt", "log2"]),
         }
     if model_name == "hist_gradient_boosting":
         return {
-            "max_iter": scope.int(hp.quniform("max_iter", 50, 200, 10)),
-            "max_depth": scope.int(hp.quniform("max_depth", 2, 4, 1)),
-            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.1)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 60, 5)),
-            "max_leaf_nodes": scope.int(hp.quniform("max_leaf_nodes", 8, 31, 1)),
-            "l2_regularization": hp.loguniform("l2_regularization", np.log(0.1), np.log(50.0)),
+            "max_iter": scope.int(hp.quniform("max_iter", 100, 500, 10)),
+            "max_depth": hp.choice("max_depth", [None, 4, 6, 8, 10]),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 5, 80, 5)),
+            "max_leaf_nodes": scope.int(hp.quniform("max_leaf_nodes", 8, 127, 1)),
+            "l2_regularization": hp.loguniform(
+                "l2_regularization", np.log(1e-3), np.log(100.0),
+            ),
         }
     if model_name == "adaboost":
         return {
-            "n_estimators": scope.int(hp.quniform("n_estimators", 20, 100, 5)),
-            "learning_rate": hp.loguniform("learning_rate", np.log(0.01), np.log(0.5)),
-            "loss": hp.choice("loss", ["linear", "square"]),
+            "n_estimators": scope.int(hp.quniform("n_estimators", 25, 400, 5)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(2.0)),
+            "loss": hp.choice("loss", ["linear", "square", "exponential"]),
+            "base_max_depth": scope.int(hp.quniform("base_max_depth", 1, 6, 1)),
+        }
+    if model_name == "lightgbm":
+        return {
+            "boosting_type": hp.choice("boosting_type", ["gbdt", "dart"]),
+            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 500, 10)),
+            "max_depth": scope.int(hp.quniform("max_depth", 2, 8, 1)),
+            "num_leaves": scope.int(hp.quniform("num_leaves", 8, 128, 4)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.2)),
+            "min_child_samples": scope.int(hp.quniform("min_child_samples", 5, 80, 5)),
+            "subsample": hp.uniform("subsample", 0.5, 1.0),
+            "colsample_bytree": hp.uniform("colsample_bytree", 0.4, 1.0),
+            "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-4), np.log(50.0)),
+            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-4), np.log(100.0)),
+        }
+    if model_name == "catboost":
+        return {
+            "iterations": scope.int(hp.quniform("iterations", 100, 800, 25)),
+            "depth": scope.int(hp.quniform("depth", 3, 10, 1)),
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
+            "l2_leaf_reg": hp.loguniform("l2_leaf_reg", np.log(0.1), np.log(100.0)),
+            "random_strength": hp.loguniform("random_strength", np.log(0.01), np.log(50.0)),
+            "bagging_temperature": hp.uniform("bagging_temperature", 0.0, 1.0),
+        }
+    if model_name == "kernel_ridge":
+        return {
+            "alpha": hp.loguniform("alpha", np.log(1e-5), np.log(1e3)),
+            "kernel": hp.choice("kernel", ["rbf", "laplacian", "linear", "polynomial"]),
+            "gamma": hp.loguniform("gamma", np.log(1e-6), np.log(10.0)),
         }
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
 _INT_KEYS_BY_MODEL: dict[str, list[str]] = {
     "random_forest": ["n_estimators", "min_samples_split", "min_samples_leaf"],
-    "huber": ["max_iter"],
     "extra_trees": ["n_estimators", "min_samples_split", "min_samples_leaf"],
-    "gradient_boosting": ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf"],
-    "hist_gradient_boosting": ["max_iter", "max_depth", "min_samples_leaf", "max_leaf_nodes"],
-    "adaboost": ["n_estimators"],
+    "hist_gradient_boosting": ["max_iter", "min_samples_leaf", "max_leaf_nodes"],
+    "adaboost": ["n_estimators", "base_max_depth"],
+    "lightgbm": ["n_estimators", "max_depth", "num_leaves", "min_child_samples"],
+    "catboost": ["iterations", "depth"],
+    "xgboost": ["n_estimators", "max_depth"],
 }
 
 
@@ -304,7 +347,7 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
         return ElasticNet(
             alpha=float(params["alpha"]),
             l1_ratio=float(params["l1_ratio"]),
-            max_iter=10000,
+            max_iter=20000,
             random_state=random_state,
         )
     if model_name == "xgboost":
@@ -351,22 +394,8 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             batch_size=int(params["batch_size"]),
             early_stopping=True,
             n_iter_no_change=20,
-            max_iter=500,
+            max_iter=1000,
             random_state=random_state,
-        )
-    if model_name == "huber":
-        return HuberRegressor(
-            epsilon=float(params["epsilon"]),
-            alpha=float(params["alpha"]),
-            max_iter=int(params["max_iter"]),
-        )
-    if model_name == "bayesian_ridge":
-        return BayesianRidge(
-            alpha_1=float(params["alpha_1"]),
-            alpha_2=float(params["alpha_2"]),
-            lambda_1=float(params["lambda_1"]),
-            lambda_2=float(params["lambda_2"]),
-            max_iter=500,
         )
     if model_name == "extra_trees":
         return ExtraTreesRegressor(
@@ -378,21 +407,10 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             random_state=random_state,
             n_jobs=MODEL_N_JOBS,
         )
-    if model_name == "gradient_boosting":
-        return GradientBoostingRegressor(
-            n_estimators=int(params["n_estimators"]),
-            max_depth=int(params["max_depth"]),
-            learning_rate=float(params["learning_rate"]),
-            subsample=float(params["subsample"]),
-            min_samples_split=int(params["min_samples_split"]),
-            min_samples_leaf=int(params["min_samples_leaf"]),
-            max_features=params["max_features"],
-            random_state=random_state,
-        )
     if model_name == "hist_gradient_boosting":
         return HistGradientBoostingRegressor(
             max_iter=int(params["max_iter"]),
-            max_depth=int(params["max_depth"]),
+            max_depth=params["max_depth"],
             learning_rate=float(params["learning_rate"]),
             min_samples_leaf=int(params["min_samples_leaf"]),
             max_leaf_nodes=int(params["max_leaf_nodes"]),
@@ -401,12 +419,52 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             random_state=random_state,
         )
     if model_name == "adaboost":
-        base = DecisionTreeRegressor(max_depth=2, random_state=random_state)
+        base = DecisionTreeRegressor(
+            max_depth=int(params["base_max_depth"]),
+            random_state=random_state,
+        )
         return AdaBoostRegressor(
             estimator=base,
             n_estimators=int(params["n_estimators"]),
             learning_rate=float(params["learning_rate"]),
             loss=str(params["loss"]),
             random_state=random_state,
+        )
+    if model_name == "lightgbm":
+        return LGBMRegressor(
+            objective="regression_l1",
+            random_state=random_state,
+            n_jobs=MODEL_N_JOBS,
+            verbose=-1,
+            boosting_type=str(params["boosting_type"]),
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            num_leaves=int(params["num_leaves"]),
+            learning_rate=float(params["learning_rate"]),
+            min_child_samples=int(params["min_child_samples"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]),
+            reg_lambda=float(params["reg_lambda"]),
+        )
+    if model_name == "catboost":
+        return CatBoostRegressor(
+            iterations=int(params["iterations"]),
+            depth=int(params["depth"]),
+            learning_rate=float(params["learning_rate"]),
+            l2_leaf_reg=float(params["l2_leaf_reg"]),
+            random_strength=float(params["random_strength"]),
+            bagging_temperature=float(params["bagging_temperature"]),
+            loss_function="MAE",
+            random_seed=random_state,
+            thread_count=MODEL_N_JOBS,
+            verbose=False,
+            allow_writing_files=False,
+        )
+    if model_name == "kernel_ridge":
+        return KernelRidge(
+            alpha=float(params["alpha"]),
+            kernel=str(params["kernel"]),
+            gamma=float(params["gamma"]),
         )
     raise ValueError(f"Unsupported model name: {model_name}")

@@ -34,6 +34,7 @@ _WORKER_STATE: dict[str, Any] | None = None
 def build_prediction_summary(predictions_df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [
         "outer_strategy_source", "target", "branch", "model_name",
+        "candidate_rank", "candidate_role",
         COUNTRY_COL, YEAR_COL, "actual",
     ]
     summary_df = predictions_df.groupby(group_cols, as_index=False, dropna=False).agg(

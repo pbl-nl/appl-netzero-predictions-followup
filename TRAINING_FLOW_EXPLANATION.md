@@ -88,13 +88,11 @@ For each `(strategy, target)`:
 
 1. Filter to successful (`status == "ok"`) runs.
 
-2. **Candidate-level disqualification**: Group by `(branch, model_name)`. A candidate is disqualified only if ALL of its outer folds have `overfit_excluded = True`. Partially overfit candidates remain eligible.
+2. Aggregate `mean_outer_test_mae` per `(branch, model_name)` across outer test years. This is the direct generalization signal and governs selection. The inner-CV `overfit_excluded` flag is recorded in `overfitting_audit.csv` but no longer disqualifies candidates — the ratio can misfire when `cv_train_mean_mae` is near zero, and the tuning-time `gap_penalty` already biases Hyperopt against pathological train/val gaps.
 
-3. Among eligible candidates, aggregate `mean_outer_test_mae` across outer test years.
+3. **Tolerance-based selection**: Compute `tolerance_threshold = best_mae × (1 + SELECTION_TOLERANCE)`. Keep all candidates within this threshold.
 
-4. **Tolerance-based selection**: Compute `tolerance_threshold = best_mae × (1 + SELECTION_TOLERANCE)`. Keep all candidates within this threshold.
-
-5. **Complexity tiebreak**: Among near-best candidates, choose the one with the lowest `MODEL_COMPLEXITY_RANK` (simplest model).
+4. **Complexity tiebreak**: Among near-best candidates, choose the one with the lowest `MODEL_COMPLEXITY_RANK` (simplest model).
 
 Output: `winners.csv` and `overfitting_audit.csv`.
 
@@ -160,11 +158,10 @@ run()
   │           └─ Save outer artifact
   │
   ├─ Winner Selection
-  │   ├─ Disqualify candidates overfit in ALL folds
-  │   ├─ Aggregate mean outer test MAE
+  │   ├─ Aggregate mean outer test MAE per candidate
   │   ├─ Apply 1% tolerance rule
   │   ├─ Tiebreak by model complexity
-  │   └─ Write winners.csv, overfitting_audit.csv
+  │   └─ Write winners.csv, overfitting_audit.csv (overfit flags audit-only)
   │
   └─ Final Refit (parallel per winner)
       ├─ Load prepared final data from cache
