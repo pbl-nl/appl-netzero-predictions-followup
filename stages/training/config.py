@@ -23,15 +23,15 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 
-DEFAULT_CPU_WORKERS = max(1, (os.cpu_count() or 2) - 1)
+DEFAULT_CPU_WORKERS = max(1, os.cpu_count())
 FINAL_BOOTSTRAP_ITERATIONS = 200
 FINAL_BOOTSTRAP_MAX_WORKERS = DEFAULT_CPU_WORKERS
 TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 5000
 
-ACTIVE_MODELS = ["mlp", "hist_gradient_boosting", "kernel_ridge"]
-# ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp", "extra_trees", "hist_gradient_boosting", "adaboost", "lightgbm", "catboost", "kernel_ridge"]
+# ACTIVE_MODELS = ["mlp", "hist_gradient_boosting", "kernel_ridge"]
+ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge"] #
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -86,7 +86,7 @@ MAX_TUNING_TRIALS_PER_MODEL: dict[str, int] = {
     "ridge": 25,
     "elasticnet": 40,
     "xgboost": 50,
-    "svr": 30,
+    "svr": 60,
     "random_forest": 40,
     "mlp": 40,
     "extra_trees": 40,
