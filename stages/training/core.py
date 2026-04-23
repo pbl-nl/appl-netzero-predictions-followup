@@ -84,7 +84,7 @@ _ERROR_ROW_NAN_FIELDS = frozenset(
         "penalized_cv_loss", "gap_penalty",
         "inner_positive_gap_fold_share",
         "folds_used", "trial_count", "tuning_elapsed_seconds",
-        "outer_train_rows", "outer_test_rows", "feature_count",
+        "outer_train_rows", "outer_test_rows", "outer_test_rows_lenient", "feature_count",
     }
     | {f"inner_train_mean_{m}" for m in CORE_METRICS}
     | {f"inner_val_mean_{m}" for m in CORE_METRICS}
@@ -93,6 +93,7 @@ _ERROR_ROW_NAN_FIELDS = frozenset(
     | {f"inner_train_val_gap_rel_{m}" for m in CORE_METRICS}
     | {f"outer_train_{m}" for m in CORE_METRICS}
     | {f"outer_test_{m}" for m in CORE_METRICS}
+    | {f"outer_test_{m}_lenient" for m in CORE_METRICS}
     | {f"outer_generalization_gap_abs_{m}" for m in CORE_METRICS}
     | {f"outer_generalization_gap_rel_{m}" for m in CORE_METRICS}
 )
@@ -289,17 +290,19 @@ def evaluate_candidate_model(
 
 
 def _aggregate_bootstrap_results(
-    bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], np.ndarray]],
+    bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]],
     base_predictions: pd.DataFrame,
-) -> tuple[dict[str, float], dict[str, float], pd.DataFrame]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], pd.DataFrame]:
     """Aggregate bootstrap iteration results into mean metrics and a predictions DataFrame."""
     bootstrap_train_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics: list[dict[str, float]] = []
+    bootstrap_test_metrics_lenient: list[dict[str, float]] = []
     prediction_rows: list[pd.DataFrame] = []
 
-    for iteration_idx, train_metrics, scored_metrics, all_preds in bootstrap_results:
+    for iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds in bootstrap_results:
         bootstrap_train_metrics.append(train_metrics)
         bootstrap_test_metrics.append(scored_metrics)
+        bootstrap_test_metrics_lenient.append(scored_metrics_lenient)
         iter_preds = base_predictions.copy()
         iter_preds["iteration"] = iteration_idx + 1
         iter_preds["prediction"] = all_preds
@@ -307,6 +310,7 @@ def _aggregate_bootstrap_results(
 
     train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
     test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
+    test_metrics_lenient_df = pd.DataFrame(bootstrap_test_metrics_lenient)
     avg_train = {
         k: float(train_metrics_df[k].mean()) for k in CORE_METRICS
         if k in train_metrics_df.columns
@@ -315,9 +319,13 @@ def _aggregate_bootstrap_results(
         k: float(test_metrics_df[k].mean()) for k in CORE_METRICS
         if k in test_metrics_df.columns
     }
+    avg_test_lenient = {
+        k: float(test_metrics_lenient_df[k].mean()) for k in CORE_METRICS
+        if k in test_metrics_lenient_df.columns
+    }
     preds_df = pd.concat(prediction_rows, ignore_index=True)
 
-    return avg_train, avg_test, preds_df
+    return avg_train, avg_test, avg_test_lenient, preds_df
 
 
 def _save_final_artifact(
@@ -377,9 +385,11 @@ def _build_final_result_row(
     best_params: dict[str, Any],
     x_train: pd.DataFrame,
     x_test_scored: pd.DataFrame,
+    x_test_scored_lenient: pd.DataFrame,
     selected_cols: list[str],
     avg_train: dict[str, float],
     avg_test: dict[str, float],
+    avg_test_lenient: dict[str, float],
     artifact_path: Path,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
@@ -392,6 +402,7 @@ def _build_final_result_row(
         "best_params_json": serialize_params(best_params),
         "final_train_rows": int(len(x_train)),
         "final_test_rows": int(len(x_test_scored)),
+        "final_test_rows_lenient": int(len(x_test_scored_lenient)),
         "feature_count": int(len(selected_cols)),
         "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
         "artifact_path": str(artifact_path),
@@ -399,6 +410,7 @@ def _build_final_result_row(
     for metric in CORE_METRICS:
         row[f"final_train_{metric}"] = float(avg_train.get(metric, float("nan")))
         row[f"final_test_{metric}"] = float(avg_test.get(metric, float("nan")))
+        row[f"final_test_{metric}_lenient"] = float(avg_test_lenient.get(metric, float("nan")))
     return row
 
 
@@ -428,6 +440,8 @@ def _refit_single_winner(
     y_train = prepared["y_train"]
     x_test_scored = prepared["x_test_scored"]
     y_test_scored = prepared["y_test_scored"]
+    x_test_scored_lenient = prepared["x_test_scored_lenient"]
+    y_test_scored_lenient = prepared["y_test_scored_lenient"]
     x_test_all = prepared["x_test_all"]
     feature_columns = prepared["feature_columns"]
     selected_cols = prepared["selected_feature_columns"]
@@ -471,10 +485,13 @@ def _refit_single_winner(
         target=target, model_name=model_name, best_params=best_params,
         x_train=x_train, y_train=y_train,
         x_test_scored=x_test_scored, y_test_scored=y_test_scored,
+        x_test_scored_lenient=x_test_scored_lenient, y_test_scored_lenient=y_test_scored_lenient,
         x_test_all=x_test_all, bootstrap_workers=bootstrap_workers,
     )
 
-    avg_train, avg_test, preds_df = _aggregate_bootstrap_results(bootstrap_results, base_predictions)
+    avg_train, avg_test, avg_test_lenient, preds_df = _aggregate_bootstrap_results(
+        bootstrap_results, base_predictions,
+    )
     pred_summary_df = build_prediction_summary(preds_df)
 
     artifact_path = _save_final_artifact(
@@ -485,7 +502,8 @@ def _refit_single_winner(
     )
 
     print(
-        f"[PID:{pid}] {tag} Done. final_test_mae={avg_test.get('mae', float('nan')):.4f}",
+        f"[PID:{pid}] {tag} Done. final_test_mae={avg_test.get('mae', float('nan')):.4f} "
+        f"(lenient={avg_test_lenient.get('mae', float('nan')):.4f})",
         flush=True,
     )
 
@@ -493,7 +511,8 @@ def _refit_single_winner(
         target, outer_strategy, branch, model_name,
         int(candidate_rank), candidate_role,
         best_params,
-        x_train, x_test_scored, selected_cols, avg_train, avg_test, artifact_path,
+        x_train, x_test_scored, x_test_scored_lenient,
+        selected_cols, avg_train, avg_test, avg_test_lenient, artifact_path,
     )
     return final_row, preds_df
 
@@ -721,6 +740,8 @@ def _evaluate_single_model(
     y_train: pd.Series,
     x_test: pd.DataFrame,
     y_test: pd.Series,
+    x_test_lenient: pd.DataFrame,
+    y_test_lenient: pd.Series,
     feat_cols: list[str],
     selected_cols: list[str],
     selector: Any,
@@ -742,10 +763,14 @@ def _evaluate_single_model(
     train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
         model_name, best_params, x_train, y_train, x_test, y_test,
     )
+    _, test_metrics_lenient, _ = evaluate_candidate_model(
+        model_name, best_params, x_train, y_train, x_test_lenient, y_test_lenient,
+    )
 
     print(
         f"[PID:{pid}] {tag} {model_name}: "
-        f"outer_test_mae={test_metrics['mae']:.4f}",
+        f"outer_test_mae={test_metrics['mae']:.4f} "
+        f"(lenient={test_metrics_lenient.get('mae', float('nan')):.4f})",
         flush=True,
     )
 
@@ -780,6 +805,7 @@ def _evaluate_single_model(
         "tuning_elapsed_seconds": tuning_result["tuning_elapsed_seconds"],
         "outer_train_rows": int(len(x_train)),
         "outer_test_rows": int(len(x_test)),
+        "outer_test_rows_lenient": int(len(x_test_lenient)),
         "feature_count": int(len(selected_cols)),
         "error": "",
         "artifact": artifact,
@@ -797,6 +823,8 @@ def _evaluate_single_model(
             result_row[f"outer_train_{metric}"] = float(train_metrics[metric])
         if metric in test_metrics:
             result_row[f"outer_test_{metric}"] = float(test_metrics[metric])
+        if metric in test_metrics_lenient:
+            result_row[f"outer_test_{metric}_lenient"] = float(test_metrics_lenient[metric])
     result_row.update(classify_fold_gaps(result_row))
     return result_row, trial_rows
 
@@ -838,6 +866,8 @@ def _run_combo_worker(
     y_train = prepared["y_train"]
     x_test = prepared["x_test"]
     y_test = prepared["y_test"]
+    x_test_lenient = prepared["x_test_lenient"]
+    y_test_lenient = prepared["y_test_lenient"]
     feat_cols = prepared["feature_columns"]
     selected_cols = prepared["selected_feature_columns"]
     selector = prepared["selector"]
@@ -855,7 +885,8 @@ def _run_combo_worker(
 
     print(
         f"[PID:{pid}] {tag}: "
-        f"{len(x_train)} train, {len(x_test)} test, "
+        f"{len(x_train)} train, {len(x_test)} test (strict), "
+        f"{len(x_test_lenient)} test (lenient), "
         f"{len(selected_cols)} features",
         flush=True,
     )
@@ -865,6 +896,7 @@ def _run_combo_worker(
             result_row, trial_rows = _evaluate_single_model(
                 strategy, branch, target, outer_test_year, model_name,
                 prepared_folds, x_train, y_train, x_test, y_test,
+                x_test_lenient, y_test_lenient,
                 feat_cols, selected_cols, selector, preprocessor,
             )
             all_trials.extend(trial_rows)

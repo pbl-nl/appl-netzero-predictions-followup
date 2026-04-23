@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -74,6 +75,7 @@ logger = logging.getLogger(__name__)
 CACHE_ROOT = Path("data/preprocessed")
 YEAR_CUTOFF = 2022
 TOP_MISSINGNESS_ROWS = 10
+PREPARED_UNIT_MAX_WRITE_ATTEMPTS = 3
 
 
 def _suppress_convergence_warnings() -> None:
@@ -208,11 +210,19 @@ def prepare_branch_outer_frames(
         split["outer_test"],
         history_df=split["outer_train"],
         split_name="outer_test",
+        drop_rows=True,
+    )
+    test_outputs_lenient = preprocessor.transform(
+        split["outer_test"],
+        history_df=split["outer_train"],
+        split_name="outer_test_lenient",
+        drop_rows="targets_only",
     )
     return {
         "preprocessor": preprocessor,
         "train_frame": train_outputs[branch],
         "test_frame": test_outputs[branch],
+        "test_frame_lenient": test_outputs_lenient[branch],
     }
 
 
@@ -229,6 +239,7 @@ def prepare_branch_fold_frames(
             fold["val"],
             history_df=fold["train"],
             split_name=f"cv_val_{fold['fold_id']}",
+            drop_rows=True,
         )
         prepared.append({
             "fold_id": fold["fold_id"],
@@ -357,6 +368,7 @@ def _build_fingerprint_config() -> dict[str, Any]:
         "n_features_to_select": N_FEATURES_TO_SELECT,
         "random_state": RANDOM_STATE,
         "row_missingness_threshold": ROW_MISSINGNESS_THRESHOLD,
+        "eval_drop_mode": "strict_primary_lenient_secondary_v1",
         "sparse_column_threshold": SPARSE_COLUMN_THRESHOLD,
         "outlier_method": OUTLIER_METHOD,
         "iqr_multiplier": IQR_MULTIPLIER,
@@ -387,6 +399,22 @@ def compute_fingerprint() -> str:
 # --- Cache validation ---
 
 
+def _active_cache_units() -> dict[str, list]:
+    from stages.training.config import (
+        ACTIVE_BRANCHES,
+        ACTIVE_OUTER_STRATEGIES,
+        ACTIVE_TARGETS,
+        OUTER_TEST_YEARS,
+    )
+
+    return enumerate_cache_units(
+        ACTIVE_BRANCHES,
+        ACTIVE_OUTER_STRATEGIES,
+        ACTIVE_TARGETS,
+        OUTER_TEST_YEARS,
+    )
+
+
 def _cache_file_valid(path: Path) -> bool:
     if not path.exists():
         return False
@@ -395,14 +423,7 @@ def _cache_file_valid(path: Path) -> bool:
     return True
 
 
-def validate_cache(cache_dir: Path) -> bool:
-    from stages.training.config import (
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        ACTIVE_TARGETS,
-        OUTER_TEST_YEARS,
-    )
-
+def validate_cache(cache_dir: Path, expected_fingerprint: str | None = None) -> bool:
     manifest_path = cache_dir / "manifest.json"
     if not manifest_path.exists():
         return False
@@ -415,8 +436,12 @@ def validate_cache(cache_dir: Path) -> bool:
         return False
 
     manifest_fp = manifest.get("fingerprint")
-    if manifest_fp != cache_dir.name:
-        logger.info(f"Cache dir/manifest mismatch: dir={cache_dir.name}, manifest={manifest_fp}")
+    expected_fp = expected_fingerprint or cache_dir.name
+    if manifest_fp != expected_fp:
+        logger.info(
+            f"Cache dir/manifest mismatch: expected={expected_fp}, dir={cache_dir.name}, "
+            f"manifest={manifest_fp}"
+        )
         return False
 
     current_fp = compute_fingerprint()
@@ -424,12 +449,7 @@ def validate_cache(cache_dir: Path) -> bool:
         logger.info(f"Cache fingerprint mismatch: cached={manifest_fp}, current={current_fp}")
         return False
 
-    units = enumerate_cache_units(
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        ACTIVE_TARGETS,
-        OUTER_TEST_YEARS,
-    )
+    units = _active_cache_units()
     for unit_type, unit_list in units.items():
         for unit_key in unit_list:
             for path in _expected_files_for_unit(cache_dir, unit_type, unit_key):
@@ -479,7 +499,7 @@ def _expected_files_for_unit(
     if unit_type == "outer":
         branch, year = unit_key
         base = cache_dir / "outer" / branch / str(year)
-        return [base / "train.csv", base / "test.csv", base / "preprocessor.joblib"]
+        return [base / "train.csv", base / "test.csv", base / "test_lenient.csv", base / "preprocessor.joblib"]
     if unit_type == "fold_sets":
         strategy, branch, year = unit_key
         base = cache_dir / "folds" / strategy / branch / str(year)
@@ -490,6 +510,7 @@ def _expected_files_for_unit(
         return [
             base / "train.csv",
             base / "test_scored.csv",
+            base / "test_scored_lenient.csv",
             base / "test_all.csv",
             base / "preprocessor.joblib",
         ]
@@ -505,6 +526,8 @@ def _expected_files_for_unit(
             base / "y_train.joblib",
             base / "x_test.joblib",
             base / "y_test.joblib",
+            base / "x_test_lenient.joblib",
+            base / "y_test_lenient.joblib",
             base / "selector.joblib",
             base / "feature_columns.json",
             base / "common_feature_columns.json",
@@ -519,6 +542,8 @@ def _expected_files_for_unit(
             base / "y_train.joblib",
             base / "x_test_scored.joblib",
             base / "y_test_scored.joblib",
+            base / "x_test_scored_lenient.joblib",
+            base / "y_test_scored_lenient.joblib",
             base / "x_test_all.joblib",
             base / "prediction_index.joblib",
             base / "selector.joblib",
@@ -558,37 +583,311 @@ def _prepared_unit_base(
     raise ValueError(f"Unsupported prepared unit type: {unit_type}")
 
 
-def _validate_prepared_unit(
-    cache_dir: Path,
-    unit_type: str,
-    unit_key: tuple | str,
-) -> bool:
-    base = _prepared_unit_base(cache_dir, unit_type, unit_key)
-    meta_path = base / "meta.json"
-    try:
-        with open(meta_path) as f:
-            meta = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        logger.info(f"Prepared cache invalid meta: {meta_path}")
-        return False
+def _prepared_unit_label(unit_type: str, unit_key: tuple | str) -> str:
+    if unit_type == "outer_prepared":
+        strategy, branch, target, year = unit_key
+        return f"prepared/outer/{strategy}/{branch}/{target}/{year}"
+    if unit_type == "final_prepared":
+        strategy, branch, target = unit_key
+        return f"prepared/final/{strategy}/{branch}/{target}"
+    raise ValueError(f"Unsupported prepared unit type: {unit_type}")
 
-    fold_ids_raw = meta.get("fold_ids")
+
+def _expected_prepared_top_level_paths(base: Path, unit_type: str) -> dict[str, Path]:
+    if unit_type == "outer_prepared":
+        return {
+            "x_train": base / "x_train.joblib",
+            "y_train": base / "y_train.joblib",
+            "x_test": base / "x_test.joblib",
+            "y_test": base / "y_test.joblib",
+            "x_test_lenient": base / "x_test_lenient.joblib",
+            "y_test_lenient": base / "y_test_lenient.joblib",
+            "selector": base / "selector.joblib",
+            "feature_columns": base / "feature_columns.json",
+            "common_feature_columns": base / "common_feature_columns.json",
+            "selected_feature_columns": base / "selected_feature_columns.json",
+            "meta": base / "meta.json",
+        }
+    if unit_type == "final_prepared":
+        return {
+            "x_train": base / "x_train.joblib",
+            "y_train": base / "y_train.joblib",
+            "x_test_scored": base / "x_test_scored.joblib",
+            "y_test_scored": base / "y_test_scored.joblib",
+            "x_test_scored_lenient": base / "x_test_scored_lenient.joblib",
+            "y_test_scored_lenient": base / "y_test_scored_lenient.joblib",
+            "x_test_all": base / "x_test_all.joblib",
+            "prediction_index": base / "prediction_index.joblib",
+            "selector": base / "selector.joblib",
+            "feature_columns": base / "feature_columns.json",
+            "common_feature_columns": base / "common_feature_columns.json",
+            "selected_feature_columns": base / "selected_feature_columns.json",
+            "meta": base / "meta.json",
+        }
+    raise ValueError(f"Unsupported prepared unit type: {unit_type}")
+
+
+def _summarize_columns(columns: list[str], limit: int = 5) -> str:
+    if len(columns) <= limit:
+        return str(columns)
+    return f"{columns[:limit]}... ({len(columns)} total)"
+
+
+def _load_json_with_issues(path: Path, label: str, issues: list[str]) -> Any | None:
+    if not path.exists():
+        issues.append(f"missing {label} file at {path}")
+        return None
+    try:
+        return _read_json(path)
+    except (json.JSONDecodeError, OSError) as exc:
+        issues.append(f"failed to read {label} at {path}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _load_joblib_with_issues(path: Path, label: str, issues: list[str]) -> Any | None:
+    if not path.exists():
+        issues.append(f"missing {label} file at {path}")
+        return None
+    try:
+        return joblib.load(path)
+    except Exception as exc:
+        issues.append(f"failed to deserialize {label} at {path}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _safe_len(value: Any, label: str, issues: list[str]) -> int | None:
+    try:
+        return len(value)
+    except Exception as exc:
+        issues.append(f"{label} has no usable length: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _validate_selected_columns(
+    matrix: Any,
+    label: str,
+    selected_feature_columns: list[str] | None,
+    issues: list[str],
+) -> int | None:
+    if matrix is None:
+        return None
+    if not isinstance(matrix, pd.DataFrame):
+        issues.append(f"{label} is not a DataFrame (got {type(matrix).__name__}).")
+        return _safe_len(matrix, label, issues)
+
+    actual_columns = list(matrix.columns)
+    if selected_feature_columns is not None and actual_columns != selected_feature_columns:
+        issues.append(
+            f"{label} columns { _summarize_columns(actual_columns) } do not match "
+            f"selected_feature_columns { _summarize_columns(selected_feature_columns) }."
+        )
+    return len(matrix)
+
+
+def _validate_xy_pair(
+    x: Any,
+    y: Any,
+    x_label: str,
+    y_label: str,
+    selected_feature_columns: list[str] | None,
+    issues: list[str],
+) -> None:
+    x_len = _validate_selected_columns(x, x_label, selected_feature_columns, issues)
+    if y is None:
+        y_len = None
+    else:
+        y_len = _safe_len(y, y_label, issues)
+    if x_len is not None and y_len is not None and x_len != y_len:
+        issues.append(f"{x_label} has {x_len} rows but {y_label} has {y_len} rows.")
+
+
+def _validate_meta_row_count(
+    meta: dict[str, Any] | None,
+    key: str,
+    actual_value: int | None,
+    issues: list[str],
+) -> None:
+    if meta is None or actual_value is None:
+        return
+    expected = meta.get(key)
+    if expected is None:
+        issues.append(f"meta.json missing {key}.")
+        return
+    if expected != actual_value:
+        issues.append(f"meta.json {key}={expected} but actual row count is {actual_value}.")
+
+
+def _prepared_unit_validation_issues(
+    base: Path,
+    unit_type: str,
+    unit_label: str,
+) -> list[str]:
+    issues: list[str] = []
+    top_level_paths = _expected_prepared_top_level_paths(base, unit_type)
+
+    meta = _load_json_with_issues(top_level_paths["meta"], "meta.json", issues)
+    if meta is not None and not isinstance(meta, dict):
+        issues.append(f"meta.json is not a JSON object for {unit_label}.")
+        meta = None
+
+    feature_columns = _load_json_with_issues(top_level_paths["feature_columns"], "feature_columns.json", issues)
+    common_feature_columns = _load_json_with_issues(
+        top_level_paths["common_feature_columns"],
+        "common_feature_columns.json",
+        issues,
+    )
+    selected_feature_columns = _load_json_with_issues(
+        top_level_paths["selected_feature_columns"],
+        "selected_feature_columns.json",
+        issues,
+    )
+
+    if feature_columns is not None and not isinstance(feature_columns, list):
+        issues.append("feature_columns.json is not a list.")
+        feature_columns = None
+    if common_feature_columns is not None and not isinstance(common_feature_columns, list):
+        issues.append("common_feature_columns.json is not a list.")
+        common_feature_columns = None
+    if selected_feature_columns is not None and not isinstance(selected_feature_columns, list):
+        issues.append("selected_feature_columns.json is not a list.")
+        selected_feature_columns = None
+
+    selector = _load_joblib_with_issues(top_level_paths["selector"], "selector.joblib", issues)
+    x_train = _load_joblib_with_issues(top_level_paths["x_train"], "x_train.joblib", issues)
+    y_train = _load_joblib_with_issues(top_level_paths["y_train"], "y_train.joblib", issues)
+    _validate_xy_pair(x_train, y_train, "x_train", "y_train", selected_feature_columns, issues)
+
+    if feature_columns is not None and selected_feature_columns is not None:
+        if not set(selected_feature_columns).issubset(set(feature_columns)):
+            issues.append("selected_feature_columns is not a subset of feature_columns.")
+    if common_feature_columns is not None and selected_feature_columns is not None:
+        if not set(selected_feature_columns).issubset(set(common_feature_columns)):
+            issues.append("selected_feature_columns is not a subset of common_feature_columns.")
+    if meta is not None and selected_feature_columns is not None:
+        if meta.get("feature_count") != len(selected_feature_columns):
+            issues.append(
+                f"meta.json feature_count={meta.get('feature_count')} but selected_feature_columns has "
+                f"{len(selected_feature_columns)} entries."
+            )
+        selector_available = meta.get("selector_available")
+        if selector_available is not None and selector_available != (selector is not None):
+            issues.append(
+                f"meta.json selector_available={selector_available} but selector "
+                f"{'is present' if selector is not None else 'loaded as None'}."
+            )
+
+    if unit_type == "outer_prepared":
+        x_test = _load_joblib_with_issues(top_level_paths["x_test"], "x_test.joblib", issues)
+        y_test = _load_joblib_with_issues(top_level_paths["y_test"], "y_test.joblib", issues)
+        x_test_lenient = _load_joblib_with_issues(
+            top_level_paths["x_test_lenient"],
+            "x_test_lenient.joblib",
+            issues,
+        )
+        y_test_lenient = _load_joblib_with_issues(
+            top_level_paths["y_test_lenient"],
+            "y_test_lenient.joblib",
+            issues,
+        )
+        _validate_xy_pair(x_test, y_test, "x_test", "y_test", selected_feature_columns, issues)
+        _validate_xy_pair(
+            x_test_lenient,
+            y_test_lenient,
+            "x_test_lenient",
+            "y_test_lenient",
+            selected_feature_columns,
+            issues,
+        )
+        _validate_meta_row_count(meta, "train_rows", _safe_len(x_train, "x_train", issues) if x_train is not None else None, issues)
+        _validate_meta_row_count(meta, "test_rows", _safe_len(x_test, "x_test", issues) if x_test is not None else None, issues)
+        _validate_meta_row_count(
+            meta,
+            "test_rows_lenient",
+            _safe_len(x_test_lenient, "x_test_lenient", issues) if x_test_lenient is not None else None,
+            issues,
+        )
+    elif unit_type == "final_prepared":
+        x_test_scored = _load_joblib_with_issues(
+            top_level_paths["x_test_scored"],
+            "x_test_scored.joblib",
+            issues,
+        )
+        y_test_scored = _load_joblib_with_issues(
+            top_level_paths["y_test_scored"],
+            "y_test_scored.joblib",
+            issues,
+        )
+        x_test_scored_lenient = _load_joblib_with_issues(
+            top_level_paths["x_test_scored_lenient"],
+            "x_test_scored_lenient.joblib",
+            issues,
+        )
+        y_test_scored_lenient = _load_joblib_with_issues(
+            top_level_paths["y_test_scored_lenient"],
+            "y_test_scored_lenient.joblib",
+            issues,
+        )
+        x_test_all = _load_joblib_with_issues(top_level_paths["x_test_all"], "x_test_all.joblib", issues)
+        prediction_index = _load_joblib_with_issues(
+            top_level_paths["prediction_index"],
+            "prediction_index.joblib",
+            issues,
+        )
+        _validate_xy_pair(
+            x_test_scored,
+            y_test_scored,
+            "x_test_scored",
+            "y_test_scored",
+            selected_feature_columns,
+            issues,
+        )
+        _validate_xy_pair(
+            x_test_scored_lenient,
+            y_test_scored_lenient,
+            "x_test_scored_lenient",
+            "y_test_scored_lenient",
+            selected_feature_columns,
+            issues,
+        )
+        x_test_all_len = _validate_selected_columns(
+            x_test_all,
+            "x_test_all",
+            selected_feature_columns,
+            issues,
+        )
+        prediction_index_len = _safe_len(prediction_index, "prediction_index", issues) if prediction_index is not None else None
+        if x_test_all_len is not None and prediction_index_len is not None and x_test_all_len != prediction_index_len:
+            issues.append(
+                f"x_test_all has {x_test_all_len} rows but prediction_index has {prediction_index_len} rows."
+            )
+        _validate_meta_row_count(meta, "train_rows", _safe_len(x_train, "x_train", issues) if x_train is not None else None, issues)
+        _validate_meta_row_count(
+            meta,
+            "test_scored_rows",
+            _safe_len(x_test_scored, "x_test_scored", issues) if x_test_scored is not None else None,
+            issues,
+        )
+        _validate_meta_row_count(
+            meta,
+            "test_scored_rows_lenient",
+            _safe_len(x_test_scored_lenient, "x_test_scored_lenient", issues)
+            if x_test_scored_lenient is not None else None,
+            issues,
+        )
+        _validate_meta_row_count(meta, "test_all_rows", x_test_all_len, issues)
+
+    fold_ids_raw = meta.get("fold_ids") if meta is not None else None
     if not isinstance(fold_ids_raw, list):
-        logger.info(f"Prepared cache invalid fold_ids in {meta_path}")
-        return False
+        issues.append("meta.json missing fold_ids list.")
+        return issues
 
     fold_ids = [str(fold_id) for fold_id in fold_ids_raw]
     if len(set(fold_ids)) != len(fold_ids):
-        logger.info(f"Prepared cache duplicate fold_ids in {meta_path}: {fold_ids}")
-        return False
+        issues.append(f"meta.json contains duplicate fold_ids: {fold_ids}.")
 
     fold_count = meta.get("fold_count")
     if fold_count != len(fold_ids):
-        logger.info(
-            f"Prepared cache fold_count mismatch in {meta_path}: "
-            f"meta={fold_count}, ids={len(fold_ids)}"
-        )
-        return False
+        issues.append(f"meta.json fold_count={fold_count} but fold_ids has {len(fold_ids)} entries.")
 
     actual_fold_ids = {
         str(_parse_fold_id(fold_dir))
@@ -596,18 +895,52 @@ def _validate_prepared_unit(
         if fold_dir.is_dir()
     }
     if actual_fold_ids != set(fold_ids):
-        logger.info(
-            f"Prepared cache fold dir mismatch in {base}: "
-            f"meta={sorted(fold_ids)}, dirs={sorted(actual_fold_ids)}"
+        issues.append(
+            f"meta fold_ids={sorted(fold_ids)} but on-disk fold dirs={sorted(actual_fold_ids)}."
         )
-        return False
 
     for fold_id in fold_ids_raw:
-        for path in _expected_prepared_fold_files(base, fold_id):
-            if not _cache_file_valid(path):
-                logger.info(f"Prepared cache missing fold file: {path}")
-                return False
+        paths = _expected_prepared_fold_paths(base, fold_id)
+        x_fold_train = _load_joblib_with_issues(paths["x_train"], f"fold_{fold_id}/x_train.joblib", issues)
+        y_fold_train = _load_joblib_with_issues(paths["y_train"], f"fold_{fold_id}/y_train.joblib", issues)
+        x_fold_val = _load_joblib_with_issues(paths["x_val"], f"fold_{fold_id}/x_val.joblib", issues)
+        y_fold_val = _load_joblib_with_issues(paths["y_val"], f"fold_{fold_id}/y_val.joblib", issues)
+        _validate_xy_pair(
+            x_fold_train,
+            y_fold_train,
+            f"fold_{fold_id}/x_train",
+            f"fold_{fold_id}/y_train",
+            selected_feature_columns,
+            issues,
+        )
+        _validate_xy_pair(
+            x_fold_val,
+            y_fold_val,
+            f"fold_{fold_id}/x_val",
+            f"fold_{fold_id}/y_val",
+            selected_feature_columns,
+            issues,
+        )
 
+    return issues
+
+
+def _log_prepared_unit_issues(unit_label: str, issues: list[str]) -> None:
+    for issue in issues:
+        logger.info(f"Prepared cache invalid for {unit_label}: {issue}")
+
+
+def _validate_prepared_unit(
+    cache_dir: Path,
+    unit_type: str,
+    unit_key: tuple | str,
+) -> bool:
+    base = _prepared_unit_base(cache_dir, unit_type, unit_key)
+    unit_label = _prepared_unit_label(unit_type, unit_key)
+    issues = _prepared_unit_validation_issues(base, unit_type, unit_label)
+    if issues:
+        _log_prepared_unit_issues(unit_label, issues)
+        return False
     return True
 
 
@@ -711,9 +1044,10 @@ def load_prepared_outer_target(
     target: str,
     outer_test_year: int,
 ) -> dict[str, Any]:
-    base = preprocessed_dir / "prepared" / "outer" / strategy / branch / target / str(outer_test_year)
+    unit_key = (strategy, branch, target, outer_test_year)
+    base = _ensure_prepared_unit_valid(preprocessed_dir, "outer_prepared", unit_key)
     meta = _read_json(base / "meta.json")
-    unit_label = f"prepared/outer/{strategy}/{branch}/{target}/{outer_test_year}"
+    unit_label = _prepared_unit_label("outer_prepared", unit_key)
     return {
         "selector": joblib.load(base / "selector.joblib"),
         "feature_columns": _read_json(base / "feature_columns.json"),
@@ -724,6 +1058,8 @@ def load_prepared_outer_target(
         "y_train": joblib.load(base / "y_train.joblib"),
         "x_test": joblib.load(base / "x_test.joblib"),
         "y_test": joblib.load(base / "y_test.joblib"),
+        "x_test_lenient": joblib.load(base / "x_test_lenient.joblib"),
+        "y_test_lenient": joblib.load(base / "y_test_lenient.joblib"),
         "prepared_folds": _load_prepared_folds(base, meta, unit_label),
     }
 
@@ -734,9 +1070,10 @@ def load_prepared_final_target(
     branch: str,
     target: str,
 ) -> dict[str, Any]:
-    base = preprocessed_dir / "prepared" / "final" / strategy / branch / target
+    unit_key = (strategy, branch, target)
+    base = _ensure_prepared_unit_valid(preprocessed_dir, "final_prepared", unit_key)
     meta = _read_json(base / "meta.json")
-    unit_label = f"prepared/final/{strategy}/{branch}/{target}"
+    unit_label = _prepared_unit_label("final_prepared", unit_key)
     return {
         "selector": joblib.load(base / "selector.joblib"),
         "feature_columns": _read_json(base / "feature_columns.json"),
@@ -747,6 +1084,8 @@ def load_prepared_final_target(
         "y_train": joblib.load(base / "y_train.joblib"),
         "x_test_scored": joblib.load(base / "x_test_scored.joblib"),
         "y_test_scored": joblib.load(base / "y_test_scored.joblib"),
+        "x_test_scored_lenient": joblib.load(base / "x_test_scored_lenient.joblib"),
+        "y_test_scored_lenient": joblib.load(base / "y_test_scored_lenient.joblib"),
         "x_test_all": joblib.load(base / "x_test_all.joblib"),
         "prediction_index": joblib.load(base / "prediction_index.joblib"),
         "prepared_folds": _load_prepared_folds(base, meta, unit_label),
@@ -762,6 +1101,7 @@ def _load_cached_outer_frames(
     return {
         "train_frame": read_frame(base / "train.csv"),
         "test_frame": read_frame(base / "test.csv"),
+        "test_frame_lenient": read_frame(base / "test_lenient.csv"),
     }
 
 
@@ -787,6 +1127,7 @@ def _load_cached_final_frames(base_dir: Path, branch: str) -> dict[str, pd.DataF
     return {
         "train_frame": read_frame(base / "train.csv"),
         "test_frame_scored": read_frame(base / "test_scored.csv"),
+        "test_frame_scored_lenient": read_frame(base / "test_scored_lenient.csv"),
         "test_frame_all": read_frame(base / "test_all.csv"),
     }
 
@@ -827,18 +1168,25 @@ def _prepared_final_dir(
 
 
 def _make_tmp_unit_dir(out_dir: Path) -> Path:
-    tmp_dir = out_dir.with_name(f"{out_dir.name}.tmp")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    return tmp_dir
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{out_dir.name}.tmp.",
+            dir=out_dir.parent,
+        )
+    )
 
 
 def _publish_tmp_unit_dir(tmp_dir: Path, out_dir: Path) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     tmp_dir.rename(out_dir)
+
+
+def _prepared_unit_lock(base_dir: Path, unit_type: str, unit_key: tuple | str) -> FileLock:
+    out_dir = _prepared_unit_base(base_dir, unit_type, unit_key)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(out_dir) + ".repair.lock")
 
 
 def _select_training_bundle(
@@ -910,6 +1258,163 @@ def _select_feature_matrix(
     return x
 
 
+def _build_outer_prepared_payload(
+    strategy: str,
+    branch: str,
+    target: str,
+    outer_test_year: int,
+    base_dir: Path,
+) -> dict[str, Any]:
+    from stages.training.config import N_FEATURES_TO_SELECT
+
+    branch_frames = _load_cached_outer_frames(base_dir, branch, outer_test_year)
+    fold_frames = _load_cached_fold_frames(base_dir, strategy, branch, outer_test_year)
+    bundle = _select_training_bundle(
+        branch_frames["train_frame"],
+        fold_frames,
+        target,
+        n_features_to_select=N_FEATURES_TO_SELECT,
+    )
+    x_test, y_test = _select_eval_xy(
+        branch_frames["test_frame"],
+        target,
+        bundle["selector"],
+        bundle["common_feature_columns"],
+    )
+    x_test_lenient, y_test_lenient = _select_eval_xy(
+        branch_frames["test_frame_lenient"],
+        target,
+        bundle["selector"],
+        bundle["common_feature_columns"],
+    )
+    fold_ids = [fold["fold_id"] for fold in bundle["prepared_folds"]]
+
+    return {
+        "joblib_artifacts": {
+            "x_train.joblib": bundle["x_train"],
+            "y_train.joblib": bundle["y_train"],
+            "x_test.joblib": x_test,
+            "y_test.joblib": y_test,
+            "x_test_lenient.joblib": x_test_lenient,
+            "y_test_lenient.joblib": y_test_lenient,
+            "selector.joblib": bundle["selector"],
+        },
+        "json_artifacts": {
+            "feature_columns.json": bundle["feature_columns"],
+            "common_feature_columns.json": bundle["common_feature_columns"],
+            "selected_feature_columns.json": bundle["selected_feature_columns"],
+        },
+        "prepared_folds": bundle["prepared_folds"],
+        "meta": {
+            "strategy": strategy,
+            "branch": branch,
+            "target": target,
+            "outer_test_year": outer_test_year,
+            "train_rows": int(len(bundle["x_train"])),
+            "test_rows": int(len(x_test)),
+            "test_rows_lenient": int(len(x_test_lenient)),
+            "feature_count": int(len(bundle["selected_feature_columns"])),
+            "fold_ids": fold_ids,
+            "fold_count": int(len(fold_ids)),
+            "selector_available": bundle["selector"] is not None,
+        },
+    }
+
+
+def _build_final_prepared_payload(
+    strategy: str,
+    branch: str,
+    target: str,
+    base_dir: Path,
+) -> dict[str, Any]:
+    from stages.training.config import N_FEATURES_TO_SELECT
+
+    final_frames = _load_cached_final_frames(base_dir, branch)
+    fold_frames = _load_cached_final_fold_frames(base_dir, strategy, branch)
+    bundle = _select_training_bundle(
+        final_frames["train_frame"],
+        fold_frames,
+        target,
+        n_features_to_select=N_FEATURES_TO_SELECT,
+    )
+    x_test_scored, y_test_scored = _select_eval_xy(
+        final_frames["test_frame_scored"],
+        target,
+        bundle["selector"],
+        bundle["common_feature_columns"],
+    )
+    x_test_scored_lenient, y_test_scored_lenient = _select_eval_xy(
+        final_frames["test_frame_scored_lenient"],
+        target,
+        bundle["selector"],
+        bundle["common_feature_columns"],
+    )
+    x_test_all = _select_feature_matrix(
+        final_frames["test_frame_all"],
+        bundle["selector"],
+        bundle["common_feature_columns"],
+    )
+    prediction_index = final_frames["test_frame_all"][[COUNTRY_COL, YEAR_COL]].copy()
+    prediction_index["actual"] = final_frames["test_frame_all"][target]
+    fold_ids = [fold["fold_id"] for fold in bundle["prepared_folds"]]
+
+    return {
+        "joblib_artifacts": {
+            "x_train.joblib": bundle["x_train"],
+            "y_train.joblib": bundle["y_train"],
+            "x_test_scored.joblib": x_test_scored,
+            "y_test_scored.joblib": y_test_scored,
+            "x_test_scored_lenient.joblib": x_test_scored_lenient,
+            "y_test_scored_lenient.joblib": y_test_scored_lenient,
+            "x_test_all.joblib": x_test_all,
+            "prediction_index.joblib": prediction_index,
+            "selector.joblib": bundle["selector"],
+        },
+        "json_artifacts": {
+            "feature_columns.json": bundle["feature_columns"],
+            "common_feature_columns.json": bundle["common_feature_columns"],
+            "selected_feature_columns.json": bundle["selected_feature_columns"],
+        },
+        "prepared_folds": bundle["prepared_folds"],
+        "meta": {
+            "strategy": strategy,
+            "branch": branch,
+            "target": target,
+            "train_rows": int(len(bundle["x_train"])),
+            "test_scored_rows": int(len(x_test_scored)),
+            "test_scored_rows_lenient": int(len(x_test_scored_lenient)),
+            "test_all_rows": int(len(x_test_all)),
+            "feature_count": int(len(bundle["selected_feature_columns"])),
+            "fold_ids": fold_ids,
+            "fold_count": int(len(fold_ids)),
+            "selector_available": bundle["selector"] is not None,
+        },
+    }
+
+
+def _build_prepared_payload(
+    unit_type: str,
+    unit_key: tuple | str,
+    base_dir: Path,
+) -> dict[str, Any]:
+    if unit_type == "outer_prepared":
+        strategy, branch, target, outer_test_year = unit_key
+        return _build_outer_prepared_payload(strategy, branch, target, outer_test_year, base_dir)
+    if unit_type == "final_prepared":
+        strategy, branch, target = unit_key
+        return _build_final_prepared_payload(strategy, branch, target, base_dir)
+    raise ValueError(f"Unsupported prepared unit type: {unit_type}")
+
+
+def _write_prepared_payload(tmp_out_dir: Path, payload: dict[str, Any]) -> None:
+    for filename, obj in payload["joblib_artifacts"].items():
+        joblib.dump(obj, tmp_out_dir / filename)
+    for filename, obj in payload["json_artifacts"].items():
+        write_json(tmp_out_dir / filename, obj)
+    _write_prepared_folds(tmp_out_dir, payload["prepared_folds"])
+    write_json(tmp_out_dir / "meta.json", payload["meta"])
+
+
 def _write_prepared_folds(base_dir: Path, prepared_folds: list[dict[str, Any]]) -> list[int | str]:
     folds_dir = base_dir / "folds"
     folds_dir.mkdir(parents=True, exist_ok=True)
@@ -923,6 +1428,107 @@ def _write_prepared_folds(base_dir: Path, prepared_folds: list[dict[str, Any]]) 
         joblib.dump(fold["y_val"], fold_dir / "y_val.joblib")
         written_fold_ids.append(fold["fold_id"])
     return written_fold_ids
+
+
+def _write_validated_prepared_unit(
+    base_dir: Path,
+    unit_type: str,
+    unit_key: tuple | str,
+    max_attempts: int = PREPARED_UNIT_MAX_WRITE_ATTEMPTS,
+) -> None:
+    out_dir = _prepared_unit_base(base_dir, unit_type, unit_key)
+    unit_label = _prepared_unit_label(unit_type, unit_key)
+    last_issues: list[str] = []
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        tmp_out_dir = _make_tmp_unit_dir(out_dir)
+        try:
+            payload = _build_prepared_payload(unit_type, unit_key, base_dir)
+            _write_prepared_payload(tmp_out_dir, payload)
+            issues = _prepared_unit_validation_issues(tmp_out_dir, unit_type, unit_label)
+            if not issues:
+                _publish_tmp_unit_dir(tmp_out_dir, out_dir)
+                return
+            last_issues = issues
+            logger.warning(
+                f"Prepared unit validation failed for {unit_label} on attempt "
+                f"{attempt}/{max_attempts}: {issues[0]}"
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                f"Prepared unit write failed for {unit_label} on attempt "
+                f"{attempt}/{max_attempts}: {type(exc).__name__}: {exc}"
+            )
+        finally:
+            if tmp_out_dir.exists():
+                shutil.rmtree(tmp_out_dir, ignore_errors=True)
+
+    if last_issues:
+        raise RuntimeError(
+            f"Prepared unit validation failed for {unit_label} after {max_attempts} attempts: "
+            + "; ".join(last_issues)
+        )
+    if last_exc is not None:
+        raise RuntimeError(
+            f"Prepared unit write failed for {unit_label} after {max_attempts} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
+    raise RuntimeError(f"Prepared unit write failed for {unit_label} for an unknown reason.")
+
+
+def _repair_prepared_unit(
+    base_dir: Path,
+    unit_type: str,
+    unit_key: tuple | str,
+) -> None:
+    out_dir = _prepared_unit_base(base_dir, unit_type, unit_key)
+    unit_label = _prepared_unit_label(unit_type, unit_key)
+    lock = _prepared_unit_lock(base_dir, unit_type, unit_key)
+
+    with lock:
+        issues = _prepared_unit_validation_issues(out_dir, unit_type, unit_label)
+        if not issues:
+            return
+
+        logger.warning(f"Repairing invalid prepared unit {unit_label}: {issues[0]}")
+        _write_validated_prepared_unit(base_dir, unit_type, unit_key)
+        repaired_issues = _prepared_unit_validation_issues(out_dir, unit_type, unit_label)
+        if repaired_issues:
+            raise RuntimeError(
+                f"Prepared unit repair failed for {unit_label}: " + "; ".join(repaired_issues)
+            )
+
+
+def _repair_invalid_prepared_units(base_dir: Path, units: dict[str, list]) -> int:
+    repaired = 0
+    for unit_type in ("outer_prepared", "final_prepared"):
+        for unit_key in units[unit_type]:
+            out_dir = _prepared_unit_base(base_dir, unit_type, unit_key)
+            unit_label = _prepared_unit_label(unit_type, unit_key)
+            issues = _prepared_unit_validation_issues(out_dir, unit_type, unit_label)
+            if not issues:
+                continue
+            _repair_prepared_unit(base_dir, unit_type, unit_key)
+            repaired += 1
+    return repaired
+
+
+def _ensure_prepared_unit_valid(
+    base_dir: Path,
+    unit_type: str,
+    unit_key: tuple | str,
+) -> Path:
+    out_dir = _prepared_unit_base(base_dir, unit_type, unit_key)
+    unit_label = _prepared_unit_label(unit_type, unit_key)
+    issues = _prepared_unit_validation_issues(out_dir, unit_type, unit_label)
+    if not issues:
+        return out_dir
+
+    logger.warning(f"Prepared unit invalid for {unit_label}; attempting repair: {issues[0]}")
+    _repair_prepared_unit(base_dir, unit_type, unit_key)
+    return out_dir
 
 
 # --- Data preparation workers ---
@@ -950,6 +1556,7 @@ def _preprocess_outer_unit(
     out_dir.mkdir(parents=True, exist_ok=True)
     write_frame(result["train_frame"], out_dir / "train.csv")
     write_frame(result["test_frame"], out_dir / "test.csv")
+    write_frame(result["test_frame_lenient"], out_dir / "test_lenient.csv")
     joblib.dump(result["preprocessor"], out_dir / "preprocessor.joblib")
 
     elapsed = time.monotonic() - t0
@@ -1016,6 +1623,12 @@ def _preprocess_final_unit(
         drop_rows=True,
         split_name=f"final_test_{branch}",
     )
+    test_outputs_scored_lenient = preprocessor.transform(
+        final_test_raw,
+        history_df=final_train_raw,
+        drop_rows="targets_only",
+        split_name=f"final_test_lenient_{branch}",
+    )
     test_outputs_all = preprocessor.transform(
         final_test_raw,
         history_df=final_train_raw,
@@ -1027,6 +1640,7 @@ def _preprocess_final_unit(
     out_dir.mkdir(parents=True, exist_ok=True)
     write_frame(train_outputs[branch], out_dir / "train.csv")
     write_frame(test_outputs_scored[branch], out_dir / "test_scored.csv")
+    write_frame(test_outputs_scored_lenient[branch], out_dir / "test_scored_lenient.csv")
     write_frame(test_outputs_all[branch], out_dir / "test_all.csv")
     joblib.dump(preprocessor, out_dir / "preprocessor.joblib")
 
@@ -1077,59 +1691,14 @@ def _preprocess_outer_prepared_unit(
 ) -> None:
     _suppress_convergence_warnings()
 
-    from stages.training.config import N_FEATURES_TO_SELECT
-
     t0 = time.monotonic()
     pid = os.getpid()
     tag = f"prepared/outer/{strategy}/{branch}/{target}/{outer_test_year}"
-
-    branch_frames = _load_cached_outer_frames(base_dir, branch, outer_test_year)
-    fold_frames = _load_cached_fold_frames(base_dir, strategy, branch, outer_test_year)
-    bundle = _select_training_bundle(
-        branch_frames["train_frame"],
-        fold_frames,
-        target,
-        n_features_to_select=N_FEATURES_TO_SELECT,
+    _write_validated_prepared_unit(
+        base_dir,
+        "outer_prepared",
+        (strategy, branch, target, outer_test_year),
     )
-    x_test, y_test = _select_eval_xy(
-        branch_frames["test_frame"],
-        target,
-        bundle["selector"],
-        bundle["common_feature_columns"],
-    )
-
-    out_dir = _prepared_outer_dir(base_dir, strategy, branch, target, outer_test_year)
-    tmp_out_dir = _make_tmp_unit_dir(out_dir)
-    try:
-        joblib.dump(bundle["x_train"], tmp_out_dir / "x_train.joblib")
-        joblib.dump(bundle["y_train"], tmp_out_dir / "y_train.joblib")
-        joblib.dump(x_test, tmp_out_dir / "x_test.joblib")
-        joblib.dump(y_test, tmp_out_dir / "y_test.joblib")
-        joblib.dump(bundle["selector"], tmp_out_dir / "selector.joblib")
-        write_json(tmp_out_dir / "feature_columns.json", bundle["feature_columns"])
-        write_json(tmp_out_dir / "common_feature_columns.json", bundle["common_feature_columns"])
-        write_json(tmp_out_dir / "selected_feature_columns.json", bundle["selected_feature_columns"])
-        written_fold_ids = _write_prepared_folds(tmp_out_dir, bundle["prepared_folds"])
-        write_json(
-            tmp_out_dir / "meta.json",
-            {
-                "strategy": strategy,
-                "branch": branch,
-                "target": target,
-                "outer_test_year": outer_test_year,
-                "train_rows": int(len(bundle["x_train"])),
-                "test_rows": int(len(x_test)),
-                "feature_count": int(len(bundle["selected_feature_columns"])),
-                "fold_ids": written_fold_ids,
-                "fold_count": int(len(written_fold_ids)),
-                "selector_available": bundle["selector"] is not None,
-            },
-        )
-        _publish_tmp_unit_dir(tmp_out_dir, out_dir)
-    except Exception:
-        if tmp_out_dir.exists():
-            shutil.rmtree(tmp_out_dir)
-        raise
 
     elapsed = time.monotonic() - t0
     print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s", flush=True)
@@ -1143,68 +1712,14 @@ def _preprocess_final_prepared_unit(
 ) -> None:
     _suppress_convergence_warnings()
 
-    from stages.training.config import N_FEATURES_TO_SELECT
-
     t0 = time.monotonic()
     pid = os.getpid()
     tag = f"prepared/final/{strategy}/{branch}/{target}"
-
-    final_frames = _load_cached_final_frames(base_dir, branch)
-    fold_frames = _load_cached_final_fold_frames(base_dir, strategy, branch)
-    bundle = _select_training_bundle(
-        final_frames["train_frame"],
-        fold_frames,
-        target,
-        n_features_to_select=N_FEATURES_TO_SELECT,
+    _write_validated_prepared_unit(
+        base_dir,
+        "final_prepared",
+        (strategy, branch, target),
     )
-    x_test_scored, y_test_scored = _select_eval_xy(
-        final_frames["test_frame_scored"],
-        target,
-        bundle["selector"],
-        bundle["common_feature_columns"],
-    )
-    x_test_all = _select_feature_matrix(
-        final_frames["test_frame_all"],
-        bundle["selector"],
-        bundle["common_feature_columns"],
-    )
-    prediction_index = final_frames["test_frame_all"][[COUNTRY_COL, YEAR_COL]].copy()
-    prediction_index["actual"] = final_frames["test_frame_all"][target]
-
-    out_dir = _prepared_final_dir(base_dir, strategy, branch, target)
-    tmp_out_dir = _make_tmp_unit_dir(out_dir)
-    try:
-        joblib.dump(bundle["x_train"], tmp_out_dir / "x_train.joblib")
-        joblib.dump(bundle["y_train"], tmp_out_dir / "y_train.joblib")
-        joblib.dump(x_test_scored, tmp_out_dir / "x_test_scored.joblib")
-        joblib.dump(y_test_scored, tmp_out_dir / "y_test_scored.joblib")
-        joblib.dump(x_test_all, tmp_out_dir / "x_test_all.joblib")
-        joblib.dump(prediction_index, tmp_out_dir / "prediction_index.joblib")
-        joblib.dump(bundle["selector"], tmp_out_dir / "selector.joblib")
-        write_json(tmp_out_dir / "feature_columns.json", bundle["feature_columns"])
-        write_json(tmp_out_dir / "common_feature_columns.json", bundle["common_feature_columns"])
-        write_json(tmp_out_dir / "selected_feature_columns.json", bundle["selected_feature_columns"])
-        written_fold_ids = _write_prepared_folds(tmp_out_dir, bundle["prepared_folds"])
-        write_json(
-            tmp_out_dir / "meta.json",
-            {
-                "strategy": strategy,
-                "branch": branch,
-                "target": target,
-                "train_rows": int(len(bundle["x_train"])),
-                "test_scored_rows": int(len(x_test_scored)),
-                "test_all_rows": int(len(x_test_all)),
-                "feature_count": int(len(bundle["selected_feature_columns"])),
-                "fold_ids": written_fold_ids,
-                "fold_count": int(len(written_fold_ids)),
-                "selector_available": bundle["selector"] is not None,
-            },
-        )
-        _publish_tmp_unit_dir(tmp_out_dir, out_dir)
-    except Exception:
-        if tmp_out_dir.exists():
-            shutil.rmtree(tmp_out_dir)
-        raise
 
     elapsed = time.monotonic() - t0
     print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s", flush=True)
@@ -1213,24 +1728,13 @@ def _preprocess_final_prepared_unit(
 # --- Cache orchestration ---
 
 
-def _build_cache(base_dir: Path, fingerprint: str) -> None:
+def _build_cache(base_dir: Path, fingerprint: str) -> dict[str, list]:
     """Build all prepared training artifacts into base_dir."""
-    from stages.training.config import (
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        ACTIVE_TARGETS,
-        DEFAULT_CPU_WORKERS,
-        OUTER_TEST_YEARS,
-    )
+    from stages.training.config import DEFAULT_CPU_WORKERS
 
     stage_t0 = time.monotonic()
     raw_df = load_panel_data(verbose=True)
-    units = enumerate_cache_units(
-        ACTIVE_BRANCHES,
-        ACTIVE_OUTER_STRATEGIES,
-        ACTIVE_TARGETS,
-        OUTER_TEST_YEARS,
-    )
+    units = _active_cache_units()
 
     frame_tasks: list[tuple[Any, ...]] = []
     for branch, year in units["outer"]:
@@ -1291,6 +1795,7 @@ def _build_cache(base_dir: Path, fingerprint: str) -> None:
     write_json(base_dir / "manifest.json", manifest)
 
     logger.info(f"Data preparation stage complete in {stage_elapsed:.1f}s")
+    return units
 
 
 def run_data_preparation_stage(force: bool = False) -> Path:
@@ -1304,10 +1809,25 @@ def run_data_preparation_stage(force: bool = False) -> Path:
     fingerprint = compute_fingerprint()
     cache_dir = CACHE_ROOT / fingerprint
     lock_path = CACHE_ROOT / f"{fingerprint}.lock"
+    units = _active_cache_units()
 
     if not force and validate_cache(cache_dir):
         logger.info(f"Valid data preparation cache found: {cache_dir}")
         return cache_dir
+
+    if not force and cache_dir.exists():
+        try:
+            repaired = _repair_invalid_prepared_units(cache_dir, units)
+            if repaired:
+                logger.info(f"Repaired {repaired} prepared units in existing cache: {cache_dir}")
+            if validate_cache(cache_dir):
+                logger.info(f"Valid data preparation cache restored: {cache_dir}")
+                return cache_dir
+        except Exception as exc:
+            logger.warning(
+                f"Failed to repair existing cache {cache_dir}; rebuilding from scratch: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
     logger.info(f"Building data preparation cache: {cache_dir}")
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1319,13 +1839,35 @@ def run_data_preparation_stage(force: bool = False) -> Path:
         if not force and validate_cache(cache_dir):
             logger.info(f"Cache built by another process: {cache_dir}")
             return cache_dir
+        if not force and cache_dir.exists():
+            try:
+                repaired = _repair_invalid_prepared_units(cache_dir, units)
+                if repaired:
+                    logger.info(
+                        f"Repaired {repaired} prepared units while waiting on cache lock: {cache_dir}"
+                    )
+                if validate_cache(cache_dir):
+                    logger.info(f"Valid data preparation cache restored while waiting: {cache_dir}")
+                    return cache_dir
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to repair existing cache {cache_dir} while waiting on lock; "
+                    f"rebuilding from scratch: {type(exc).__name__}: {exc}"
+                )
         tmp_dir = CACHE_ROOT / f"{fingerprint}.tmp"
         if tmp_dir.exists():
             logger.info(f"Removing stale temp dir: {tmp_dir}")
             shutil.rmtree(tmp_dir)
         try:
             tmp_dir.mkdir(parents=True)
-            _build_cache(tmp_dir, fingerprint)
+            tmp_units = _build_cache(tmp_dir, fingerprint)
+            repaired = _repair_invalid_prepared_units(tmp_dir, tmp_units)
+            if repaired:
+                logger.info(f"Repaired {repaired} prepared units before cache publication.")
+            if not validate_cache(tmp_dir, expected_fingerprint=fingerprint):
+                raise RuntimeError(
+                    f"Refusing to publish invalid data preparation cache: {tmp_dir}"
+                )
             if cache_dir.exists():
                 shutil.rmtree(cache_dir)
             tmp_dir.rename(cache_dir)

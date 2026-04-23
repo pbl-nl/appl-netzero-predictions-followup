@@ -41,6 +41,7 @@ OUT_DIR = "data/processed"
 PROCESSED_DIR = Path("data/processed")
 NETZERO_DIR = Path("data/netzero")
 OUTPUT_PATH = Path("data/merged/merged.csv")
+TARGET_AUDIT_PATH = OUTPUT_PATH.with_name("target_audit.csv")
 
 # =============================================================================
 # Download constants
@@ -135,6 +136,18 @@ SCENARIO_ALPHAS = {
     "linear": 1.0,
     "optimistic": 2.0,
     "pessimistic": 0.5,
+}
+
+EMISSIONS_ABSOLUTE_TO_PER_CAPITA = {
+    "non_co2_emissions": "non_co2_emissions_per_capita",
+    "total_ghg_emissions": "total_ghg_emissions_per_capita",
+    "total_hard_to_abate_emissions": "total_hard_to_abate_emissions_per_capita",
+}
+
+EMISSIONS_ABSOLUTE_RENAMES = {
+    "non_co2_emissions": "non_co2_emissions_mt_co2e",
+    "total_ghg_emissions": "total_ghg_emissions_mt_co2e",
+    "total_hard_to_abate_emissions": "total_hard_to_abate_emissions_mt_co2e",
 }
 
 IEA_COUNTRY_CATCHES = {
@@ -788,6 +801,32 @@ def build_merged_panel() -> pd.DataFrame:
     return merged.sort_values(["country", "year"]).reset_index(drop=True)
 
 
+def add_per_capita_emission_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert absolute PRIMAP Mt CO2e columns to t CO2e/person features.
+
+    The original absolute columns are preserved with explicit ``_mt_co2e``
+    suffixes for target construction and net-zero post-analysis consumers.
+    """
+    out = df.copy()
+    if "population_total" not in out.columns:
+        return out.rename(columns={
+            old: new for old, new in EMISSIONS_ABSOLUTE_RENAMES.items() if old in out.columns
+        })
+
+    population = pd.to_numeric(out["population_total"], errors="coerce")
+    valid_population = population.where(population > 0)
+
+    for absolute_col, per_capita_col in EMISSIONS_ABSOLUTE_TO_PER_CAPITA.items():
+        if absolute_col not in out.columns:
+            continue
+        emissions = pd.to_numeric(out[absolute_col], errors="coerce")
+        out[per_capita_col] = emissions * SCALE / valid_population
+
+    return out.rename(columns={
+        old: new for old, new in EMISSIONS_ABSOLUTE_RENAMES.items() if old in out.columns
+    })
+
+
 # =============================================================================
 # NZ target and population loaders
 # =============================================================================
@@ -804,14 +843,70 @@ def load_nz_data() -> pd.DataFrame:
 
     emi = pd.read_excel(
         xlsx_path, sheet_name="Emissions NDC Tool", skiprows=7,
-        usecols=["isocode", "currpol_2030_median"],
+        usecols=["isocode", "ndc_2030_unconditional_max", "currpol_2030_median"],
+    )
+    emi["ndc_2030_unconditional_max"] = pd.to_numeric(
+        emi["ndc_2030_unconditional_max"], errors="coerce",
     )
     emi["currpol_2030_median"] = pd.to_numeric(emi["currpol_2030_median"], errors="coerce")
 
     result = nz.merge(emi, on="isocode", how="left")
     result["iso3"] = result["iso3"].str.strip().str.upper()
     result = result[result["iso3"].str.fullmatch(r"[A-Z]{3}", na=False)]
-    return result[["iso3", "nz_ghg_year", "currpol_2030_median"]].drop_duplicates(subset=["iso3"])
+    result = result.drop_duplicates(subset=["iso3"]).copy()
+
+    selected = result.apply(_select_emissions_2030, axis=1, result_type="expand")
+    result = pd.concat([result.reset_index(drop=True), selected.reset_index(drop=True)], axis=1)
+    return result[
+        [
+            "iso3",
+            "nz_ghg_year",
+            "ndc_2030_unconditional_max",
+            "currpol_2030_median",
+            "emissions_2030",
+            "emissions_2030_source",
+            "emissions_2030_status_detail",
+        ]
+    ]
+
+
+def _invalid_2030_reason(value: float, column: str) -> str | None:
+    if pd.isna(value):
+        return f"missing_{column}"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return f"invalid_{column}"
+    if not np.isfinite(numeric):
+        return f"invalid_{column}"
+    if numeric < 0:
+        return f"negative_{column}"
+    return None
+
+
+def _select_emissions_2030(row: pd.Series) -> pd.Series:
+    ndc_col = "ndc_2030_unconditional_max"
+    currpol_col = "currpol_2030_median"
+    ndc_reason = _invalid_2030_reason(row.get(ndc_col), ndc_col)
+    currpol_reason = _invalid_2030_reason(row.get(currpol_col), currpol_col)
+
+    if ndc_reason is None:
+        return pd.Series({
+            "emissions_2030": float(row[ndc_col]),
+            "emissions_2030_source": ndc_col,
+            "emissions_2030_status_detail": "ok",
+        })
+    if currpol_reason is None:
+        return pd.Series({
+            "emissions_2030": float(row[currpol_col]),
+            "emissions_2030_source": currpol_col,
+            "emissions_2030_status_detail": ndc_reason,
+        })
+    return pd.Series({
+        "emissions_2030": np.nan,
+        "emissions_2030_source": "missing",
+        "emissions_2030_status_detail": "|".join([ndc_reason, currpol_reason]),
+    })
 
 
 def load_population_projections(skip_download: bool = False) -> pd.DataFrame:
@@ -945,9 +1040,25 @@ def cumulative_per_capita_path(
 # =============================================================================
 
 
-def compute_target_columns(merged: pd.DataFrame, skip_download: bool = False) -> pd.DataFrame:
+def _join_reasons(reasons: list[str] | set[str]) -> str:
+    unique = [reason for reason in dict.fromkeys(reasons) if reason]
+    return "|".join(unique) if unique else "ok"
+
+
+def compute_target_columns(
+    merged: pd.DataFrame,
+    skip_download: bool = False,
+    audit_path: Path | None = None,
+) -> pd.DataFrame:
     scenario_cols = ["country", "year"] + list(SCENARIO_ALPHAS.keys())
     if "total_ghg_emissions" not in merged.columns or "population_total" not in merged.columns:
+        if audit_path is not None:
+            audit = pd.DataFrame([{
+                "target_status": "missing_required_columns",
+                "target_status_detail": "missing_total_ghg_emissions_or_population_total",
+            }])
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            audit.to_csv(audit_path, index=False)
         return pd.DataFrame(columns=scenario_cols)
 
     history = merged[["country", "year", "total_ghg_emissions", "population_total"]].copy()
@@ -957,8 +1068,7 @@ def compute_target_columns(merged: pd.DataFrame, skip_download: bool = False) ->
     nz_data = load_nz_data()
     population = load_population_projections(skip_download=skip_download)
 
-    nz_map = dict(zip(nz_data["iso3"], nz_data["nz_ghg_year"]))
-    currpol_map = dict(zip(nz_data["iso3"], nz_data["currpol_2030_median"]))
+    nz_ref = nz_data.set_index("iso3").to_dict("index")
     pop_map = {
         iso3: dict(zip(group["year"], group["population_estimate"]))
         for iso3, group in population.groupby("iso3")
@@ -968,56 +1078,137 @@ def compute_target_columns(merged: pd.DataFrame, skip_download: bool = False) ->
         for country, group in history.groupby("country")
     }
 
-    country_inputs = []
+    scenario_records: dict[str, list[dict[str, float | int | str]]] = {
+        scenario: [] for scenario in SCENARIO_ALPHAS
+    }
+    audit_rows: list[dict[str, object]] = []
     for country, hist_df in history_groups.items():
+        ref = nz_ref.get(country, {})
         valid = hist_df.dropna(subset=["total_ghg_emissions"]).sort_values("year")
+        latest_year: int | None = None
+        e_latest = np.nan
+        blockers: list[str] = []
         if valid.empty:
-            continue
-        latest_row = valid.iloc[-1]
-        e_latest = latest_row["total_ghg_emissions"]
-        latest_year = int(latest_row["year"])
-        e_2030 = currpol_map.get(country)
-        net_zero_year = nz_map.get(country)
+            blockers.append("missing_total_ghg_emissions_history")
+        else:
+            latest_row = valid.iloc[-1]
+            e_latest = latest_row["total_ghg_emissions"]
+            latest_year = int(latest_row["year"])
+            if pd.isna(e_latest):
+                blockers.append("missing_latest_total_ghg_emissions")
+            elif float(e_latest) < 0:
+                blockers.append("negative_latest_total_ghg_emissions")
+
+        e_2030 = ref.get("emissions_2030", np.nan)
+        e_2030_source = ref.get("emissions_2030_source", "missing")
+        e_2030_detail = ref.get("emissions_2030_status_detail", "missing_nz_reference")
+        net_zero_year = ref.get("nz_ghg_year", np.nan)
         pop_by_year = pop_map.get(country)
-        if (
-            pd.isna(e_latest)
-            or e_2030 is None or pd.isna(e_2030)
-            or net_zero_year is None or pd.isna(net_zero_year)
-            or pop_by_year is None
-        ):
-            continue
-        country_inputs.append({
+
+        if e_2030 is None or pd.isna(e_2030):
+            if e_2030_detail and e_2030_detail != "ok":
+                blockers.extend(str(e_2030_detail).split("|"))
+            else:
+                blockers.append("missing_emissions_2030")
+        elif float(e_2030) < 0:
+            blockers.append("negative_emissions_2030")
+        if net_zero_year is None or pd.isna(net_zero_year):
+            blockers.append("missing_announced_nz_ghg_year")
+        if pop_by_year is None:
+            blockers.append("missing_population_projection")
+
+        base_audit = {
             "country": country,
-            "e_start": float(e_latest),
-            "start_year": latest_year,
-            "e_2030": float(e_2030),
-            "net_zero_year": int(net_zero_year),
-            "population": pop_by_year,
-            "history": hist_df,
+            "latest_emissions_year": latest_year,
+            "latest_total_ghg_emissions": e_latest,
+            "ndc_2030_unconditional_max": ref.get("ndc_2030_unconditional_max", np.nan),
+            "currpol_2030_median": ref.get("currpol_2030_median", np.nan),
+            "emissions_2030": e_2030,
+            "emissions_2030_source": e_2030_source,
+            "emissions_2030_status_detail": e_2030_detail,
+            "announced_nz_ghg_year": net_zero_year,
+            "has_population_projection": pop_by_year is not None,
+        }
+
+        if blockers:
+            audit_rows.append({
+                **base_audit,
+                "target_status": "missing_or_invalid_inputs",
+                "target_status_detail": _join_reasons(blockers),
+                "target_values_created": 0,
+            })
+            continue
+
+        target_values_created = 0
+        generation_reasons: list[str] = []
+        for scenario, alpha in SCENARIO_ALPHAS.items():
+            emissions = emissions_path_to_nz(
+                e_start=float(e_latest),
+                e_2030=float(e_2030),
+                start_year=int(latest_year),
+                net_zero_year=int(net_zero_year),
+                alpha=alpha,
+            )
+            if not emissions:
+                generation_reasons.append("emissions_path_empty")
+                continue
+
+            per_capita = per_capita_emissions_path(emissions, pop_by_year)
+            missing_population_years = [
+                year for year, value in per_capita.items()
+                if pd.isna(value)
+            ]
+            if missing_population_years:
+                generation_reasons.append(
+                    f"missing_path_population:{min(missing_population_years)}"
+                )
+
+            cumulative = cumulative_per_capita_path(per_capita, hist_df, int(latest_year))
+            scenario_count = 0
+            for year, value in cumulative.items():
+                if START_YEAR <= year <= END_YEAR and pd.notna(value) and float(value) > 0:
+                    scenario_records[scenario].append({
+                        "country": country,
+                        "year": int(year),
+                        scenario: float(value),
+                    })
+                    scenario_count += 1
+            if scenario_count == 0:
+                generation_reasons.append(f"no_positive_cumulative_budget:{scenario}")
+            target_values_created += scenario_count
+
+        audit_rows.append({
+            **base_audit,
+            "target_status": "ok" if target_values_created else "no_target_values",
+            "target_status_detail": (
+                "ok"
+                if target_values_created
+                else _join_reasons(
+                    generation_reasons
+                    + (
+                        ["net_zero_year_not_after_latest_emission_year"]
+                        if int(net_zero_year) <= int(latest_year)
+                        else []
+                    )
+                )
+            ),
+            "target_values_created": target_values_created,
         })
 
     scenario_frames: list[pd.DataFrame] = []
-    for scenario, alpha in SCENARIO_ALPHAS.items():
-        records = []
-        for item in country_inputs:
-            emissions = emissions_path_to_nz(
-                e_start=item["e_start"],
-                e_2030=item["e_2030"],
-                start_year=item["start_year"],
-                net_zero_year=item["net_zero_year"],
-                alpha=alpha,
-            )
-            per_capita = per_capita_emissions_path(emissions, item["population"])
-            cumulative = cumulative_per_capita_path(per_capita, item["history"], item["start_year"])
-            for year, value in cumulative.items():
-                if START_YEAR <= year <= END_YEAR:
-                    records.append({"country": item["country"], "year": int(year), scenario: float(value)})
+    for scenario, records in scenario_records.items():
         if records:
             df = pd.DataFrame(records).sort_values(["country", "year"])
             df = df.groupby(["country", "year"], as_index=False).first()
         else:
             df = pd.DataFrame(columns=["country", "year", scenario])
         scenario_frames.append(df)
+
+    if audit_path is not None:
+        audit_df = pd.DataFrame(audit_rows).sort_values("country").reset_index(drop=True)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_df.to_csv(audit_path, index=False)
+        log.info("Saved target audit -> %s", audit_path)
 
     target = scenario_frames[0]
     for frame in scenario_frames[1:]:
@@ -1060,8 +1251,13 @@ def run(skip_download: bool = False) -> None:
 
     # 3. Merge + targets
     merged = build_merged_panel()
-    targets = compute_target_columns(merged, skip_download=skip_download)
+    targets = compute_target_columns(
+        merged,
+        skip_download=skip_download,
+        audit_path=TARGET_AUDIT_PATH,
+    )
     final_df = merged.merge(targets, on=["country", "year"], how="left")
+    final_df = add_per_capita_emission_features(final_df)
     final_df = final_df.sort_values(["country", "year"]).reset_index(drop=True)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     final_df.to_csv(OUTPUT_PATH, index=False)

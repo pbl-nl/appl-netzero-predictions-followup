@@ -446,8 +446,7 @@ if __name__ == '__main__':
     print("start loading data from merged.csv")
 
     # Column mapping: merged.csv names → old pipeline names
-    # NOTE: PRIMAP emission columns (total_ghg_emissions, non_co2_emissions,
-    # total_hard_to_abate_emissions) are renamed here but scaled/per-capita in Step 4.
+    # PRIMAP emission feature columns are already per capita in merged.csv.
     NEW_TO_OLD_COLUMNS = {
         "country": "Country Code",
         "year": "Year",
@@ -456,9 +455,10 @@ if __name__ == '__main__':
         "energy_intensity_mj_per_usd_ppp": "Energy intensity level of primary energy (MJ/$2017 PPP GDP)",
         "inform_risk_index": "INFORM Risk Index",
         "ghg_growth": "GHG growth (annual %)",
-        "non_co2_emissions": "Non-CO2 emissions per capita",
-        "total_ghg_emissions": "Per capita GHG emissions (tons/capita)",
-        "total_hard_to_abate_emissions": "Total GHG emissions by sector (Mt CO2 eq) - Hard to Abate (ABIT)",
+        "non_co2_emissions_per_capita": "Non-CO2 emissions per capita",
+        "total_ghg_emissions_per_capita": "Per capita GHG emissions (tons/capita)",
+        "total_hard_to_abate_emissions_per_capita":
+            "Total GHG emissions by sector (Mt CO2 eq) - Hard to Abate (ABIT)",
         "rsf_press_freedom_index": "Press Freedom Index",
         "v2x_regime": "Electoral Democracy",
         "agricultural_land_of_land_area": "Agricultural land (% of land area)",
@@ -488,6 +488,7 @@ if __name__ == '__main__':
     # Drop precomputed target scenarios (will recalculate using same NDC/NZT method as old/reproduce.py)
     merged_df = merged_df.drop(columns=[c for c in ['linear', 'optimistic', 'pessimistic']
                                         if c in merged_df.columns])
+    merged_df = merged_df.drop(columns=[c for c in merged_df.columns if c.endswith('_mt_co2e')], errors='ignore')
 
     # YEAR FILTER: retain 2022 data so revised target calculations use a 2022 anchor.
     DATA_YEAR_CUTOFF = '2022'
@@ -499,24 +500,6 @@ if __name__ == '__main__':
     # Step 4 — Feature engineering (replaces old/reproduce.py lines 244–402)
     # -------------------------------------------------------------------------
     print("start Feature engineering")
-
-    # SCALE: PRIMAP columns in merged.csv are absolute Mt CO2e.
-    # Convert to t CO2e (×1e6) then divide by population to match old pipeline units.
-    # After rename in Step 3, these columns now have old-pipeline names:
-    #   'Per capita GHG emissions (tons/capita)'  ← was total_ghg_emissions (Mt CO2e abs)
-    #   'Non-CO2 emissions per capita'             ← was non_co2_emissions (Mt CO2e abs)
-    #   'Total GHG emissions by sector (Mt CO2 eq) - Hard to Abate (ABIT)' ← was total_hard_to_abate (Mt CO2e abs)
-    PRIMAP_SCALE = 1e6  # Mt CO2e → t CO2e
-
-    primap_renamed = {
-        'Per capita GHG emissions (tons/capita)': '_total_ghg_abs',
-        'Non-CO2 emissions per capita': '_nonco2_abs',
-        'Total GHG emissions by sector (Mt CO2 eq) - Hard to Abate (ABIT)': '_abit_abs',
-    }
-    for new_name, tmp_name in primap_renamed.items():
-        if new_name in merged_df.columns:
-            merged_df[tmp_name] = merged_df[new_name] * PRIMAP_SCALE
-            merged_df = merged_df.drop(columns=[new_name])
 
     # WGI sum — only 4 of 6 components available in merged.csv
     # (Government Effectiveness and Rule of Law are absent)
@@ -536,27 +519,11 @@ if __name__ == '__main__':
         merged_df['Oil and Gas Rents (% of GDP)'] = (
             merged_df['Oil rents (% of GDP)'] + merged_df['Natural gas rents (% of GDP)'])
 
-    # Per-capita scaling — divide absolute t CO2e by population
     pop_data = merged_df[['Year', 'Country Code', 'Population, total']].dropna()
     pop_reference_year = pop_data['Year'].max()
     pop_recent_data = pop_data[pop_data['Year'] == pop_reference_year].copy()
 
     merged_cap_df = merged_df.copy()
-
-    def _per_capita(row, col):
-        pop = row.get('Population, total')
-        val = row.get(col)
-        if pd.notnull(val) and pd.notnull(pop) and pop != 0:
-            return val / pop
-        return None
-
-    merged_cap_df['Per capita GHG emissions (tons/capita)'] = merged_cap_df.apply(
-        lambda r: _per_capita(r, '_total_ghg_abs'), axis=1)
-    merged_cap_df['Non-CO2 emissions per capita'] = merged_cap_df.apply(
-        lambda r: _per_capita(r, '_nonco2_abs'), axis=1)
-    merged_cap_df['Total GHG emissions by sector (Mt CO2 eq) - Hard to Abate (ABIT)'] = merged_cap_df.apply(
-        lambda r: _per_capita(r, '_abit_abs'), axis=1)
-    merged_cap_df = merged_cap_df.drop(columns=['_total_ghg_abs', '_nonco2_abs', '_abit_abs'])
 
     # -------------------------------------------------------------------------
     # EUU aggregation — replicate old/reproduce.py lines 257–309

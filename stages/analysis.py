@@ -37,6 +37,11 @@ FIGURES_DIR = OUTPUT_DIR / "figures"
 
 TARGET_COLS = ["linear", "optimistic", "pessimistic"]
 TARGET_LABELS = {"linear": "Linear", "optimistic": "Optimistic", "pessimistic": "Pessimistic"}
+ABSOLUTE_EMISSION_COLS = [
+    "non_co2_emissions_mt_co2e",
+    "total_ghg_emissions_mt_co2e",
+    "total_hard_to_abate_emissions_mt_co2e",
+]
 
 FEATURE_LABELS = {
     "renewable_energy_share_tfc_pct":             "Renewable Energy Share (\% TFC)",
@@ -44,9 +49,12 @@ FEATURE_LABELS = {
     "energy_intensity_mj_per_usd_ppp":            "Energy Intensity (MJ/USD PPP)",
     "inform_risk_index":                          "INFORM Risk Index",
     "ghg_growth":                                 "GHG Growth (\% YoY)",
-    "non_co2_emissions":                          "Non-CO$_2$ Emissions (Mt CO$_2$e)",
-    "total_ghg_emissions":                        "Total GHG Emissions (Mt CO$_2$e)",
-    "total_hard_to_abate_emissions":              "Hard-to-Abate Emissions (Mt CO$_2$e)",
+    "non_co2_emissions_per_capita":               "Non-CO$_2$ Emissions (t CO$_2$e/cap)",
+    "total_ghg_emissions_per_capita":             "Total GHG Emissions (t CO$_2$e/cap)",
+    "total_hard_to_abate_emissions_per_capita":   "Hard-to-Abate Emissions (t CO$_2$e/cap)",
+    "non_co2_emissions_mt_co2e":                  "Non-CO$_2$ Emissions (Mt CO$_2$e)",
+    "total_ghg_emissions_mt_co2e":                "Total GHG Emissions (Mt CO$_2$e)",
+    "total_hard_to_abate_emissions_mt_co2e":      "Hard-to-Abate Emissions (Mt CO$_2$e)",
     "rsf_press_freedom_index":                    "Press Freedom Index",
     "v2x_regime":                                 "Regime Type (V-Dem)",
     "agricultural_land_of_land_area":             "Agricultural Land (\% Land Area)",
@@ -107,7 +115,7 @@ def load_data() -> pd.DataFrame:
 
 
 def feature_columns(df: pd.DataFrame) -> list:
-    return [c for c in df.columns if c not in ["country", "year"] + TARGET_COLS]
+    return [c for c in df.columns if c not in ["country", "year"] + TARGET_COLS + ABSOLUTE_EMISSION_COLS]
 
 
 def save_fig(name: str, tight: bool = True):
@@ -236,6 +244,70 @@ def figure_target_distributions(df: pd.DataFrame):
     save_fig("target_distributions")
 
 
+def figure_target_log_transform_comparison(df: pd.DataFrame, target: str = "linear"):
+    """Compare the raw target scale with the stored log-transformed target."""
+    log_vals = (
+        pd.to_numeric(df[target], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    if log_vals.empty:
+        print(f"  Skipped figure: no non-missing values for {target}")
+        return
+
+    log_vals = pd.Series(log_vals.to_numpy(), name="Log target")
+    raw_vals = pd.Series(np.exp(log_vals.to_numpy()), name="Raw target")
+    label = TARGET_LABELS.get(target, target.title())
+    color = SCENARIO_COLORS.get(target, "#2166ac")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=False)
+    panels = [
+        (
+            axes[0],
+            raw_vals,
+            "Former scale: cumulative per-capita GHG budget",
+            "Cumulative per-capita GHG budget",
+            "#b2182b",
+            "Raw scale",
+        ),
+        (
+            axes[1],
+            log_vals,
+            "After transform: log target",
+            "ln(Cumulative per-capita GHG budget)",
+            color,
+            "Log scale",
+        ),
+    ]
+
+    for ax, vals, title, xlabel, panel_color, box_title in panels:
+        ax.hist(vals, bins=45, color=panel_color, alpha=0.35, density=True, edgecolor="none")
+        vals.plot.kde(ax=ax, color=panel_color, lw=2)
+        ax.axvline(vals.median(), color="black", lw=1.2, ls="-", label="Median")
+        ax.axvline(vals.quantile(0.95), color="gray", lw=1.2, ls="--", label="95th pct.")
+        skew = float(stats.skew(vals))
+        kurt = float(stats.kurtosis(vals))
+        p95_ratio = float(vals.quantile(0.95) / vals.median()) if vals.median() != 0 else np.nan
+        ax.text(
+            0.04,
+            0.96,
+            f"{box_title}\nSkew={skew:.2f}\nKurt={kurt:.2f}\nP95/median={p95_ratio:.2f}",
+            transform=ax.transAxes,
+            fontsize=8,
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.78),
+        )
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Density")
+        if box_title == "Raw scale":
+            ax.set_xlim(left=0)
+        ax.legend(fontsize=8)
+
+    fig.suptitle(f"Why the {label} Target Uses a Log Transformation", fontsize=13, y=1.02)
+    save_fig("target_log_transform_comparison")
+
+
 def table_target_stats(df: pd.DataFrame):
     """Descriptive statistics for the three target variables."""
     records = []
@@ -318,8 +390,8 @@ def figure_feature_correlation_matrix(df: pd.DataFrame):
 def figure_global_emissions_trend(df: pd.DataFrame):
     """Line chart: global total GHG and per-capita emissions over time."""
     yearly = df.groupby("year").agg(
-        total_ghg=("total_ghg_emissions", "sum"),
-        mean_ghg=("total_ghg_emissions", "mean"),
+        total_ghg=("total_ghg_emissions_mt_co2e", "sum"),
+        mean_ghg=("total_ghg_emissions_per_capita", "mean"),
         n_countries=("country", "count"),
     ).reset_index()
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
@@ -333,8 +405,8 @@ def figure_global_emissions_trend(df: pd.DataFrame):
     ax = axes[1]
     ax.plot(yearly["year"], yearly["mean_ghg"], color="#d6604d", lw=2, marker="o", markersize=4)
     ax.set_xlabel("Year")
-    ax.set_ylabel("Mean Country GHG (Mt CO$_2$e)")
-    ax.set_title("(b) Cross-Country Mean GHG Emissions")
+    ax.set_ylabel("Mean Country GHG (t CO$_2$e/cap)")
+    ax.set_title("(b) Cross-Country Mean Per-Capita GHG Emissions")
     ax.xaxis.set_major_locator(mticker.MultipleLocator(4))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30)
     fig.suptitle("Temporal Trends in GHG Emissions (2000–2024)", fontsize=13, y=1.02)
@@ -457,16 +529,16 @@ def figure_renewable_trend(df: pd.DataFrame):
 def figure_key_features_pairplot(df: pd.DataFrame):
     """Pairplot for the most complete key indicators."""
     key_cols = [
-        "total_ghg_emissions", "gdp_per_capita_constant_2015_us",
+        "total_ghg_emissions_per_capita", "gdp_per_capita_constant_2015_us",
         "renewable_energy_share_tfc_pct",
         "population_density_people_per_sq_km_of_land_area", "linear",
     ]
     sub = df[key_cols].dropna()
-    for c in ["total_ghg_emissions", "gdp_per_capita_constant_2015_us",
+    for c in ["total_ghg_emissions_per_capita", "gdp_per_capita_constant_2015_us",
               "population_density_people_per_sq_km_of_land_area"]:
         sub[c] = np.log1p(sub[c])
     rename = {
-        "total_ghg_emissions": "ln(GHG)",
+        "total_ghg_emissions_per_capita": "ln(GHG/cap)",
         "gdp_per_capita_constant_2015_us": "ln(GDP/cap)",
         "renewable_energy_share_tfc_pct": "Renew. (\%)",
         "population_density_people_per_sq_km_of_land_area": "ln(Pop. dens.)",
@@ -579,6 +651,7 @@ def run():
     print("\nGenerating figures...")
     figure_missing_data_heatmap(df)
     figure_target_distributions(df)
+    figure_target_log_transform_comparison(df)
     figure_feature_target_correlation(df)
     figure_feature_correlation_matrix(df)
     figure_global_emissions_trend(df)

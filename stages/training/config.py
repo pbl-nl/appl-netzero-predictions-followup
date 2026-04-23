@@ -30,8 +30,8 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 5000
 
-# ACTIVE_MODELS = []
-ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp", "extra_trees", "hist_gradient_boosting", "adaboost", "lightgbm", "catboost", "kernel_ridge"]
+ACTIVE_MODELS = ["mlp", "hist_gradient_boosting", "kernel_ridge"]
+# ACTIVE_MODELS = ["ridge", "elasticnet", "xgboost", "svr", "random_forest", "mlp", "extra_trees", "hist_gradient_boosting", "adaboost", "lightgbm", "catboost", "kernel_ridge"]
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -58,6 +58,10 @@ MAX_TRAIN_START_YEAR = min(OUTER_TEST_YEARS) - N_TEMPORAL_CV_FOLDS - 1  # = 2012
 # outer_test_mae across outer folds. Take top CANDIDATE_PRIMARY_COUNT as primary.
 # For any primary with candidate_all_folds_outer_gap_flagged=True, append the
 # next-best non-flagged candidate as backup. Result: between 3 and 6 per pair.
+# Note: outer_test_mae refers to the STRICT test set (drop_rows=True), which is
+# the primary evaluation surface so train and test share the same completeness
+# floor. The lenient variant (drop_rows="targets_only") is carried as the
+# outer_test_{metric}_lenient / final_test_{metric}_lenient secondary audit.
 CANDIDATE_PRIMARY_COUNT = 3
 SELECTION_TOLERANCE = 0.01  # legacy knob, kept for reference tables
 MODEL_COMPLEXITY_RANK: dict[str, int] = {
@@ -117,7 +121,7 @@ OUTER_GAP_ABS_THRESHOLD = 0.1
 OUTER_GAP_REL_THRESHOLD = 0.5
 
 # Feature selection
-N_FEATURES_TO_SELECT = 30
+N_FEATURES_TO_SELECT = 50
 
 # --- Output paths ---
 
@@ -155,14 +159,18 @@ FINAL_RESULTS_COLUMNS = [
     "best_params_json",
     "final_train_rows",
     "final_test_rows",
+    "final_test_rows_lenient",
     "feature_count",
     "bootstrap_iterations",
     # final_train_{metric} for each of the 5 metrics
     "final_train_mae", "final_train_mse", "final_train_rmse",
     "final_train_r2", "final_train_explained_variance",
-    # final_test_{metric} for each of the 5 metrics
+    # final_test_{metric} (primary — strict drop_rows=True) for each of the 5 metrics
     "final_test_mae", "final_test_mse", "final_test_rmse",
     "final_test_r2", "final_test_explained_variance",
+    # final_test_{metric}_lenient (secondary audit — drop_rows="targets_only")
+    "final_test_mae_lenient", "final_test_mse_lenient", "final_test_rmse_lenient",
+    "final_test_r2_lenient", "final_test_explained_variance_lenient",
     "artifact_path",
 ]
 FINAL_PREDICTIONS_COLUMNS = [

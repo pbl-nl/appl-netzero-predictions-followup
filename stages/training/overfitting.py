@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# All metric references in this module (outer_test_{m}, inner_val_mean_{m}) refer
+# to the STRICT evaluation surface, which is now primary. Lenient (_lenient suffix)
+# is recorded upstream but not consulted for gap flagging.
+
 from typing import Any
 
 import numpy as np
@@ -87,7 +91,8 @@ def build_overfitting_audit_df(
       selected_as_primary / selected_as_backup — per-candidate selection roles.
 
     Neither candidate-level flag gates tuning or penalized CV loss; both are
-    audit signals. Winner selection is driven by mean outer_test_mae directly.
+    audit signals. Winner selection is driven by mean outer_test_mae directly
+    (strict evaluation surface — the primary).
     """
     audit_df = outer_results_df.copy()
 

@@ -223,62 +223,84 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
     if model_name == "xgboost":
         return {
             "n_estimators": scope.int(hp.quniform("n_estimators", 50, 500, 10)),
-            "max_depth": scope.int(hp.quniform("max_depth", 2, 10, 1)),
+            # OLD: max_depth [2,10] → depth 8–10 showed increasing max gaps (3.11× at depth=9)
+            "max_depth": scope.int(hp.quniform("max_depth", 2, 7, 1)),
             "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
             "subsample": hp.uniform("subsample", 0.5, 1.0),
             "colsample_bytree": hp.uniform("colsample_bytree", 0.4, 1.0),
-            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-4), np.log(100.0)),
+            # OLD: reg_lambda [1e-4,100] → 4.72× worst case had lambda=0.12; all clean configs had lambda>0.1
+            "reg_lambda": hp.loguniform("reg_lambda", np.log(0.1), np.log(100.0)),
             "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-4), np.log(50.0)),
-            "min_child_weight": hp.quniform("min_child_weight", 1.0, 50.0, 1.0),
-            "gamma": hp.uniform("gamma", 0.0, 10.0),
+            # OLD: min_child_weight [1,50] → mcw=1 allows single-sample children on ~1800-row data
+            "min_child_weight": hp.quniform("min_child_weight", 5.0, 50.0, 1.0),
+            "gamma": hp.uniform("gamma", 0.0, 5.0),
         }
     if model_name == "svr":
         return {
-            "kernel": hp.choice("kernel", ["linear", "rbf", "poly", "sigmoid"]),
-            "C": hp.loguniform("C", np.log(1e-3), np.log(1e3)),
+            # OLD: [linear, rbf, poly, sigmoid] → poly mean 16.43×/max 292×; sigmoid max 3.88× at high C
+            "kernel": hp.choice("kernel", ["linear", "rbf"]),
+            # OLD: C [1e-3, 1e3] → sigmoid 3.88× case had C=16.78; high-C SVR memorises small data
+            "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
             "epsilon": hp.loguniform("epsilon", np.log(1e-4), np.log(1.0)),
-            "gamma": hp.loguniform("gamma", np.log(1e-6), np.log(10.0)),
+            # OLD: gamma [1e-6, 10] → RBF 7.14× case had gamma=5.0; best configs had gamma < 0.1
+            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.5)),
         }
     if model_name == "random_forest":
         return {
             "n_estimators": scope.int(hp.quniform("n_estimators", 100, 500, 25)),
-            "max_depth": hp.choice("max_depth", [None, 5, 10, 15, 20]),
-            "min_samples_split": scope.int(hp.quniform("min_samples_split", 2, 100, 2)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 1, 60, 1)),
+            # OLD: [None, 5, 10, 15, 20] → None worst 5.55×; depth=20 worst 3.00×
+            "max_depth": hp.choice("max_depth", [5, 10, 15]),
+            # OLD: min_samples_split [2,100] → worst case had mss=4; 10 = 0.5% of ~1800 rows
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 10, 100, 2)),
+            # OLD: min_samples_leaf [1,60] → msl<5 mean 0.92×/max 5.55×; msl≥5 max drops to 1.57×
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 5, 60, 1)),
             "max_features": hp.choice("max_features", [0.2, 0.3, 0.5, 0.7, "sqrt", "log2"]),
         }
     if model_name == "mlp":
         return {
+            # OLD: 10 choices incl. (64,64,64), (128,64,32), (100,100) → 3-layer max 12.5×;
+            # (100,100) was first trial in recent run with 1.18× gap
             "hidden_layer_sizes": hp.choice(
                 "hidden_layer_sizes",
                 [(16,), (32,), (64,), (128,),
-                 (32, 16), (64, 32), (100, 100), (128, 64),
-                 (64, 64, 64), (128, 64, 32)],
+                 (32, 16), (64, 32), (128, 64)],
             ),
             "activation": hp.choice("activation", ["relu", "tanh"]),
-            "alpha": hp.loguniform("alpha", np.log(1e-6), np.log(1e-1)),
+            # OLD: alpha [1e-6, 1e-1] → all gap > 8× cases had alpha < 1e-4; worst was alpha=5.7e-5
+            "alpha": hp.loguniform("alpha", np.log(1e-3), np.log(1e-1)),
+            # OLD: lr_init [1e-5, 1e-1] → 1e-5 configs converge too slowly, waste budget
             "learning_rate_init": hp.loguniform(
-                "learning_rate_init", np.log(1e-5), np.log(1e-1),
+                "learning_rate_init", np.log(1e-4), np.log(1e-1),
             ),
-            "batch_size": hp.choice("batch_size", [32, 64, 128, 256]),
+            # OLD: [32, 64, 128, 256] → batch=32 mean gap 2.57×; was the batch for the 12.5× case
+            "batch_size": hp.choice("batch_size", [64, 128, 256]),
         }
     if model_name == "extra_trees":
         return {
             "n_estimators": scope.int(hp.quniform("n_estimators", 100, 500, 25)),
-            "max_depth": hp.choice("max_depth", [None, 5, 10, 15, 20]),
-            "min_samples_split": scope.int(hp.quniform("min_samples_split", 2, 100, 2)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 1, 60, 1)),
+            # OLD: [None, 5, 10, 15, 20] → None worst 5.26×; depth=20 worst 3.15×
+            "max_depth": hp.choice("max_depth", [5, 10, 15]),
+            # OLD: min_samples_split [2,100] → worst cases had mss=2–6
+            "min_samples_split": scope.int(hp.quniform("min_samples_split", 10, 100, 2)),
+            # OLD: min_samples_leaf [1,60] → msl<5 mean 0.88×/max 5.26×; msl≥5 max 4.04×
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 5, 60, 1)),
             "max_features": hp.choice("max_features", [0.2, 0.3, 0.5, 0.7, "sqrt", "log2"]),
         }
     if model_name == "hist_gradient_boosting":
         return {
-            "max_iter": scope.int(hp.quniform("max_iter", 100, 500, 10)),
-            "max_depth": hp.choice("max_depth", [None, 4, 6, 8, 10]),
-            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
-            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 5, 80, 5)),
-            "max_leaf_nodes": scope.int(hp.quniform("max_leaf_nodes", 8, 127, 1)),
+            # OLD: max_iter [100,500] → iters 350–500 mean 2.22×/max 5.46×
+            "max_iter": scope.int(hp.quniform("max_iter", 100, 300, 10)),
+            # OLD: [None, 4, 6, 8, 10] → depth=8 mean 2.43×; depth=10 interacts catastrophically with high iters
+            "max_depth": hp.choice("max_depth", [None, 4, 6]),
+            # OLD: lr [0.005, 0.3] → strongest predictor: lr 0.1–0.2 mean 3.58×; lr 0.2–0.3 mean 3.96×
+            "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.1)),
+            # OLD: min_samples_leaf [5,80] → best low-gap trial used msl=35 (gap=0.12×); msl<20 high-gap zone
+            "min_samples_leaf": scope.int(hp.quniform("min_samples_leaf", 20, 80, 5)),
+            # OLD: max_leaf_nodes [8,127] → 64–100 bucket worst (mean 2.58×); cap at 50 prevents depth circumvention
+            "max_leaf_nodes": scope.int(hp.quniform("max_leaf_nodes", 15, 50, 1)),
+            # OLD: l2 [1e-3,100] → selected winners used l2=0.001–0.004; near-zero l2 + high lr drove gaps
             "l2_regularization": hp.loguniform(
-                "l2_regularization", np.log(1e-3), np.log(100.0),
+                "l2_regularization", np.log(0.1), np.log(100.0),
             ),
         }
     if model_name == "adaboost":
@@ -286,35 +308,51 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
             "n_estimators": scope.int(hp.quniform("n_estimators", 25, 400, 5)),
             "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(2.0)),
             "loss": hp.choice("loss", ["linear", "square", "exponential"]),
-            "base_max_depth": scope.int(hp.quniform("base_max_depth", 1, 6, 1)),
+            # OLD: base_max_depth [1,6] → depth=6 was the only problematic case (1.54×)
+            "base_max_depth": scope.int(hp.quniform("base_max_depth", 1, 4, 1)),
         }
     if model_name == "lightgbm":
         return {
             "boosting_type": hp.choice("boosting_type", ["gbdt", "dart"]),
-            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 500, 10)),
-            "max_depth": scope.int(hp.quniform("max_depth", 2, 8, 1)),
-            "num_leaves": scope.int(hp.quniform("num_leaves", 8, 128, 4)),
+            # OLD: n_estimators [50,500] → consistent with catboost iterations cap
+            "n_estimators": scope.int(hp.quniform("n_estimators", 50, 400, 10)),
+            # OLD: max_depth [2,8] → prevents depth 7–8 × num_leaves uncapped growth interaction
+            "max_depth": scope.int(hp.quniform("max_depth", 2, 6, 1)),
+            # OLD: num_leaves [8,128] → 6.18× case had depth=6/num_leaves=48 (>2^6/2);
+            # num_leaves > 2^depth causes uncapped tree growth per LightGBM docs; cap at 32
+            "num_leaves": scope.int(hp.quniform("num_leaves", 8, 32, 4)),
             "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.2)),
-            "min_child_samples": scope.int(hp.quniform("min_child_samples", 5, 80, 5)),
+            # OLD: min_child_samples [5,80] → 10–20 bucket mean 1.34×/max 6.18×; 20–30 mean 0.53×
+            "min_child_samples": scope.int(hp.quniform("min_child_samples", 20, 80, 5)),
             "subsample": hp.uniform("subsample", 0.5, 1.0),
             "colsample_bytree": hp.uniform("colsample_bytree", 0.4, 1.0),
-            "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-4), np.log(50.0)),
-            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-4), np.log(100.0)),
+            # OLD: reg_alpha [1e-4, 50] → 6.18× case had reg_alpha=0.0015
+            "reg_alpha": hp.loguniform("reg_alpha", np.log(1e-3), np.log(50.0)),
+            "reg_lambda": hp.loguniform("reg_lambda", np.log(1e-3), np.log(100.0)),
         }
     if model_name == "catboost":
         return {
-            "iterations": scope.int(hp.quniform("iterations", 100, 800, 25)),
-            "depth": scope.int(hp.quniform("depth", 3, 10, 1)),
+            # OLD: iterations [100,800] → iters 700 mean 4.18×/max 5.41×; iters 200 mean 0.44×
+            "iterations": scope.int(hp.quniform("iterations", 100, 400, 25)),
+            # OLD: depth [3,10] → depth=8 mean 3.69×/max 5.26×; depth=10 mean 3.89×
+            "depth": scope.int(hp.quniform("depth", 3, 7, 1)),
             "learning_rate": hp.loguniform("learning_rate", np.log(0.005), np.log(0.3)),
-            "l2_leaf_reg": hp.loguniform("l2_leaf_reg", np.log(0.1), np.log(100.0)),
+            # OLD: l2_leaf_reg [0.1,100] → 5.41× case had l2=0.176; best low-gap used l2=7.13
+            "l2_leaf_reg": hp.loguniform("l2_leaf_reg", np.log(1.0), np.log(100.0)),
             "random_strength": hp.loguniform("random_strength", np.log(0.01), np.log(50.0)),
             "bagging_temperature": hp.uniform("bagging_temperature", 0.0, 1.0),
         }
     if model_name == "kernel_ridge":
         return {
-            "alpha": hp.loguniform("alpha", np.log(1e-5), np.log(1e3)),
-            "kernel": hp.choice("kernel", ["rbf", "laplacian", "linear", "polynomial"]),
-            "gamma": hp.loguniform("gamma", np.log(1e-6), np.log(10.0)),
+            # OLD: alpha [1e-5, 1e3] → decisive split: alpha<0.1 mean 22.42×/max 65.65×;
+            # alpha≥0.1 mean 0.05×/max 0.35×
+            "alpha": hp.loguniform("alpha", np.log(0.1), np.log(1e3)),
+            # OLD: [rbf, laplacian, linear, polynomial] → polynomial mean 48.71×/max 1691×;
+            # laplacian mean 2.52×/max 81.84×; both removed
+            "kernel": hp.choice("kernel", ["rbf", "linear"]),
+            # OLD: gamma [1e-6, 10] → 65.65× case had gamma=8.21; best RBF had gamma=0.022–0.098;
+            # natural scale 1/n_features≈0.033 with 30 features
+            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(1.0)),
         }
     raise ValueError(f"Unsupported model name: {model_name}")
 

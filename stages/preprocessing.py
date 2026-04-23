@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,12 @@ YEAR_COL = "year"
 ID_COLS = [COUNTRY_COL, YEAR_COL]
 TARGET_COLS = ["linear", "optimistic", "pessimistic"]
 CATEGORICAL_FEATURES = ["v2x_regime"]
+NON_FEATURE_COLS = [
+    "non_co2_emissions_mt_co2e",
+    "total_ghg_emissions_mt_co2e",
+    "total_hard_to_abate_emissions_mt_co2e",
+    "population_total",
+]
 
 TEST_YEAR = 2022
 RANDOM_STATE = 42
@@ -52,17 +59,13 @@ IQR_MULTIPLIER = 1.5
 COUNTRY_OUTLIER_MIN_OBS = 5
 YEAR_OUTLIER_MIN_OBS = 20
 
-LAG_PERIODS = [1]
-ROLLING_WINDOWS = [3]
+LAG_PERIODS = [1, 2, 3]
+ROLLING_WINDOWS = [3, 5, 7]
+ROLLING_STD_WINDOWS = [3, 5]
 ROLLING_MIN_PERIODS = 1
 STRUCTURAL_NA_FILL_VALUE = 0.0
-INTERACTION_PAIRS: list[tuple[str, str]] = [
-    ("total_ghg_emissions", "population_total"),
-    ("oil_rents_of_gdp", "total_ghg_emissions"),
-    ("renewable_energy_share_tfc_pct", "energy_intensity_mj_per_usd_ppp"),
-    ("gdp_per_capita_constant_2015_us", "total_ghg_emissions"),
-    ("control_of_corruption_estimate", "renewable_energy_share_tfc_pct"),
-]
+ALL_PAIRWISE_INTERACTIONS = True  # generates all C(n,2) pairs from engineerable features
+INTERACTION_PAIRS: list[tuple[str, str]] = []  # used only when ALL_PAIRWISE_INTERACTIONS=False
 ENABLE_DIFF_FEATURES = True
 ENABLE_PCT_CHANGE_FEATURES = True
 
@@ -78,20 +81,7 @@ RATE_FEATURES = {
     "annual_deforestation_of_change",
 }
 
-PCT_CHANGE_FEATURES = [
-    "renewable_energy_share_tfc_pct",
-    "renewable_electricity_share_pct",
-    "energy_intensity_mj_per_usd_ppp",
-    "inform_risk_index",
-    "non_co2_emissions",
-    "total_hard_to_abate_emissions",
-    "rsf_press_freedom_index",
-    "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average",
-    "gdp_per_capita_constant_2015_us",
-    "gdp_ppp_constant_2021_international",
-    "population_density_people_per_sq_km_of_land_area",
-    "population_total",
-]
+# Pct-change is applied to all engineerable features except RATE_FEATURES (already rates).
 
 NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
     "renewable_energy_share_tfc_pct": {"lower": 0.0, "upper": 100.0},
@@ -99,9 +89,9 @@ NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
     "energy_intensity_mj_per_usd_ppp": {"lower": 0.0, "upper": 100.0},
     "inform_risk_index": {"lower": 0.0, "upper": 10.0},
     "ghg_growth": {"finite_only": True},
-    "non_co2_emissions": {"lower": 0.0, "upper": 5000.0},
-    "total_ghg_emissions": {"lower": -5000.0, "upper": 20000.0},
-    "total_hard_to_abate_emissions": {"lower": 0.0, "upper": 5000.0},
+    "non_co2_emissions_per_capita": {"lower": 0.0, "upper": 500.0},
+    "total_ghg_emissions_per_capita": {"lower": -500.0, "upper": 500.0},
+    "total_hard_to_abate_emissions_per_capita": {"lower": 0.0, "upper": 500.0},
     "rsf_press_freedom_index": {"lower": 0.0, "upper": 100.0},
     "agricultural_land_of_land_area": {"lower": 0.0, "upper": 100.0},
     "annual_deforestation_of_change": {"lower": -100.0, "upper": 100.0},
@@ -142,7 +132,7 @@ def safe_mode(series: pd.Series) -> Any:
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    return [col for col in df.columns if col not in ID_COLS + TARGET_COLS]
+    return [col for col in df.columns if col not in ID_COLS + TARGET_COLS + NON_FEATURE_COLS]
 
 
 def get_continuous_features(df: pd.DataFrame, feature_columns: list[str]) -> list[str]:
@@ -403,7 +393,7 @@ class Preprocessor:
         df: pd.DataFrame,
         history_df: pd.DataFrame | None = None,
         split_name: str = "data",
-        drop_rows: bool = True,
+        drop_rows: bool | str = True,
     ) -> dict[str, pd.DataFrame]:
         cleaned = self._clean(df, history_df=history_df, fit=False, drop_rows=drop_rows)
         cleaned = self._fill_temporal_gaps(cleaned)
@@ -444,7 +434,7 @@ class Preprocessor:
         df: pd.DataFrame,
         history_df: pd.DataFrame | None,
         fit: bool,
-        drop_rows: bool = True,
+        drop_rows: bool | str = True,
     ) -> pd.DataFrame:
         current = df.copy().sort_values(ID_COLS).reset_index(drop=True)
         current["_is_current"] = True
@@ -464,12 +454,17 @@ class Preprocessor:
 
         cleaned = working[working["_is_current"]].copy().drop(columns=["_is_current"], errors="ignore")
 
-        if drop_rows:
+        if drop_rows is True:
             feature_cols = get_feature_columns(cleaned)
             real_feature_cols = [c for c in feature_cols if c not in self.synthetic_feature_names_]
             row_missing = cleaned[real_feature_cols].isna().mean(axis=1) > ROW_MISSINGNESS_THRESHOLD
             all_targets_nan = cleaned[TARGET_COLS].isna().all(axis=1)
             drop_mask = all_targets_nan | row_missing
+        elif drop_rows == "targets_only":
+            # Evaluation mode: keep rows with high feature missingness (imputation handles them);
+            # only drop rows where every target is NaN (no metric can be computed).
+            all_targets_nan = cleaned[TARGET_COLS].isna().all(axis=1)
+            drop_mask = all_targets_nan
         else:
             drop_mask = pd.Series(False, index=cleaned.index)
 
@@ -765,21 +760,32 @@ class Preprocessor:
                     col_names.append(name)
 
         if ENABLE_PCT_CHANGE_FEATURES:
-            for col in PCT_CHANGE_FEATURES:
-                if col in engineerable:
+            for col in engineerable:
+                if col not in RATE_FEATURES:
                     name = f"{col}_pct_change1"
                     new_cols[name] = group[col].pct_change().replace([np.inf, -np.inf], np.nan)
                     col_names.append(name)
 
         for window in ROLLING_WINDOWS:
             for col in engineerable:
-                name = f"{col}_rollmean{window}"
+                w = window  # capture loop variable for lambda
+                name = f"{col}_rollmean{w}"
                 new_cols[name] = group[col].transform(
-                    lambda s: s.rolling(window=window, min_periods=ROLLING_MIN_PERIODS).mean()
+                    lambda s, _w=w: s.rolling(window=_w, min_periods=ROLLING_MIN_PERIODS).mean()
                 )
                 col_names.append(name)
 
-        for left, right in INTERACTION_PAIRS:
+        for window in ROLLING_STD_WINDOWS:
+            for col in engineerable:
+                w = window
+                name = f"{col}_rollstd{w}"
+                new_cols[name] = group[col].transform(
+                    lambda s, _w=w: s.rolling(window=_w, min_periods=ROLLING_MIN_PERIODS).std()
+                )
+                col_names.append(name)
+
+        pairs = combinations(engineerable, 2) if ALL_PAIRWISE_INTERACTIONS else iter(INTERACTION_PAIRS)
+        for left, right in pairs:
             if left in working.columns and right in working.columns:
                 name = f"{left}_x_{right}"
                 new_cols[name] = working[left] * working[right]

@@ -61,9 +61,11 @@ def _run_one_iteration(
     y_train: pd.Series,
     x_test_scored: pd.DataFrame,
     y_test_scored: pd.Series,
+    x_test_scored_lenient: pd.DataFrame,
+    y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], np.ndarray]:
+) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]:
     bootstrap_seed = PIPELINE_RANDOM_STATE + iteration_idx
     x_boot = x_train.sample(frac=1.0, replace=True, random_state=bootstrap_seed)
     y_boot = y_train.loc[x_boot.index]
@@ -79,8 +81,11 @@ def _run_one_iteration(
     scored_preds = model.predict(x_test_scored)
     scored_metrics = evaluate_metrics(y_test_scored, scored_preds)
 
+    scored_preds_lenient = model.predict(x_test_scored_lenient)
+    scored_metrics_lenient = evaluate_metrics(y_test_scored_lenient, scored_preds_lenient)
+
     all_preds = model.predict(x_test_all)
-    return iteration_idx, train_metrics, scored_metrics, all_preds
+    return iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds
 
 
 def _init_worker(
@@ -90,6 +95,8 @@ def _init_worker(
     y_train: pd.Series,
     x_test_scored: pd.DataFrame,
     y_test_scored: pd.Series,
+    x_test_scored_lenient: pd.DataFrame,
+    y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
 ) -> None:
     global _WORKER_STATE
@@ -100,6 +107,8 @@ def _init_worker(
         "y_train": y_train,
         "x_test_scored": x_test_scored,
         "y_test_scored": y_test_scored,
+        "x_test_scored_lenient": x_test_scored_lenient,
+        "y_test_scored_lenient": y_test_scored_lenient,
         "x_test_all": x_test_all,
     }
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
@@ -108,7 +117,7 @@ def _init_worker(
 
 def _run_iteration_from_state(
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], np.ndarray]:
+) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]:
     state = _WORKER_STATE
     if state is None:
         raise RuntimeError("Worker state not initialized.")
@@ -119,6 +128,8 @@ def _run_iteration_from_state(
         y_train=state["y_train"],
         x_test_scored=state["x_test_scored"],
         y_test_scored=state["y_test_scored"],
+        x_test_scored_lenient=state["x_test_scored_lenient"],
+        y_test_scored_lenient=state["y_test_scored_lenient"],
         x_test_all=state["x_test_all"],
         iteration_idx=iteration_idx,
     )
@@ -132,9 +143,11 @@ def run_final_bootstrap_iterations(
     y_train: pd.Series,
     x_test_scored: pd.DataFrame,
     y_test_scored: pd.Series,
+    x_test_scored_lenient: pd.DataFrame,
+    y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
     bootstrap_workers: int | None = None,
-) -> list[tuple[int, dict[str, float], dict[str, float], np.ndarray]]:
+) -> list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]]:
     iteration_indices = list(range(FINAL_BOOTSTRAP_ITERATIONS))
     effective_max = bootstrap_workers if bootstrap_workers is not None else FINAL_BOOTSTRAP_MAX_WORKERS
     max_workers = min(
@@ -156,6 +169,7 @@ def run_final_bootstrap_iterations(
                     model_name, best_params,
                     x_train, y_train,
                     x_test_scored, y_test_scored,
+                    x_test_scored_lenient, y_test_scored_lenient,
                     x_test_all,
                 ),
             ) as executor:
@@ -184,6 +198,8 @@ def run_final_bootstrap_iterations(
             y_train=y_train,
             x_test_scored=x_test_scored,
             y_test_scored=y_test_scored,
+            x_test_scored_lenient=x_test_scored_lenient,
+            y_test_scored_lenient=y_test_scored_lenient,
             x_test_all=x_test_all,
             iteration_idx=idx,
         )
