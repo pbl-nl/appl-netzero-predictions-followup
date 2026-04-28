@@ -222,6 +222,8 @@ class Preprocessor:
 
         # Synthetic feature names (non-engineerable columns)
         self.synthetic_feature_names_: list[str] = []
+        self._last_clean_missingness_: pd.DataFrame = pd.DataFrame()
+        self.last_transform_missingness_: pd.DataFrame = pd.DataFrame()
 
         # Imputers
         self.simple_imputer_: CountryYearFallbackImputer | None = None
@@ -396,6 +398,7 @@ class Preprocessor:
         drop_rows: bool | str = True,
     ) -> dict[str, pd.DataFrame]:
         cleaned = self._clean(df, history_df=history_df, fit=False, drop_rows=drop_rows)
+        self.last_transform_missingness_ = self._last_clean_missingness_.copy()
         cleaned = self._fill_temporal_gaps(cleaned)
         cleaned = self._attach_synthetic_features(cleaned)
 
@@ -453,11 +456,15 @@ class Preprocessor:
         self._apply_categorical_range_rules(working)
 
         cleaned = working[working["_is_current"]].copy().drop(columns=["_is_current"], errors="ignore")
+        feature_cols = get_feature_columns(cleaned)
+        real_feature_cols = [c for c in feature_cols if c not in self.synthetic_feature_names_]
+        if real_feature_cols:
+            row_missing_fraction = cleaned[real_feature_cols].isna().mean(axis=1)
+        else:
+            row_missing_fraction = pd.Series(0.0, index=cleaned.index)
 
         if drop_rows is True:
-            feature_cols = get_feature_columns(cleaned)
-            real_feature_cols = [c for c in feature_cols if c not in self.synthetic_feature_names_]
-            row_missing = cleaned[real_feature_cols].isna().mean(axis=1) > ROW_MISSINGNESS_THRESHOLD
+            row_missing = row_missing_fraction > ROW_MISSINGNESS_THRESHOLD
             all_targets_nan = cleaned[TARGET_COLS].isna().all(axis=1)
             drop_mask = all_targets_nan | row_missing
         elif drop_rows == "targets_only":
@@ -470,6 +477,10 @@ class Preprocessor:
 
         if fit:
             self._fit_column_drops(cleaned.loc[~drop_mask].copy())
+
+        self._last_clean_missingness_ = cleaned[[COUNTRY_COL, YEAR_COL]].copy()
+        self._last_clean_missingness_["row_missingness_fraction"] = row_missing_fraction.to_numpy()
+        self._last_clean_missingness_["included"] = (~drop_mask).to_numpy()
 
         cleaned["_to_drop"] = drop_mask
         cleaned = cleaned.drop(columns=sorted(self.columns_to_drop_), errors="ignore")

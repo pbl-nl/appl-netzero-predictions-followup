@@ -88,10 +88,13 @@ def table_performance_summary(
         c for c in [
             "target", "outer_strategy_source", "branch", "model_name",
             "candidate_rank", "candidate_role",
-            "final_test_mae", "final_test_rmse", "final_test_r2",
+            "final_test_mae", "final_test_rows",
+            "final_test_mae_lenient", "final_test_rows_lenient",
+            "final_test_rmse", "final_test_r2",
             "final_test_mse", "final_test_explained_variance",
             "final_train_mae", "train_test_gap_mae",
             "feature_count", "bootstrap_iterations",
+            "final_model_svr_converged", "bootstrap_svr_converged_share",
         ] if c in df.columns
     ]
     df = df[keep_cols].copy()

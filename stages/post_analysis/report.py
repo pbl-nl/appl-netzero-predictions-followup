@@ -41,6 +41,8 @@ _SHEET_ORDER: list[tuple[str, str]] = [
     ("strategy_sensitivity",       "Strategy Sensitivity"),
     ("scenario_sensitivity",       "Scenario Sensitivity"),
     ("country_uncertainty_ranking","Country Uncertainty"),
+    ("missingness_stratified",     "Missingness Stratified"),
+    ("abstention_curve",           "Abstention Curve"),
     ("tnz_predictions",            "TNZ Predictions"),
     ("tnz_bootstrap_implied_years","TNZ Bootstrap Years"),
     ("outer_cv_results",           "Outer CV Results"),
@@ -125,6 +127,7 @@ def build_key_findings(
     branch_sensitivity: pd.DataFrame  | None = None,
     strategy_sensitivity: pd.DataFrame | None = None,
     tnz_predictions: pd.DataFrame     | None = None,
+    abstention_curve: pd.DataFrame    | None = None,
 ) -> dict[str, Any]:
     """
     Extract and structure the most important headline findings across analyses.
@@ -150,6 +153,10 @@ def build_key_findings(
                         findings[f"best_strategy_{target}"] = best_row["outer_strategy_source"]
                     if "branch" in best_row:
                         findings[f"best_branch_{target}"] = best_row["branch"]
+                    if "final_test_rows" in best_row:
+                        findings[f"coverage_strict_{target}"] = int(best_row["final_test_rows"])
+                    if "final_test_rows_lenient" in best_row:
+                        findings[f"coverage_lenient_{target}"] = int(best_row["final_test_rows_lenient"])
 
     # --- Benchmark: % countries on track ---
     if benchmark_summary is not None and not benchmark_summary.empty:
@@ -197,6 +204,35 @@ def build_key_findings(
             mean_delta = strategy_sensitivity["delta_mae"].mean()
             findings["strategy_mean_delta_mae"] = round(float(mean_delta), 4) if not np.isnan(mean_delta) else None
 
+    # --- Abstention curve: MAE at the 0.30 strict threshold ---
+    if abstention_curve is not None and not abstention_curve.empty:
+        if "threshold" in abstention_curve.columns and "mae" in abstention_curve.columns:
+            curve = abstention_curve.copy()
+            if "candidate_role" in curve.columns:
+                primary = curve[curve["candidate_role"] == "primary"]
+                if not primary.empty:
+                    curve = primary
+            if "candidate_rank" in curve.columns:
+                rank = pd.to_numeric(curve["candidate_rank"], errors="coerce")
+                rank_1 = curve[rank == 1]
+                if not rank_1.empty:
+                    curve = rank_1
+            at_30 = curve[
+                (curve["threshold"] - 0.30).abs() < 0.01
+            ]
+            if not at_30.empty:
+                if "target" in at_30.columns:
+                    for tgt, grp in at_30.groupby("target"):
+                        val = grp["mae"].mean()
+                        findings[f"abstention_mae_at_0.30_{tgt}"] = (
+                            round(float(val), 4) if not np.isnan(val) else None
+                        )
+                else:
+                    val = at_30["mae"].mean()
+                    findings["abstention_mae_at_0.30"] = (
+                        round(float(val), 4) if not np.isnan(val) else None
+                    )
+
     return findings
 
 
@@ -240,6 +276,7 @@ def run_report(
         branch_sensitivity   = all_tables.get("branch_sensitivity"),
         strategy_sensitivity = all_tables.get("strategy_sensitivity"),
         tnz_predictions      = all_tables.get("tnz_predictions"),
+        abstention_curve     = all_tables.get("abstention_curve"),
     )
     export_key_findings(key_findings, out_dir / "key_findings.csv")
 

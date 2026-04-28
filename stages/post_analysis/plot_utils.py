@@ -11,6 +11,9 @@ import logging
 import textwrap
 from pathlib import Path
 
+from stages.post_analysis.matplotlib_setup import configure_matplotlib_environment
+
+configure_matplotlib_environment()
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend — must come before pyplot import
 import matplotlib.pyplot as plt

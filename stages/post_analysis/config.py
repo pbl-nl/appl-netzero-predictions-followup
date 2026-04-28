@@ -121,7 +121,8 @@ FIGURE_DPI = 150
 
 PLOT_RCPARAMS: dict = {
     "figure.dpi":         FIGURE_DPI,
-    "font.family":        "serif",
+    "font.family":        "DejaVu Sans",
+    "font.sans-serif":    ["DejaVu Sans"],
     "axes.spines.top":    False,
     "axes.spines.right":  False,
     "axes.grid":          True,

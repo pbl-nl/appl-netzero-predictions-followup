@@ -21,6 +21,7 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
+from sklearn.dummy import DummyRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
@@ -171,6 +172,28 @@ def fit_model(model: Any, x_train: pd.DataFrame, y_train: pd.Series) -> Any:
     return model
 
 
+def get_fit_diagnostics(model: Any) -> dict[str, Any]:
+    """Return convergence diagnostics for models that expose fit state (SVR/SVC)."""
+    if not isinstance(model, SVR):
+        return {
+            "svr_converged": None,
+            "svr_n_iter": None,
+            "svr_support_vectors": None,
+        }
+    converged = not hasattr(model, "fit_status_") or model.fit_status_ == 0
+    n_iter = getattr(model, "n_iter_", None)
+    n_sv = (
+        int(model.support_vectors_.shape[0])
+        if hasattr(model, "support_vectors_")
+        else None
+    )
+    return {
+        "svr_converged": converged,
+        "svr_n_iter": n_iter,
+        "svr_support_vectors": n_sv,
+    }
+
+
 def predict_evaluate(
     model: Any,
     x_eval: pd.DataFrame,
@@ -242,13 +265,21 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
     if model_name == "svr":
         return {
             # OLD: [linear, rbf, poly, sigmoid] → poly mean 16.43×/max 292×; sigmoid max 3.88× at high C
-            "kernel": hp.choice("kernel", ["linear", "rbf"]),
+            # "kernel": hp.choice("kernel", ["linear", "rbf"]),
+            # "kernel": hp.choice("kernel", ["rbf"]),
+            "kernel": hp.choice("kernel", ["rbf"]),
             # OLD: C [1e-3, 1e3] → sigmoid 3.88× case had C=16.78; high-C SVR memorises small data
-            "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
+            # "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
+            # "C": hp.loguniform("C", np.log(1e-2), np.log(10.0)),
+            "C": hp.loguniform("C", np.log(1e-2), np.log(30.0)),
             # OLD: epsilon [1e-4, 1.0] → low epsilon is primary overfit signal (rho_inner=-0.843); sub-0.005 is degenerate attractor
-            "epsilon": hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
+            # "epsilon": hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
+            # "epsilon": hp.loguniform("epsilon", np.log(0.02), np.log(1.0)),
+            "epsilon": hp.loguniform("epsilon", np.log(0.01), np.log(1.0)),
             # OLD: gamma [1e-6, 10] → RBF 7.14× case had gamma=5.0; best configs had gamma < 0.1
-            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.5)),
+            # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.5)),
+            # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.1)),
+            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.25)),
         }
     if model_name == "random_forest":
         return {
@@ -376,6 +407,8 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
             # OLD: gamma [1e-4, 1.0] → observed range 0.002–0.018, concentrated at 0.016; upper 0.1–1.0 never reached
             "gamma": hp.loguniform("gamma", np.log(0.001), np.log(0.1)),
         }
+    if model_name == "dummy_mean":
+        return {}
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
@@ -407,7 +440,7 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
         return ElasticNet(
             alpha=float(params["alpha"]),
             l1_ratio=float(params["l1_ratio"]),
-            max_iter=5000,
+            max_iter=50000,
             random_state=random_state,
         )
     if model_name == "xgboost":
@@ -527,4 +560,6 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             kernel=str(params["kernel"]),
             gamma=float(params["gamma"]),
         )
+    if model_name == "dummy_mean":
+        return DummyRegressor(strategy="mean")
     raise ValueError(f"Unsupported model name: {model_name}")

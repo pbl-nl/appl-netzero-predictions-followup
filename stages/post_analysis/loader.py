@@ -39,6 +39,7 @@ _CSV_MAP: dict[str, str] = {
     "winners":                     "winners.csv",
     "overfitting_audit":           "overfitting_audit.csv",
     "trials":                      "trials.csv",
+    "final_test_missingness":      "final_test_missingness.csv",
 }
 
 

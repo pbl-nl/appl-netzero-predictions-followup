@@ -49,6 +49,11 @@ def table_outer_candidate_summary(
     strategy_col = _strategy_col(df)
     if strategy_col is None or "outer_test_mae" not in df.columns:
         return pd.DataFrame()
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+    df = df[np.isfinite(df["outer_test_mae"])].copy()
+    if df.empty:
+        return pd.DataFrame()
 
     audit = _outer_metric_frame(overfitting_audit) if not overfitting_audit.empty else df.copy()
     if strategy_col not in audit.columns and "outer_strategy" in audit.columns:
@@ -116,6 +121,12 @@ def table_outer_year_breakdown(
     strategy_col = _strategy_col(df)
     required = {"outer_test_year", "outer_test_mae", "target", "branch", "model_name"}
     if strategy_col is None or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"].copy()
+    df = df[np.isfinite(df["outer_test_mae"])].copy()
+    if df.empty:
         return pd.DataFrame()
 
     out = df.copy().rename(columns={strategy_col: "outer_strategy_source"})

@@ -23,6 +23,7 @@ from stages.training.helpers import (
     build_model,
     evaluate_metrics,
     fit_model,
+    get_fit_diagnostics,
 )
 logger = logging.getLogger(__name__)
 
@@ -65,15 +66,27 @@ def _run_one_iteration(
     y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]:
+    country_labels: pd.Series | None = None,
+) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray, bool | None]:
     bootstrap_seed = PIPELINE_RANDOM_STATE + iteration_idx
-    x_boot = x_train.sample(frac=1.0, replace=True, random_state=bootstrap_seed)
-    y_boot = y_train.loc[x_boot.index]
+    if country_labels is not None:
+        rng = np.random.default_rng(bootstrap_seed)
+        unique_countries = country_labels.unique()
+        sampled = rng.choice(unique_countries, size=len(unique_countries), replace=True)
+        boot_idx = np.concatenate(
+            [country_labels.index[country_labels == c].values for c in sampled]
+        )
+        x_boot = x_train.loc[boot_idx]
+        y_boot = y_train.loc[boot_idx]
+    else:
+        x_boot = x_train.sample(frac=1.0, replace=True, random_state=bootstrap_seed)
+        y_boot = y_train.loc[x_boot.index]
 
     model = fit_model(
         build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
         x_boot, y_boot,
     )
+    svr_converged = get_fit_diagnostics(model)["svr_converged"]
 
     train_preds = model.predict(x_train)
     train_metrics = evaluate_metrics(y_train, train_preds)
@@ -85,7 +98,7 @@ def _run_one_iteration(
     scored_metrics_lenient = evaluate_metrics(y_test_scored_lenient, scored_preds_lenient)
 
     all_preds = model.predict(x_test_all)
-    return iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds
+    return iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds, svr_converged
 
 
 def _init_worker(
@@ -98,6 +111,7 @@ def _init_worker(
     x_test_scored_lenient: pd.DataFrame,
     y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
+    country_labels: pd.Series | None = None,
 ) -> None:
     global _WORKER_STATE
     _WORKER_STATE = {
@@ -110,6 +124,7 @@ def _init_worker(
         "x_test_scored_lenient": x_test_scored_lenient,
         "y_test_scored_lenient": y_test_scored_lenient,
         "x_test_all": x_test_all,
+        "country_labels": country_labels,
     }
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
     warnings.filterwarnings("ignore", message=".*Early stopping criterion not reached.*")
@@ -117,7 +132,7 @@ def _init_worker(
 
 def _run_iteration_from_state(
     iteration_idx: int,
-) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]:
+) -> tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray, bool | None]:
     state = _WORKER_STATE
     if state is None:
         raise RuntimeError("Worker state not initialized.")
@@ -132,6 +147,7 @@ def _run_iteration_from_state(
         y_test_scored_lenient=state["y_test_scored_lenient"],
         x_test_all=state["x_test_all"],
         iteration_idx=iteration_idx,
+        country_labels=state.get("country_labels"),
     )
 
 
@@ -146,8 +162,9 @@ def run_final_bootstrap_iterations(
     x_test_scored_lenient: pd.DataFrame,
     y_test_scored_lenient: pd.Series,
     x_test_all: pd.DataFrame,
+    country_labels: pd.Series | None = None,
     bootstrap_workers: int | None = None,
-) -> list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]]:
+) -> list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray, bool | None]]:
     iteration_indices = list(range(FINAL_BOOTSTRAP_ITERATIONS))
     effective_max = bootstrap_workers if bootstrap_workers is not None else FINAL_BOOTSTRAP_MAX_WORKERS
     max_workers = min(
@@ -155,11 +172,12 @@ def run_final_bootstrap_iterations(
         max(1, effective_max),
         DEFAULT_CPU_WORKERS,
     )
+    sample_unit = "country-block" if country_labels is not None else "row"
 
     if FINAL_BOOTSTRAP_ITERATIONS > 1 and max_workers > 1:
         logger.info(
             f"Final bootstrap: target={target} workers={max_workers} "
-            f"iterations={FINAL_BOOTSTRAP_ITERATIONS}"
+            f"iterations={FINAL_BOOTSTRAP_ITERATIONS} sample_unit={sample_unit}"
         )
         try:
             with ProcessPoolExecutor(
@@ -170,7 +188,7 @@ def run_final_bootstrap_iterations(
                     x_train, y_train,
                     x_test_scored, y_test_scored,
                     x_test_scored_lenient, y_test_scored_lenient,
-                    x_test_all,
+                    x_test_all, country_labels,
                 ),
             ) as executor:
                 futures = [
@@ -188,7 +206,8 @@ def run_final_bootstrap_iterations(
             )
 
     logger.info(
-        f"Final bootstrap sequential: target={target} iterations={FINAL_BOOTSTRAP_ITERATIONS}"
+        f"Final bootstrap sequential: target={target} iterations={FINAL_BOOTSTRAP_ITERATIONS} "
+        f"sample_unit={sample_unit}"
     )
     return [
         _run_one_iteration(
@@ -202,6 +221,7 @@ def run_final_bootstrap_iterations(
             y_test_scored_lenient=y_test_scored_lenient,
             x_test_all=x_test_all,
             iteration_idx=idx,
+            country_labels=country_labels,
         )
         for idx in iteration_indices
     ]

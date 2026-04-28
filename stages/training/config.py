@@ -28,10 +28,10 @@ FINAL_BOOTSTRAP_ITERATIONS = 200
 FINAL_BOOTSTRAP_MAX_WORKERS = DEFAULT_CPU_WORKERS
 TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
-SVR_MAX_ITER = 5000
+SVR_MAX_ITER = 10_000_000
 
-# ACTIVE_MODELS = ["mlp", "hist_gradient_boosting", "kernel_ridge"]
-ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge"] #
+ACTIVE_MODELS = ["svr", "elasticnet", "dummy_mean"]
+# ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -65,6 +65,7 @@ MAX_TRAIN_START_YEAR = min(OUTER_TEST_YEARS) - N_TEMPORAL_CV_FOLDS - 1  # = 2012
 CANDIDATE_PRIMARY_COUNT = 3
 SELECTION_TOLERANCE = 0.01  # legacy knob, kept for reference tables
 MODEL_COMPLEXITY_RANK: dict[str, int] = {
+    "dummy_mean": 0,
     "ridge": 1,
     "elasticnet": 2,
     "svr": 5,
@@ -83,6 +84,7 @@ MODEL_RANDOM_STATE = PIPELINE_RANDOM_STATE
 MODEL_N_JOBS = 1
 
 MAX_TUNING_TRIALS_PER_MODEL: dict[str, int] = {
+    "dummy_mean": 1,
     "ridge": 25,
     "elasticnet": 40,
     "xgboost": 50,
@@ -143,6 +145,7 @@ FINAL_RESULTS_PATH = OUTPUT_DIR / "final_results.csv"
 FINAL_BOOTSTRAP_PREDICTIONS_PATH = OUTPUT_DIR / "final_bootstrap_predictions.csv"
 FINAL_PREDICTION_SUMMARY_PATH = OUTPUT_DIR / "final_prediction_summary.csv"
 OVERFITTING_AUDIT_PATH = OUTPUT_DIR / "overfitting_audit.csv"
+FINAL_TEST_MISSINGNESS_PATH = OUTPUT_DIR / "final_test_missingness.csv"
 OUTER_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "outer_winners"
 FINAL_ARTIFACTS_DIR = OUTPUT_DIR / "artifacts" / "final"
 
@@ -171,7 +174,23 @@ FINAL_RESULTS_COLUMNS = [
     # final_test_{metric}_lenient (secondary audit — drop_rows="targets_only")
     "final_test_mae_lenient", "final_test_mse_lenient", "final_test_rmse_lenient",
     "final_test_r2_lenient", "final_test_explained_variance_lenient",
+    # SVR convergence diagnostics for the saved single-model artifact
+    "final_model_svr_converged",
+    "final_model_svr_n_iter",
+    "final_model_svr_support_vectors",
+    # Fraction of the 200 bootstrap iterations where the model converged
+    "bootstrap_svr_converged_share",
     "artifact_path",
+]
+
+FINAL_TEST_MISSINGNESS_COLUMNS = [
+    "branch",
+    COUNTRY_COL,
+    YEAR_COL,
+    "row_missingness_fraction",
+    "strict_included",
+    "lenient_included",
+    "all_included",
 ]
 FINAL_PREDICTIONS_COLUMNS = [
     COUNTRY_COL,

@@ -6,6 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ML pipeline for predicting net-zero emissions reduction targets across countries. Combines data from 6 public sources (INFORM, PRIMAP, V-Dem, FAO, IEA, RSF + World Bank API), engineers features, and trains models via nested cross-validation with bootstrap uncertainty quantification.
 
+## Python Environment
+
+- **Do NOT modify the `.venv` directory.** The project requires Python 3.10-3.12 (3.13+ not supported).
+- Do NOT run `pip install`, `uv sync`, or any command that alters the virtual environment without explicit user approval.
+- If a smoke test or verification requires new dependencies, stop and ask first.
+- Always invoke the interpreter as `.venv/bin/python` (never a system Python or conda env).
+
+## Workflow Conventions
+
+- **For multi-file refactors or pipeline changes, present a written plan first and wait for approval before editing.** The plan must list: files to be modified and why, renames/merges/deletions, and verification steps.
+- After multi-file edits, run `python -m py_compile` on every modified `.py` file and report results.
+- When discussing methodology or architectural tradeoffs, surface concerns explicitly before proposing implementation — do not jump straight to code.
+
 ## Commands
 
 ```bash
@@ -190,3 +203,6 @@ The reproduction scripts (`reproduce_old.py`, `reproduce_new.py`) are ~100K-line
 - **Git LFS** tracks all files under `data/` and `results/`; if CSVs appear as pointer files, run `git lfs pull`
 - **Preprocessor cache** in `data/preprocessed/` is invalidated by config hash changes; force rebuild with `--force` flag
 - **Commit style**: short prefixes like `ADDED:`, `CHANGED:`, `FIXED:`, `REMOVED:`
+- **Strict/lenient versioning**: primary data version is always **strict** (`drop_rows=True`); secondary is **lenient** (`drop_rows="targets_only"`). Maintain parallel tracking across `preprocessing.py`, `data_preparation.py`, `core.py`, and `bootstrap.py`. Lenient results live in `_lenient`-suffixed columns only.
+- **Key result files for run comparisons**: `outer_results.csv` (CV performance, uses `outer_strategy`) and `final_results.csv` (holdout performance, uses `outer_strategy_source`). Use both when comparing runs.
+- **Cache invalidation**: whenever data versioning or config changes, rebuild the preprocessor cache (`python -m stages.training.data_preparation --force`) and verify the fingerprint before re-running training.

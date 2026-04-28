@@ -305,6 +305,8 @@ def prepare_cv_fold_data(
     target: str,
     feature_selector: SelectKBest | None = None,
     all_feature_columns: list[str] | None = None,
+    n_features_to_select: int | None = None,
+    common_feature_columns: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     for fold in prepared_fold_frames:
@@ -314,7 +316,17 @@ def prepare_cv_fold_data(
         if x_train.empty or x_val.empty:
             continue
 
-        if feature_selector is not None and all_feature_columns is not None:
+        fold_selector: SelectKBest | None = None
+        if n_features_to_select is not None and common_feature_columns:
+            fold_selector = fit_feature_selector(
+                x_train.reindex(columns=common_feature_columns, fill_value=0.0),
+                y_train,
+                n_features=n_features_to_select,
+            )
+            x_train, feat_cols = apply_feature_selector(fold_selector, x_train, common_feature_columns)
+            x_val, _ = apply_feature_selector(fold_selector, x_val, common_feature_columns)
+        elif feature_selector is not None and all_feature_columns is not None:
+            fold_selector = feature_selector
             x_train, _ = apply_feature_selector(feature_selector, x_train, all_feature_columns)
             x_val, feat_cols = apply_feature_selector(feature_selector, x_val, all_feature_columns)
 
@@ -327,6 +339,8 @@ def prepare_cv_fold_data(
             "train_rows": int(len(x_train)),
             "val_rows": int(len(x_val)),
             "feature_count": int(len(feat_cols)),
+            "selector": fold_selector,
+            "selected_feature_columns": list(feat_cols),
         })
     return prepared
 
@@ -512,6 +526,7 @@ def _expected_files_for_unit(
             base / "test_scored.csv",
             base / "test_scored_lenient.csv",
             base / "test_all.csv",
+            base / "test_missingness.csv",
             base / "preprocessor.joblib",
         ]
     if unit_type == "final_fold_sets":
@@ -547,6 +562,7 @@ def _expected_files_for_unit(
             base / "x_test_all.joblib",
             base / "prediction_index.joblib",
             base / "selector.joblib",
+            base / "country_labels.joblib",
             base / "feature_columns.json",
             base / "common_feature_columns.json",
             base / "selected_feature_columns.json",
@@ -619,6 +635,7 @@ def _expected_prepared_top_level_paths(base: Path, unit_type: str) -> dict[str, 
             "x_test_all": base / "x_test_all.joblib",
             "prediction_index": base / "prediction_index.joblib",
             "selector": base / "selector.joblib",
+            "country_labels": base / "country_labels.joblib",
             "feature_columns": base / "feature_columns.json",
             "common_feature_columns": base / "common_feature_columns.json",
             "selected_feature_columns": base / "selected_feature_columns.json",
@@ -699,6 +716,28 @@ def _validate_xy_pair(
         y_len = _safe_len(y, y_label, issues)
     if x_len is not None and y_len is not None and x_len != y_len:
         issues.append(f"{x_label} has {x_len} rows but {y_label} has {y_len} rows.")
+
+
+def _validate_country_labels(
+    country_labels: Any,
+    x_train: Any,
+    issues: list[str],
+) -> None:
+    if country_labels is None or x_train is None:
+        return
+    if not isinstance(country_labels, pd.Series):
+        issues.append(f"country_labels is not a Series (got {type(country_labels).__name__}).")
+        return
+    if not isinstance(x_train, pd.DataFrame):
+        return
+    if len(country_labels) != len(x_train):
+        issues.append(
+            f"country_labels has {len(country_labels)} rows but x_train has {len(x_train)} rows."
+        )
+    if not country_labels.index.equals(x_train.index):
+        issues.append("country_labels index does not match x_train index.")
+    if country_labels.isna().any():
+        issues.append("country_labels contains missing country values.")
 
 
 def _validate_meta_row_count(
@@ -833,6 +872,12 @@ def _prepared_unit_validation_issues(
             "prediction_index.joblib",
             issues,
         )
+        country_labels = _load_joblib_with_issues(
+            top_level_paths["country_labels"],
+            "country_labels.joblib",
+            issues,
+        )
+        _validate_country_labels(country_labels, x_train, issues)
         _validate_xy_pair(
             x_test_scored,
             y_test_scored,
@@ -905,12 +950,18 @@ def _prepared_unit_validation_issues(
         y_fold_train = _load_joblib_with_issues(paths["y_train"], f"fold_{fold_id}/y_train.joblib", issues)
         x_fold_val = _load_joblib_with_issues(paths["x_val"], f"fold_{fold_id}/x_val.joblib", issues)
         y_fold_val = _load_joblib_with_issues(paths["y_val"], f"fold_{fold_id}/y_val.joblib", issues)
+        fold_selected_cols = _load_json_with_issues(
+            paths["selected_feature_columns"],
+            f"fold_{fold_id}/selected_feature_columns.json",
+            issues,
+        )
+        fold_cols_for_validation = fold_selected_cols if fold_selected_cols is not None else selected_feature_columns
         _validate_xy_pair(
             x_fold_train,
             y_fold_train,
             f"fold_{fold_id}/x_train",
             f"fold_{fold_id}/y_train",
-            selected_feature_columns,
+            fold_cols_for_validation,
             issues,
         )
         _validate_xy_pair(
@@ -918,7 +969,7 @@ def _prepared_unit_validation_issues(
             y_fold_val,
             f"fold_{fold_id}/x_val",
             f"fold_{fold_id}/y_val",
-            selected_feature_columns,
+            fold_cols_for_validation,
             issues,
         )
 
@@ -972,6 +1023,22 @@ def load_final_preprocessor(
     return joblib.load(base / "preprocessor.joblib")
 
 
+def load_final_test_missingness(
+    preprocessed_dir: Path,
+    branches: list[str],
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for branch in branches:
+        path = preprocessed_dir / "final" / branch / "test_missingness.csv"
+        if path.exists():
+            frames.append(read_frame(path))
+        else:
+            logger.warning("Missing final test missingness artifact for branch=%s at %s", branch, path)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def _expected_prepared_fold_paths(base: Path, fold_id: int | str) -> dict[str, Path]:
     fold_dir = base / "folds" / f"fold_{fold_id}"
     return {
@@ -979,6 +1046,8 @@ def _expected_prepared_fold_paths(base: Path, fold_id: int | str) -> dict[str, P
         "y_train": fold_dir / "y_train.joblib",
         "x_val": fold_dir / "x_val.joblib",
         "y_val": fold_dir / "y_val.joblib",
+        "selector": fold_dir / "selector.joblib",
+        "selected_feature_columns": fold_dir / "selected_feature_columns.json",
     }
 
 
@@ -1024,6 +1093,8 @@ def _load_prepared_folds(
         y_train = joblib.load(paths["y_train"])
         x_val = joblib.load(paths["x_val"])
         y_val = joblib.load(paths["y_val"])
+        fold_selector = joblib.load(paths["selector"])
+        fold_selected_cols = _read_json(paths["selected_feature_columns"])
         folds.append({
             "fold_id": fold_id,
             "x_train": x_train,
@@ -1033,6 +1104,8 @@ def _load_prepared_folds(
             "train_rows": int(len(x_train)),
             "val_rows": int(len(x_val)),
             "feature_count": int(x_train.shape[1]),
+            "selector": fold_selector,
+            "selected_feature_columns": fold_selected_cols,
         })
     return folds
 
@@ -1088,6 +1161,7 @@ def load_prepared_final_target(
         "y_test_scored_lenient": joblib.load(base / "y_test_scored_lenient.joblib"),
         "x_test_all": joblib.load(base / "x_test_all.joblib"),
         "prediction_index": joblib.load(base / "prediction_index.joblib"),
+        "country_labels": joblib.load(base / "country_labels.joblib"),
         "prepared_folds": _load_prepared_folds(base, meta, unit_label),
     }
 
@@ -1216,8 +1290,8 @@ def _select_training_bundle(
         prepared_folds = prepare_cv_fold_data(
             fold_frames,
             target,
-            feature_selector=selector,
-            all_feature_columns=common_feature_columns,
+            n_features_to_select=n_features_to_select,
+            common_feature_columns=common_feature_columns,
         )
     else:
         x_train = x_train.iloc[:, 0:0].copy()
@@ -1358,6 +1432,9 @@ def _build_final_prepared_payload(
     prediction_index["actual"] = final_frames["test_frame_all"][target]
     fold_ids = [fold["fold_id"] for fold in bundle["prepared_folds"]]
 
+    # Country labels aligned to x_train rows for country-block bootstrap
+    country_labels = final_frames["train_frame"].loc[bundle["x_train"].index, COUNTRY_COL]
+
     return {
         "joblib_artifacts": {
             "x_train.joblib": bundle["x_train"],
@@ -1369,6 +1446,7 @@ def _build_final_prepared_payload(
             "x_test_all.joblib": x_test_all,
             "prediction_index.joblib": prediction_index,
             "selector.joblib": bundle["selector"],
+            "country_labels.joblib": country_labels,
         },
         "json_artifacts": {
             "feature_columns.json": bundle["feature_columns"],
@@ -1426,6 +1504,8 @@ def _write_prepared_folds(base_dir: Path, prepared_folds: list[dict[str, Any]]) 
         joblib.dump(fold["y_train"], fold_dir / "y_train.joblib")
         joblib.dump(fold["x_val"], fold_dir / "x_val.joblib")
         joblib.dump(fold["y_val"], fold_dir / "y_val.joblib")
+        joblib.dump(fold.get("selector"), fold_dir / "selector.joblib")
+        write_json(fold_dir / "selected_feature_columns.json", fold.get("selected_feature_columns", []))
         written_fold_ids.append(fold["fold_id"])
     return written_fold_ids
 
@@ -1599,6 +1679,51 @@ def _preprocess_fold_set(
     print(f"[PID:{pid}] {tag} done in {elapsed:.1f}s ({len(fold_frames)} folds)", flush=True)
 
 
+def _transform_missingness_frame(
+    preprocessor: Preprocessor,
+    included_col: str,
+) -> pd.DataFrame:
+    diag = preprocessor.last_transform_missingness_.copy()
+    required = {COUNTRY_COL, YEAR_COL, "row_missingness_fraction", "included"}
+    missing = required - set(diag.columns)
+    if missing:
+        raise RuntimeError(f"Missing transform missingness columns: {sorted(missing)}")
+    return (
+        diag[[COUNTRY_COL, YEAR_COL, "row_missingness_fraction", "included"]]
+        .rename(columns={"included": included_col})
+        .copy()
+    )
+
+
+def _merge_final_test_missingness(
+    branch: str,
+    strict_diag: pd.DataFrame,
+    lenient_diag: pd.DataFrame,
+    all_diag: pd.DataFrame,
+) -> pd.DataFrame:
+    from stages.training.config import FINAL_TEST_MISSINGNESS_COLUMNS
+
+    key_cols = [COUNTRY_COL, YEAR_COL]
+    merged = strict_diag.copy()
+    merged = merged.merge(
+        lenient_diag[key_cols + ["lenient_included"]],
+        on=key_cols,
+        how="outer",
+        validate="one_to_one",
+    )
+    merged = merged.merge(
+        all_diag[key_cols + ["all_included"]],
+        on=key_cols,
+        how="outer",
+        validate="one_to_one",
+    )
+    merged.insert(0, "branch", branch)
+    for col in ["strict_included", "lenient_included", "all_included"]:
+        merged[col] = merged[col].fillna(False).astype(bool)
+    merged = merged.sort_values(["branch", COUNTRY_COL, YEAR_COL]).reset_index(drop=True)
+    return merged[FINAL_TEST_MISSINGNESS_COLUMNS]
+
+
 def _preprocess_final_unit(
     raw_df: pd.DataFrame,
     branch: str,
@@ -1623,17 +1748,26 @@ def _preprocess_final_unit(
         drop_rows=True,
         split_name=f"final_test_{branch}",
     )
+    strict_missingness = _transform_missingness_frame(preprocessor, "strict_included")
     test_outputs_scored_lenient = preprocessor.transform(
         final_test_raw,
         history_df=final_train_raw,
         drop_rows="targets_only",
         split_name=f"final_test_lenient_{branch}",
     )
+    lenient_missingness = _transform_missingness_frame(preprocessor, "lenient_included")
     test_outputs_all = preprocessor.transform(
         final_test_raw,
         history_df=final_train_raw,
         drop_rows=False,
         split_name=f"final_test_all_{branch}",
+    )
+    all_missingness = _transform_missingness_frame(preprocessor, "all_included")
+    test_missingness = _merge_final_test_missingness(
+        branch,
+        strict_missingness,
+        lenient_missingness,
+        all_missingness,
     )
 
     out_dir = base_dir / "final" / branch
@@ -1642,6 +1776,7 @@ def _preprocess_final_unit(
     write_frame(test_outputs_scored[branch], out_dir / "test_scored.csv")
     write_frame(test_outputs_scored_lenient[branch], out_dir / "test_scored_lenient.csv")
     write_frame(test_outputs_all[branch], out_dir / "test_all.csv")
+    write_frame(test_missingness, out_dir / "test_missingness.csv")
     joblib.dump(preprocessor, out_dir / "preprocessor.joblib")
 
     elapsed = time.monotonic() - t0
@@ -1781,7 +1916,7 @@ def _build_cache(base_dir: Path, fingerprint: str) -> dict[str, list]:
     stage_elapsed = time.monotonic() - stage_t0
 
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "fingerprint": fingerprint,
         "complete": True,
         "created_at": datetime.now(timezone.utc).isoformat(),

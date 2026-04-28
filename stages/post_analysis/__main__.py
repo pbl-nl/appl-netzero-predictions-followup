@@ -42,7 +42,11 @@ import time
 import warnings
 from pathlib import Path
 
+from stages.post_analysis.matplotlib_setup import configure_matplotlib_environment
+
+configure_matplotlib_environment()
 import matplotlib
+import pandas as pd
 matplotlib.use("Agg")
 
 # ---------------------------------------------------------------------------
@@ -329,6 +333,7 @@ def run(argv: list[str] | None = None) -> None:
     outer_results             = dfs["outer_results"]
     winners                   = dfs["winners"]
     overfitting_audit         = dfs["overfitting_audit"]
+    final_test_missingness    = dfs.get("final_test_missingness", pd.DataFrame())
 
     log.info(
         "Loaded: %d final results, %d prediction summary rows, %d bootstrap rows",
@@ -345,7 +350,6 @@ def run(argv: list[str] | None = None) -> None:
         merged_df = None
 
     # Accumulate all tables for Excel export
-    import pandas as pd
     all_tables: dict[str, pd.DataFrame] = {
         "final_results":    final_results,
         "outer_cv_results": outer_results,
@@ -483,6 +487,31 @@ def run(argv: list[str] | None = None) -> None:
             all_tables.update(unc_tables)
         except Exception as exc:
             log.warning("Uncertainty analysis failed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # 8b. Coverage / missingness analysis
+    # ------------------------------------------------------------------
+    if not final_test_missingness.empty:
+        log.info("=== Coverage / Missingness Analysis ===")
+        try:
+            from stages.post_analysis.coverage import (
+                run_missingness_stratified_table,
+                run_abstention_curve,
+            )
+            strat_df = run_missingness_stratified_table(
+                final_prediction_summary, final_test_missingness, subdirs[cfg.SUBDIR_SUMMARY],
+            )
+            curve_df = run_abstention_curve(
+                final_prediction_summary, final_test_missingness, subdirs[cfg.SUBDIR_SUMMARY],
+            )
+            if not strat_df.empty:
+                all_tables["missingness_stratified"] = strat_df
+            if not curve_df.empty:
+                all_tables["abstention_curve"] = curve_df
+        except Exception as exc:
+            log.warning("Coverage analysis failed: %s", exc, exc_info=True)
+    else:
+        log.info("Coverage analysis skipped: final_test_missingness.csv not found in results dir.")
 
     # ------------------------------------------------------------------
     # 9. Report (Excel + key findings)

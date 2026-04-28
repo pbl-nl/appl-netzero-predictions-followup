@@ -30,6 +30,8 @@ from stages.training.config import (
     FINAL_BOOTSTRAP_PREDICTIONS_PATH,
     FINAL_PREDICTION_SUMMARY_PATH,
     FINAL_RESULTS_PATH,
+    FINAL_TEST_MISSINGNESS_PATH,
+    FINAL_TEST_MISSINGNESS_COLUMNS,
     GAP_PENALTY_WEIGHT,
     GAP_RATIO_CAP,
     MAX_LOSS,
@@ -51,6 +53,7 @@ from stages.training.config import (
 )
 from stages.training.data_preparation import (
     load_final_preprocessor,
+    load_final_test_missingness,
     load_outer_preprocessor,
     load_prepared_final_target,
     load_prepared_outer_target,
@@ -64,6 +67,7 @@ from stages.training.helpers import (
     empty_final_results_df,
     ensure_output_dirs,
     fit_model,
+    get_fit_diagnostics,
     get_hyperopt_space,
     normalize_hyperopt_params,
     persist_partial_outputs,
@@ -85,6 +89,7 @@ _ERROR_ROW_NAN_FIELDS = frozenset(
         "inner_positive_gap_fold_share",
         "folds_used", "trial_count", "tuning_elapsed_seconds",
         "outer_train_rows", "outer_test_rows", "outer_test_rows_lenient", "feature_count",
+        "svr_n_iter", "svr_support_vectors",
     }
     | {f"inner_train_mean_{m}" for m in CORE_METRICS}
     | {f"inner_val_mean_{m}" for m in CORE_METRICS}
@@ -123,6 +128,12 @@ def run_cv_trial(
             fold["x_train"],
             fold["y_train"],
         )
+        diag = get_fit_diagnostics(model)
+        if diag["svr_converged"] is False:
+            logger.warning(
+                "SVR did not converge in inner fold (fit_status_!=0, n_iter_=%s). "
+                "Consider raising SVR_MAX_ITER.", diag["svr_n_iter"],
+            )
         train_metrics, _ = predict_evaluate(model, fold["x_train"], fold["y_train"])
         val_metrics, _ = predict_evaluate(model, fold["x_val"], fold["y_val"])
         row: dict[str, float] = {"fold_id": fold["fold_id"]}
@@ -214,18 +225,21 @@ def tune_model(
         trial_records.append(record)
         return {"loss": loss, "status": STATUS_OK}
 
-    while len(trial_records) < max_trials:
-        if len(trial_records) >= MIN_TUNING_TRIALS and time.monotonic() >= tuning_deadline:
-            break
-        fmin(
-            fn=objective,
-            space=space,
-            algo=tpe.suggest,
-            max_evals=len(trial_records) + 1,
-            trials=trials,
-            rstate=rng,
-            show_progressbar=False,
-        )
+    if not space:
+        objective({})
+    else:
+        while len(trial_records) < max_trials:
+            if len(trial_records) >= MIN_TUNING_TRIALS and time.monotonic() >= tuning_deadline:
+                break
+            fmin(
+                fn=objective,
+                space=space,
+                algo=tpe.suggest,
+                max_evals=len(trial_records) + 1,
+                trials=trials,
+                rstate=rng,
+                show_progressbar=False,
+            )
 
     successful = sorted(
         [r for r in trial_records if r["status"] == "ok"],
@@ -290,19 +304,21 @@ def evaluate_candidate_model(
 
 
 def _aggregate_bootstrap_results(
-    bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray]],
+    bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray, bool | None]],
     base_predictions: pd.DataFrame,
-) -> tuple[dict[str, float], dict[str, float], dict[str, float], pd.DataFrame]:
-    """Aggregate bootstrap iteration results into mean metrics and a predictions DataFrame."""
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], pd.DataFrame, float]:
+    """Aggregate bootstrap iteration results into mean metrics, predictions, and convergence share."""
     bootstrap_train_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics_lenient: list[dict[str, float]] = []
     prediction_rows: list[pd.DataFrame] = []
+    converged_flags: list[bool | None] = []
 
-    for iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds in bootstrap_results:
+    for iteration_idx, train_metrics, scored_metrics, scored_metrics_lenient, all_preds, svr_converged in bootstrap_results:
         bootstrap_train_metrics.append(train_metrics)
         bootstrap_test_metrics.append(scored_metrics)
         bootstrap_test_metrics_lenient.append(scored_metrics_lenient)
+        converged_flags.append(svr_converged)
         iter_preds = base_predictions.copy()
         iter_preds["iteration"] = iteration_idx + 1
         iter_preds["prediction"] = all_preds
@@ -324,8 +340,12 @@ def _aggregate_bootstrap_results(
         if k in test_metrics_lenient_df.columns
     }
     preds_df = pd.concat(prediction_rows, ignore_index=True)
+    svr_flags = [flag for flag in converged_flags if flag is not None]
+    bootstrap_svr_converged_share = (
+        float(sum(svr_flags) / len(svr_flags)) if svr_flags else float("nan")
+    )
 
-    return avg_train, avg_test, avg_test_lenient, preds_df
+    return avg_train, avg_test, avg_test_lenient, preds_df, bootstrap_svr_converged_share
 
 
 def _save_final_artifact(
@@ -345,12 +365,14 @@ def _save_final_artifact(
     avg_train: dict[str, float],
     avg_test: dict[str, float],
     pred_summary_df: pd.DataFrame,
+    artifact_model: Any = None,
 ) -> Path:
-    """Fit final model, save artifact to disk, return artifact path."""
-    artifact_model = fit_model(
-        build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
-        x_train, y_train,
-    )
+    """Save final model artifact to disk. Accepts a pre-fit model to avoid double fit."""
+    if artifact_model is None:
+        artifact_model = fit_model(
+            build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
+            x_train, y_train,
+        )
     artifact = {
         "model": artifact_model,
         "preprocessor": preprocessor,
@@ -391,7 +413,10 @@ def _build_final_result_row(
     avg_test: dict[str, float],
     avg_test_lenient: dict[str, float],
     artifact_path: Path,
+    artifact_model: Any,
+    bootstrap_svr_converged_share: float,
 ) -> dict[str, Any]:
+    artifact_diag = get_fit_diagnostics(artifact_model)
     row: dict[str, Any] = {
         "target": target,
         "outer_strategy_source": outer_strategy,
@@ -405,6 +430,10 @@ def _build_final_result_row(
         "final_test_rows_lenient": int(len(x_test_scored_lenient)),
         "feature_count": int(len(selected_cols)),
         "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
+        "final_model_svr_converged": artifact_diag["svr_converged"],
+        "final_model_svr_n_iter": artifact_diag["svr_n_iter"],
+        "final_model_svr_support_vectors": artifact_diag["svr_support_vectors"],
+        "bootstrap_svr_converged_share": bootstrap_svr_converged_share,
         "artifact_path": str(artifact_path),
     }
     for metric in CORE_METRICS:
@@ -447,6 +476,7 @@ def _refit_single_winner(
     selected_cols = prepared["selected_feature_columns"]
     selector = prepared["selector"]
     prepared_folds = prepared["prepared_folds"]
+    country_labels: pd.Series | None = prepared.get("country_labels")
 
     if x_train.empty or x_test_scored.empty:
         raise RuntimeError(
@@ -486,24 +516,46 @@ def _refit_single_winner(
         x_train=x_train, y_train=y_train,
         x_test_scored=x_test_scored, y_test_scored=y_test_scored,
         x_test_scored_lenient=x_test_scored_lenient, y_test_scored_lenient=y_test_scored_lenient,
-        x_test_all=x_test_all, bootstrap_workers=bootstrap_workers,
+        x_test_all=x_test_all, country_labels=country_labels, bootstrap_workers=bootstrap_workers,
     )
 
-    avg_train, avg_test, avg_test_lenient, preds_df = _aggregate_bootstrap_results(
-        bootstrap_results, base_predictions,
+    avg_train, avg_test, avg_test_lenient, preds_df, bootstrap_svr_converged_share = (
+        _aggregate_bootstrap_results(bootstrap_results, base_predictions)
     )
+    if not pd.isna(bootstrap_svr_converged_share) and bootstrap_svr_converged_share < 1.0:
+        logger.warning(
+            "%s: only %.1f%% of bootstrap iterations converged.",
+            tag, 100.0 * bootstrap_svr_converged_share,
+        )
     pred_summary_df = build_prediction_summary(preds_df)
+
+    artifact_model = fit_model(
+        build_model(model_name, best_params, random_state=MODEL_RANDOM_STATE),
+        x_train, y_train,
+    )
+    artifact_diag = get_fit_diagnostics(artifact_model)
+    if artifact_diag["svr_converged"] is False:
+        logger.warning(
+            "%s: final artifact model did not converge (n_iter_=%s).",
+            tag, artifact_diag["svr_n_iter"],
+        )
+    bootstrap_converged_label = (
+        "n/a" if pd.isna(bootstrap_svr_converged_share)
+        else f"{bootstrap_svr_converged_share:.2f}"
+    )
 
     artifact_path = _save_final_artifact(
         model_name, best_params, x_train, y_train,
         preprocessor, selector, selected_cols, feature_columns,
         target, branch, outer_strategy, int(candidate_rank), candidate_role,
         avg_train, avg_test, pred_summary_df,
+        artifact_model=artifact_model,
     )
 
     print(
         f"[PID:{pid}] {tag} Done. final_test_mae={avg_test.get('mae', float('nan')):.4f} "
-        f"(lenient={avg_test_lenient.get('mae', float('nan')):.4f})",
+        f"(lenient={avg_test_lenient.get('mae', float('nan')):.4f}), "
+        f"bootstrap_converged={bootstrap_converged_label}",
         flush=True,
     )
 
@@ -513,6 +565,7 @@ def _refit_single_winner(
         best_params,
         x_train, x_test_scored, x_test_scored_lenient,
         selected_cols, avg_train, avg_test, avg_test_lenient, artifact_path,
+        artifact_model, bootstrap_svr_converged_share,
     )
     return final_row, preds_df
 
@@ -573,7 +626,21 @@ def refit_final_models(
     else:
         final_results_df = empty_final_results_df()
 
+    _write_final_test_missingness(preprocessed_dir)
+
     return final_results_df, final_preds_df, final_summary_df
+
+
+def _write_final_test_missingness(preprocessed_dir: Path) -> None:
+    """Publish preprocessing-derived final-test missingness diagnostics."""
+    miss_df = load_final_test_missingness(preprocessed_dir, ACTIVE_BRANCHES)
+    if miss_df.empty:
+        logger.warning("No final test missingness artifacts found; skipping final_test_missingness.csv.")
+        return
+    miss_df = miss_df[FINAL_TEST_MISSINGNESS_COLUMNS].copy()
+    FINAL_TEST_MISSINGNESS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    miss_df.to_csv(FINAL_TEST_MISSINGNESS_PATH, index=False)
+    logger.info("Wrote %s rows to %s", len(miss_df), FINAL_TEST_MISSINGNESS_PATH)
 
 
 # --- Candidate selection ---
@@ -763,9 +830,13 @@ def _evaluate_single_model(
     train_metrics, test_metrics, fitted_model = evaluate_candidate_model(
         model_name, best_params, x_train, y_train, x_test, y_test,
     )
-    _, test_metrics_lenient, _ = evaluate_candidate_model(
-        model_name, best_params, x_train, y_train, x_test_lenient, y_test_lenient,
-    )
+    test_metrics_lenient, _ = predict_evaluate(fitted_model, x_test_lenient, y_test_lenient)
+    outer_diag = get_fit_diagnostics(fitted_model)
+    if outer_diag["svr_converged"] is False:
+        logger.warning(
+            "SVR did not converge in outer refit for %s (n_iter_=%s).",
+            tag, outer_diag["svr_n_iter"],
+        )
 
     print(
         f"[PID:{pid}] {tag} {model_name}: "
@@ -808,6 +879,9 @@ def _evaluate_single_model(
         "outer_test_rows_lenient": int(len(x_test_lenient)),
         "feature_count": int(len(selected_cols)),
         "error": "",
+        "svr_converged": outer_diag["svr_converged"],
+        "svr_n_iter": outer_diag["svr_n_iter"],
+        "svr_support_vectors": outer_diag["svr_support_vectors"],
         "artifact": artifact,
     }
     for key, value in tuning_result.items():
