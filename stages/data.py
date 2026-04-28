@@ -16,7 +16,11 @@ import io
 import json
 import logging
 import os
+import random
 import re
+import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +31,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -48,8 +51,18 @@ TARGET_AUDIT_PATH = OUTPUT_PATH.with_name("target_audit.csv")
 # =============================================================================
 
 REQUEST_TIMEOUT = 120
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+DOWNLOAD_RETRYABLE_HTTP_CODES = {408, 429}
+WGI_WORKBOOK_URL = (
+    "https://datacatalogfiles.worldbank.org/ddh-published/0038026/DR0095947/"
+    "wgidataset_with_sourcedata-2025.xlsx"
+)
+WGI_ESTIMATE_COLUMN = "Governance estimate (approx. -2.5 to +2.5)"
 _cpu = os.cpu_count() or 1
 MAX_WORKERS = max(1, _cpu - 1)
+_wgi_workbook_content: bytes | None = None
+_wgi_workbook_lock = threading.Lock()
 
 WORLD_BANK_COLUMNS = [
     "indicator_id", "indicator_name", "country_id", "country_name",
@@ -96,10 +109,34 @@ WORLD_BANK_SOURCES = [
     {"name": "world_bank_total_population", "indicator": "SP.POP.TOTL", "source": 2},
     {"name": "world_bank_gdp_ppp", "indicator": "NY.GDP.MKTP.PP.KD", "source": 2},
     {"name": "world_bank_annual_deforestation", "indicator": "ER.FST.DFST.ZG", "source": 18},
-    {"name": "world_bank_control_of_corruption", "indicator": "CC.EST", "source": 2},
-    {"name": "world_bank_absence_of_violence_terrorism", "indicator": "PV.EST", "source": 2},
-    {"name": "world_bank_regulatory_quality", "indicator": "RQ.EST", "source": 2},
-    {"name": "world_bank_voice_and_accountability", "indicator": "VA.EST", "source": 2},
+    {
+        "name": "world_bank_control_of_corruption",
+        "indicator": "CC.EST",
+        "indicator_name": "Control of Corruption: Estimate",
+        "kind": "wgi_workbook",
+        "sheet": "cc",
+    },
+    {
+        "name": "world_bank_absence_of_violence_terrorism",
+        "indicator": "PV.EST",
+        "indicator_name": "Political Stability and Absence of Violence/Terrorism: Estimate",
+        "kind": "wgi_workbook",
+        "sheet": "pv",
+    },
+    {
+        "name": "world_bank_regulatory_quality",
+        "indicator": "RQ.EST",
+        "indicator_name": "Regulatory Quality: Estimate",
+        "kind": "wgi_workbook",
+        "sheet": "rq",
+    },
+    {
+        "name": "world_bank_voice_and_accountability",
+        "indicator": "VA.EST",
+        "indicator_name": "Voice and Accountability: Estimate",
+        "kind": "wgi_workbook",
+        "sheet": "va",
+    },
 ]
 
 # =============================================================================
@@ -195,7 +232,46 @@ def build_sources() -> list[dict]:
     return sources
 
 
-def get_response(url: str, use_browser_agent: bool = False) -> bytes:
+def _is_retryable_reason(reason: object) -> bool:
+    if isinstance(reason, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    reason_text = str(reason).lower()
+    retryable_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "temporary failure",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote end closed connection",
+        "nodename nor servname provided",
+        "name or service not known",
+    )
+    return any(marker in reason_text for marker in retryable_markers)
+
+
+def is_retryable_download_error(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in DOWNLOAD_RETRYABLE_HTTP_CODES or 500 <= error.code <= 599
+    if isinstance(error, urllib.error.URLError):
+        return _is_retryable_reason(error.reason)
+    return isinstance(error, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError))
+
+
+def _download_retry_delay(attempt: int) -> float:
+    index = min(max(attempt - 1, 0), len(DOWNLOAD_BACKOFF_SECONDS) - 1)
+    return DOWNLOAD_BACKOFF_SECONDS[index] + random.uniform(0.0, 0.5)
+
+
+def _format_download_error(url: str, attempts: int, error: BaseException) -> str:
+    return (
+        f"Failed to download {url} after {attempts} attempt(s): "
+        f"{type(error).__name__}: {error}"
+    )
+
+
+def _get_response_once(url: str, use_browser_agent: bool = False) -> bytes:
     headers = {}
     if use_browser_agent:
         headers = {
@@ -203,16 +279,37 @@ def get_response(url: str, use_browser_agent: bool = False) -> bytes:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
     request = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            status_code = getattr(response, "status", 200)
-            if status_code != 200:
-                raise RuntimeError(f"HTTP {status_code} for {url}")
-            return response.read()
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f"HTTP {error.code} for {url}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Failed to reach {url}: {error.reason}") from error
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        status_code = getattr(response, "status", 200)
+        if status_code != 200:
+            raise urllib.error.HTTPError(
+                url, status_code, f"HTTP {status_code}", response.headers, None
+            )
+        return response.read()
+
+
+def get_response(url: str, use_browser_agent: bool = False, attempts: int = DOWNLOAD_RETRIES) -> bytes:
+    attempts = max(1, attempts)
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _get_response_once(url, use_browser_agent=use_browser_agent)
+        except Exception as error:
+            last_error = error
+            if attempt >= attempts or not is_retryable_download_error(error):
+                raise RuntimeError(_format_download_error(url, attempt, error)) from error
+            delay = _download_retry_delay(attempt)
+            log.warning(
+                "Download failed for %s (attempt %s/%s): %s: %s. Retrying in %.1fs.",
+                url,
+                attempt,
+                attempts,
+                type(error).__name__,
+                error,
+                delay,
+            )
+            time.sleep(delay)
+    raise RuntimeError(_format_download_error(url, attempts, last_error or RuntimeError("unknown error")))
 
 
 def save_bytes(path: str, content: bytes) -> None:
@@ -273,7 +370,23 @@ def world_bank_url(indicator: str, source_id: int) -> str:
     )
 
 
+def _format_world_bank_messages(messages: object) -> str:
+    if not isinstance(messages, list):
+        return str(messages)
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            parts.append(str(message))
+            continue
+        key = message.get("key") or message.get("id") or "message"
+        value = message.get("value") or message.get("message") or ""
+        parts.append(f"{key}: {value}".strip())
+    return "; ".join(parts)
+
+
 def parse_world_bank_payload(payload: list) -> tuple:
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "message" in payload[0]:
+        raise RuntimeError(f"World Bank API error: {_format_world_bank_messages(payload[0]['message'])}")
     if not isinstance(payload, list) or len(payload) < 2:
         raise RuntimeError("World Bank response did not return [metadata, rows]")
     metadata = payload[0] if isinstance(payload[0], dict) else {}
@@ -306,7 +419,49 @@ def write_world_bank_csv(path: str, rows: list) -> None:
             writer.writerow(flatten_world_bank_row(row))
 
 
+def get_wgi_workbook_content() -> bytes:
+    global _wgi_workbook_content
+    with _wgi_workbook_lock:
+        if _wgi_workbook_content is None:
+            _wgi_workbook_content = get_response(WGI_WORKBOOK_URL, use_browser_agent=False)
+    return _wgi_workbook_content
+
+
+def wgi_rows_from_workbook(source: dict, content: bytes) -> list[dict]:
+    df = pd.read_excel(
+        io.BytesIO(content),
+        sheet_name=source["sheet"],
+        usecols=["Economy (name)", "Economy (code)", "Year", WGI_ESTIMATE_COLUMN],
+    )
+    df[WGI_ESTIMATE_COLUMN] = pd.to_numeric(df[WGI_ESTIMATE_COLUMN], errors="coerce")
+    df = df.dropna(subset=["Economy (code)", "Year"])
+    rows = []
+    for record in df.to_dict("records"):
+        value = record[WGI_ESTIMATE_COLUMN]
+        rows.append({
+            "indicator": {"id": source["indicator"], "value": source["indicator_name"]},
+            "country": {"id": record["Economy (code)"], "value": record["Economy (name)"]},
+            "countryiso3code": record["Economy (code)"],
+            "date": int(record["Year"]),
+            "value": float(value) if pd.notna(value) else None,
+            "unit": "",
+            "obs_status": None,
+            "decimal": None,
+        })
+    return rows
+
+
+def download_wgi_csv(source: dict) -> str:
+    rows = wgi_rows_from_workbook(source, get_wgi_workbook_content())
+    path = os.path.join(RAW_DIR, f"{source['name']}.csv")
+    write_world_bank_csv(path, rows)
+    log.info("Downloaded %s -> %s (rows=%s)", source["name"], path, len(rows))
+    return path
+
+
 def download_world_bank_csv(source: dict) -> str:
+    if source.get("kind") == "wgi_workbook":
+        return download_wgi_csv(source)
     url = world_bank_url(source["indicator"], source["source"])
     content = get_response(url, use_browser_agent=False)
     payload = json.loads(content.decode("utf-8"))
@@ -922,10 +1077,9 @@ def load_population_projections(skip_download: bool = False) -> pd.DataFrame:
                     "data/netzero/population_estimate.csv must already exist."
                 )
         log.info("population_estimate.csv not found – downloading from UN WPP …")
-        resp = requests.get(POPULATION_URL, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
+        content = get_response(POPULATION_URL, use_browser_agent=True)
         raw = pd.read_excel(
-            io.BytesIO(resp.content), sheet_name=POPULATION_SHEET, skiprows=POPULATION_SKIP_ROWS,
+            io.BytesIO(content), sheet_name=POPULATION_SHEET, skiprows=POPULATION_SKIP_ROWS,
         )
         raw.columns = raw.columns.astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
         df_pop = raw[list(POPULATION_SOURCE_COLS.keys())].rename(columns=POPULATION_SOURCE_COLS)

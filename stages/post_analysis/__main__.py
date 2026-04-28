@@ -40,6 +40,7 @@ import os
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from stages.post_analysis.matplotlib_setup import configure_matplotlib_environment
@@ -251,6 +252,21 @@ def _build_cross_run_table(
 
 
 # ---------------------------------------------------------------------------
+# Top-level step workers — imported from _workers.py so they are picklable
+# on macOS spawn (worker functions must be in a regular importable module,
+# not in __main__, or subprocesses cannot locate them when unpickling).
+# ---------------------------------------------------------------------------
+
+from stages.post_analysis._workers import (  # noqa: E402
+    _worker_model_comparison,
+    _worker_training_comparison,
+    _worker_sensitivity,
+    _worker_uncertainty,
+    _worker_net_zero,
+)
+
+
+# ---------------------------------------------------------------------------
 # Main run function
 # ---------------------------------------------------------------------------
 
@@ -358,36 +374,131 @@ def run(argv: list[str] | None = None) -> None:
     }
 
     # ------------------------------------------------------------------
-    # 3. Model comparison
+    # 3. Parallel phase: model_comparison, training_comparison, sensitivity,
+    #    uncertainty, and net_zero run concurrently (all are mutually
+    #    independent).  benchmark runs after because it needs tnz_predictions
+    #    from net_zero.  Each step runs in a separate process so matplotlib's
+    #    global figure state is never shared across workers.
     # ------------------------------------------------------------------
-    if "model_comparison" not in skip:
-        log.info("=== Model Comparison ===")
-        try:
-            from stages.post_analysis.model_comparison import run_model_comparison
-            mc_tables = run_model_comparison(final_results, outer_results, subdirs[cfg.SUBDIR_MODEL_COMPARISON])
-            all_tables.update(mc_tables)
-        except Exception as exc:
-            log.warning("Model comparison failed: %s", exc, exc_info=True)
+    step_futures: dict = {}
+    n_parallel = max(1, os.cpu_count())
+
+    log.info("=== Parallel Analysis Phase (up to %d workers) ===", n_parallel)
+
+    try:
+        with ProcessPoolExecutor(max_workers=n_parallel) as executor:
+            if "model_comparison" not in skip:
+                step_futures[executor.submit(
+                    _worker_model_comparison,
+                    final_results, outer_results,
+                    subdirs[cfg.SUBDIR_MODEL_COMPARISON],
+                )] = "model_comparison"
+
+            if "training_comparison" not in skip:
+                step_futures[executor.submit(
+                    _worker_training_comparison,
+                    outer_results, dfs["trials"], winners, overfitting_audit,
+                    subdirs[cfg.SUBDIR_TRAINING_COMPARISON],
+                )] = "training_comparison"
+
+            if "sensitivity" not in skip:
+                step_futures[executor.submit(
+                    _worker_sensitivity,
+                    outer_results, final_prediction_summary,
+                    subdirs[cfg.SUBDIR_SENSITIVITY],
+                )] = "sensitivity"
+
+            if "uncertainty" not in skip:
+                step_futures[executor.submit(
+                    _worker_uncertainty,
+                    final_bootstrap_predictions, final_prediction_summary,
+                    subdirs[cfg.SUBDIR_UNCERTAINTY],
+                )] = "uncertainty"
+
+            if "net_zero" not in skip and merged_df is not None:
+                step_futures[executor.submit(
+                    _worker_net_zero,
+                    final_prediction_summary, final_bootstrap_predictions, merged_df,
+                    subdirs[cfg.SUBDIR_NET_ZERO_YEARS],
+                )] = "net_zero"
+            elif "net_zero" not in skip and merged_df is None:
+                log.warning("Net-zero derivation skipped: merged data not available.")
+
+            tnz_predictions = pd.DataFrame()
+            for future in as_completed(step_futures):
+                name = step_futures[future]
+                try:
+                    step_tables = future.result()
+                    if name == "net_zero":
+                        tnz_predictions = step_tables.pop("tnz_predictions", pd.DataFrame())
+                    all_tables.update(step_tables)
+                    log.info("Step '%s' complete.", name)
+                except Exception as exc:
+                    log.warning("Step '%s' failed: %s", name, exc, exc_info=True)
+
+    except PermissionError:
+        log.warning("ProcessPoolExecutor unavailable — running parallel steps sequentially.")
+        tnz_predictions = pd.DataFrame()
+
+        if "model_comparison" not in skip:
+            log.info("=== Model Comparison ===")
+            try:
+                tables = _worker_model_comparison(
+                    final_results, outer_results, subdirs[cfg.SUBDIR_MODEL_COMPARISON]
+                )
+                all_tables.update(tables)
+            except Exception as exc:
+                log.warning("Model comparison failed: %s", exc, exc_info=True)
+
+        if "training_comparison" not in skip:
+            log.info("=== Training Comparison ===")
+            try:
+                tables = _worker_training_comparison(
+                    outer_results, dfs["trials"], winners, overfitting_audit,
+                    subdirs[cfg.SUBDIR_TRAINING_COMPARISON],
+                )
+                all_tables.update(tables)
+            except Exception as exc:
+                log.warning("Training comparison failed: %s", exc, exc_info=True)
+
+        if "sensitivity" not in skip:
+            log.info("=== Sensitivity Analysis ===")
+            try:
+                tables = _worker_sensitivity(
+                    outer_results, final_prediction_summary, subdirs[cfg.SUBDIR_SENSITIVITY]
+                )
+                all_tables.update(tables)
+            except Exception as exc:
+                log.warning("Sensitivity analysis failed: %s", exc, exc_info=True)
+
+        if "uncertainty" not in skip:
+            log.info("=== Uncertainty Analysis ===")
+            try:
+                tables = _worker_uncertainty(
+                    final_bootstrap_predictions, final_prediction_summary,
+                    subdirs[cfg.SUBDIR_UNCERTAINTY],
+                )
+                all_tables.update(tables)
+            except Exception as exc:
+                log.warning("Uncertainty analysis failed: %s", exc, exc_info=True)
+
+        if "net_zero" not in skip and merged_df is not None:
+            log.info("=== Net-Zero Year Derivation ===")
+            try:
+                tables = _worker_net_zero(
+                    final_prediction_summary, final_bootstrap_predictions, merged_df,
+                    subdirs[cfg.SUBDIR_NET_ZERO_YEARS],
+                )
+                tnz_predictions = tables.pop("tnz_predictions", pd.DataFrame())
+                all_tables.update(tables)
+            except Exception as exc:
+                log.warning("Net-zero derivation failed: %s", exc, exc_info=True)
+        elif "net_zero" not in skip and merged_df is None:
+            log.warning("Net-zero derivation skipped: merged data not available.")
 
     # ------------------------------------------------------------------
-    # 3b. Training-stage comparison
+    # Cross-run comparison (conditional on --compare; sequential)
     # ------------------------------------------------------------------
-    if "training_comparison" not in skip:
-        log.info("=== Training Comparison ===")
-        try:
-            from stages.post_analysis.training_comparison import run_training_comparison
-            tc_tables = run_training_comparison(
-                outer_results,
-                dfs["trials"],
-                winners,
-                overfitting_audit,
-                subdirs[cfg.SUBDIR_TRAINING_COMPARISON],
-            )
-            all_tables.update(tc_tables)
-        except Exception as exc:
-            log.warning("Training comparison failed: %s", exc, exc_info=True)
-
-    # Cross-run comparison (if --compare was provided)
     if args.compare:
         log.info("=== Cross-Run Comparison ===")
         try:
@@ -401,40 +512,7 @@ def run(argv: list[str] | None = None) -> None:
             log.warning("Cross-run comparison failed: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
-    # 4. Sensitivity analysis
-    # ------------------------------------------------------------------
-    if "sensitivity" not in skip:
-        log.info("=== Sensitivity Analysis ===")
-        try:
-            from stages.post_analysis.sensitivity import run_sensitivity
-            sens_tables = run_sensitivity(outer_results, final_prediction_summary, subdirs[cfg.SUBDIR_SENSITIVITY])
-            all_tables.update(sens_tables)
-        except Exception as exc:
-            log.warning("Sensitivity analysis failed: %s", exc, exc_info=True)
-
-    # ------------------------------------------------------------------
-    # 5. Net-zero year derivation
-    # ------------------------------------------------------------------
-    tnz_predictions = pd.DataFrame()
-    if "net_zero" not in skip and merged_df is not None:
-        log.info("=== Net-Zero Year Derivation ===")
-        try:
-            from stages.post_analysis.net_zero import run_net_zero_derivation
-            tnz_tables = run_net_zero_derivation(
-                final_prediction_summary,
-                final_bootstrap_predictions,
-                merged_df,
-                subdirs[cfg.SUBDIR_NET_ZERO_YEARS],
-            )
-            tnz_predictions = tnz_tables.get("tnz_predictions", pd.DataFrame())
-            all_tables.update(tnz_tables)
-        except Exception as exc:
-            log.warning("Net-zero derivation failed: %s", exc, exc_info=True)
-    elif "net_zero" not in skip and merged_df is None:
-        log.warning("Net-zero derivation skipped: merged data not available.")
-
-    # ------------------------------------------------------------------
-    # 6. Benchmark analysis
+    # Benchmark analysis (sequential — depends on net_zero tnz_predictions)
     # ------------------------------------------------------------------
     if "benchmark" not in skip and not tnz_predictions.empty:
         log.info("=== Benchmark Analysis ===")
@@ -455,7 +533,8 @@ def run(argv: list[str] | None = None) -> None:
         log.warning("Benchmark skipped: TNZ predictions not available (net_zero step may have failed).")
 
     # ------------------------------------------------------------------
-    # 7. Interpretability
+    # Interpretability — runs its own internal ProcessPoolExecutor
+    # (kept outside the top-level pool to avoid nested executor usage)
     # ------------------------------------------------------------------
     if "interpretability" not in skip and merged_df is not None:
         log.info("=== Interpretability Analysis (SHAP=%s) ===", not args.no_shap)
@@ -474,22 +553,7 @@ def run(argv: list[str] | None = None) -> None:
         log.warning("Interpretability skipped: merged data not available.")
 
     # ------------------------------------------------------------------
-    # 8. Uncertainty analysis
-    # ------------------------------------------------------------------
-    if "uncertainty" not in skip:
-        log.info("=== Uncertainty Analysis ===")
-        try:
-            from stages.post_analysis.uncertainty import run_uncertainty
-            unc_tables = run_uncertainty(
-                final_bootstrap_predictions, final_prediction_summary,
-                subdirs[cfg.SUBDIR_UNCERTAINTY],
-            )
-            all_tables.update(unc_tables)
-        except Exception as exc:
-            log.warning("Uncertainty analysis failed: %s", exc, exc_info=True)
-
-    # ------------------------------------------------------------------
-    # 8b. Coverage / missingness analysis
+    # Coverage / missingness analysis (sequential, conditional)
     # ------------------------------------------------------------------
     if not final_test_missingness.empty:
         log.info("=== Coverage / Missingness Analysis ===")
@@ -514,7 +578,7 @@ def run(argv: list[str] | None = None) -> None:
         log.info("Coverage analysis skipped: final_test_missingness.csv not found in results dir.")
 
     # ------------------------------------------------------------------
-    # 9. Report (Excel + key findings)
+    # Report (Excel + key findings)
     # ------------------------------------------------------------------
     if "report" not in skip:
         log.info("=== Report Generation ===")

@@ -15,11 +15,21 @@ The Preprocessor.transform() method returns a dict[branch_name -> DataFrame].
 We index into this dict using artifact["branch"] to obtain the branch-specific
 feature matrix, then apply the already-fitted SelectKBest and enforce the
 stored selected_feature_columns ordering.
+
+Parallelisation
+---------------
+Each artifact row is processed in an isolated subprocess via ProcessPoolExecutor,
+following the same pattern as stages/training/bootstrap.py.  The merged_df is
+broadcast once per worker process via the initializer to avoid repeated pickle
+overhead.  A PermissionError fallback runs rows sequentially when the executor
+cannot be created (e.g. restricted execution environments).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +49,9 @@ from stages.post_analysis.loader import load_artifact
 from stages.post_analysis.plot_utils import apply_thesis_style, save_fig, wrap_label
 
 log = logging.getLogger(__name__)
+
+# Per-worker state populated by _init_interpretability_worker; read by _run_interpretability_row.
+_WORKER_STATE: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +331,120 @@ def figure_shap_bar(
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker infrastructure
+# ---------------------------------------------------------------------------
+
+
+def _init_interpretability_worker(
+    merged_df: pd.DataFrame,
+    out_dir: Path,
+    background_samples: int,
+    kernel_nsamples: int,
+    max_display: int,
+    skip_shap: bool,
+) -> None:
+    """Initializer for ProcessPoolExecutor workers. Runs once per worker process."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from stages.post_analysis.matplotlib_setup import configure_matplotlib_environment
+    configure_matplotlib_environment()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+    )
+    logging.getLogger("shap").setLevel(logging.WARNING)
+    _WORKER_STATE.update({
+        "merged_df": merged_df,
+        "out_dir": Path(out_dir),
+        "background_samples": background_samples,
+        "kernel_nsamples": kernel_nsamples,
+        "max_display": max_display,
+        "skip_shap": skip_shap,
+    })
+
+
+def _run_interpretability_row(row_dict: dict) -> str:
+    """
+    Process one artifact row in a worker process.
+
+    Returns the tag string on success, or a ``"skipped:<reason>:<tag>"`` string
+    when the row is skipped.  Raises on unexpected errors so the caller can log them.
+    """
+    merged_df          = _WORKER_STATE["merged_df"]
+    out_dir            = _WORKER_STATE["out_dir"]
+    background_samples = _WORKER_STATE["background_samples"]
+    kernel_nsamples    = _WORKER_STATE["kernel_nsamples"]
+    max_display        = _WORKER_STATE["max_display"]
+    skip_shap          = _WORKER_STATE["skip_shap"]
+
+    _log = logging.getLogger(__name__)
+    apply_thesis_style()
+
+    artifact_path = row_dict.get("artifact_path")
+    if not artifact_path:
+        return "skipped:no_artifact_path"
+
+    artifact = load_artifact(artifact_path)
+    if artifact is None:
+        _log.warning("Could not load artifact: %s", artifact_path)
+        return f"skipped:load_failed:{artifact_path}"
+
+    model_name = artifact.get("model_name", str(row_dict.get("model_name", "unknown")))
+    target     = artifact.get("target",     str(row_dict.get("target",     "unknown")))
+    branch     = artifact.get("branch",     str(row_dict.get("branch",     "unknown")))
+    strategy   = artifact.get("outer_strategy_source", str(row_dict.get("outer_strategy_source", "unknown")))
+    tag = f"{strategy}_{target}_{model_name}_{branch}"
+    _log.info("Processing interpretability for: %s", tag)
+
+    X_df = _prepare_X_for_artifact(artifact, merged_df)
+    if X_df is None or X_df.empty:
+        _log.warning("Could not prepare X for %s — skipping.", tag)
+        return f"skipped:no_X:{tag}"
+
+    feature_names = list(X_df.columns) if hasattr(X_df, "columns") else [f"f{i}" for i in range(X_df.shape[1])]
+
+    if skip_shap:
+        _log.debug("SHAP skipped (--no-shap) for %s.", tag)
+        return f"skipped:no_shap:{tag}"
+
+    X_arr = X_df.values if hasattr(X_df, "values") else X_df
+    n_bg = min(background_samples, len(X_arr))
+    rng = np.random.default_rng(42)
+    bg_idx = rng.choice(len(X_arr), size=n_bg, replace=False)
+    X_background = X_arr[bg_idx]
+
+    explainer, etype = get_shap_explainer(model_name, artifact["model"], X_background)
+    if explainer is None:
+        return f"skipped:no_explainer:{tag}"
+
+    shap_vals = compute_shap_values(explainer, etype, X_arr, nsamples=kernel_nsamples)
+    if shap_vals is None:
+        return f"skipped:no_shap_vals:{tag}"
+
+    try:
+        shap_df = pd.DataFrame(shap_vals, columns=feature_names)
+        shap_df.to_csv(out_dir / f"{tag}_shap_values.csv", index=False)
+    except Exception as exc:
+        _log.debug("Could not save SHAP values CSV for %s: %s", tag, exc)
+
+    figure_shap_beeswarm(
+        shap_vals, X_df, feature_names,
+        f"SHAP Beeswarm — {tag}",
+        out_dir / f"{tag}_shap_beeswarm.png",
+        max_display=max_display,
+    )
+    figure_shap_bar(
+        shap_vals, feature_names,
+        f"SHAP Mean |value| — {tag}",
+        out_dir / f"{tag}_shap_bar.png",
+        max_display=max_display,
+    )
+
+    _log.info("Interpretability outputs saved for: %s", tag)
+    return tag
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -334,8 +461,12 @@ def run_interpretability(
     """
     Main entry point for interpretability analysis.
 
-    Iterates over each row of *final_results*, loads the corresponding artifact,
-    prepares the feature matrix, computes SHAP values, and saves all outputs.
+    Each artifact in *final_results* is dispatched to a worker process via
+    ProcessPoolExecutor (same pattern as stages/training/bootstrap.py).
+    *merged_df* is broadcast once per worker via the initializer to avoid
+    repeated serialisation overhead.
+
+    Falls back to sequential execution on PermissionError (restricted envs).
     """
     apply_thesis_style()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -348,69 +479,35 @@ def run_interpretability(
         log.warning("interpretability: 'artifact_path' column missing — cannot load artifacts.")
         return
 
-    for _, row in final_results.iterrows():
-        artifact_path = row.get("artifact_path")
-        if not artifact_path:
-            continue
+    rows = [row.to_dict() for _, row in final_results.iterrows()]
+    n_workers = min(len(rows), os.cpu_count() or 1)
+    initargs = (merged_df, out_dir, background_samples, kernel_nsamples, max_display, skip_shap)
 
-        artifact = load_artifact(artifact_path)
-        if artifact is None:
-            log.warning("Could not load artifact: %s", artifact_path)
-            continue
+    log.debug("Interpretability: processing %d artifacts across %d workers.", len(rows), n_workers)
 
-        model_name = artifact.get("model_name", str(row.get("model_name", "unknown")))
-        target     = artifact.get("target",     str(row.get("target",     "unknown")))
-        branch     = artifact.get("branch",     str(row.get("branch",     "unknown")))
-        strategy   = artifact.get("outer_strategy_source", str(row.get("outer_strategy_source", "unknown")))
-        tag = f"{strategy}_{target}_{model_name}_{branch}"
-        log.info("Processing interpretability for: %s", tag)
+    total_done = 0
 
-        # Prepare feature matrix
-        X_df = _prepare_X_for_artifact(artifact, merged_df)
-        if X_df is None or X_df.empty:
-            log.warning("Could not prepare X for %s — skipping.", tag)
-            continue
+    try:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_interpretability_worker,
+            initargs=initargs,
+        ) as executor:
+            futures = [executor.submit(_run_interpretability_row, r) for r in rows]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    total_done += 1
+                except Exception as exc:
+                    log.warning("Interpretability worker failed: %s", exc)
+    except PermissionError:
+        log.warning("ProcessPoolExecutor unavailable — falling back to sequential interpretability.")
+        _init_interpretability_worker(*initargs)
+        for r in rows:
+            try:
+                _run_interpretability_row(r)
+                total_done += 1
+            except Exception as exc:
+                log.warning("Interpretability row failed: %s", exc)
 
-        feature_names = list(X_df.columns) if hasattr(X_df, "columns") else [f"f{i}" for i in range(X_df.shape[1])]
-
-        if skip_shap:
-            log.debug("SHAP skipped (--no-shap) for %s.", tag)
-            continue
-
-        # SHAP background dataset (subsample for speed)
-        X_arr = X_df.values if hasattr(X_df, "values") else X_df
-        n_bg = min(background_samples, len(X_arr))
-        rng = np.random.default_rng(42)
-        bg_idx = rng.choice(len(X_arr), size=n_bg, replace=False)
-        X_background = X_arr[bg_idx]
-
-        explainer, etype = get_shap_explainer(model_name, artifact["model"], X_background)
-        if explainer is None:
-            continue
-
-        shap_vals = compute_shap_values(explainer, etype, X_arr, nsamples=kernel_nsamples)
-        if shap_vals is None:
-            continue
-
-        # Save raw SHAP values as CSV
-        try:
-            shap_df = pd.DataFrame(shap_vals, columns=feature_names)
-            shap_df.to_csv(out_dir / f"{tag}_shap_values.csv", index=False)
-        except Exception as exc:
-            log.debug("Could not save SHAP values CSV for %s: %s", tag, exc)
-
-        figure_shap_beeswarm(
-            shap_vals, X_df, feature_names,
-            f"SHAP Beeswarm — {tag}",
-            out_dir / f"{tag}_shap_beeswarm.png",
-            max_display=max_display,
-        )
-
-        figure_shap_bar(
-            shap_vals, feature_names,
-            f"SHAP Mean |value| — {tag}",
-            out_dir / f"{tag}_shap_bar.png",
-            max_display=max_display,
-        )
-
-        log.info("Interpretability outputs saved for: %s", tag)
+    log.debug("Interpretability complete: %d/%d artifacts processed.", total_done, len(rows))

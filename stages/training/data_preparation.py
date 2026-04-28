@@ -950,6 +950,7 @@ def _prepared_unit_validation_issues(
         y_fold_train = _load_joblib_with_issues(paths["y_train"], f"fold_{fold_id}/y_train.joblib", issues)
         x_fold_val = _load_joblib_with_issues(paths["x_val"], f"fold_{fold_id}/x_val.joblib", issues)
         y_fold_val = _load_joblib_with_issues(paths["y_val"], f"fold_{fold_id}/y_val.joblib", issues)
+        _load_joblib_with_issues(paths["selector"], f"fold_{fold_id}/selector.joblib", issues)
         fold_selected_cols = _load_json_with_issues(
             paths["selected_feature_columns"],
             f"fold_{fold_id}/selected_feature_columns.json",

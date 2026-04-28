@@ -269,13 +269,14 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
             # "kernel": hp.choice("kernel", ["rbf"]),
             "kernel": hp.choice("kernel", ["rbf"]),
             # OLD: C [1e-3, 1e3] → sigmoid 3.88× case had C=16.78; high-C SVR memorises small data
-            # "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
             # "C": hp.loguniform("C", np.log(1e-2), np.log(10.0)),
-            "C": hp.loguniform("C", np.log(1e-2), np.log(30.0)),
+            # "C": hp.loguniform("C", np.log(1e-2), np.log(30.0)),
+            "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
             # OLD: epsilon [1e-4, 1.0] → low epsilon is primary overfit signal (rho_inner=-0.843); sub-0.005 is degenerate attractor
-            # "epsilon": hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
+            # OLD: epsilon [0.01, 1.0] → Run4 raised floor to 0.01 which, combined with full convergence (10M max_iter), worsened final test (2022) from 0.167→0.295 while outer test improved; wider-margin solutions overfit to 2018-2021 patterns
             # "epsilon": hp.loguniform("epsilon", np.log(0.02), np.log(1.0)),
-            "epsilon": hp.loguniform("epsilon", np.log(0.01), np.log(1.0)),
+            # "epsilon": hp.loguniform("epsilon", np.log(0.01), np.log(1.0)),
+            "epsilon": hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
             # OLD: gamma [1e-6, 10] → RBF 7.14× case had gamma=5.0; best configs had gamma < 0.1
             # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.5)),
             # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.1)),
