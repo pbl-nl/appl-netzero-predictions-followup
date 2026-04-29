@@ -234,11 +234,11 @@ def _build_cross_run_table(
     parts: list["pd.DataFrame"] = []
     for run_label, df in frames:
         run_tag = Path(run_label).name
-        sub = df[["target", "outer_strategy_source", "branch", "model_name", "final_test_mae", "final_test_rmse", "final_test_r2"]].copy()
+        sub = df[["target", "outer_strategy_source", "branch", "model_name", "final_model_test_mae", "final_model_test_rmse", "final_model_test_r2"]].copy()
         sub = sub.rename(columns={
-            "final_test_mae":  f"final_test_mae_{run_tag}",
-            "final_test_rmse": f"final_test_rmse_{run_tag}",
-            "final_test_r2":   f"final_test_r2_{run_tag}",
+            "final_model_test_mae":  f"final_model_test_mae_{run_tag}",
+            "final_model_test_rmse": f"final_model_test_rmse_{run_tag}",
+            "final_model_test_r2":   f"final_model_test_r2_{run_tag}",
         })
         parts.append(sub)
 

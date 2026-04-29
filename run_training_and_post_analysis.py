@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from stages.thesis_analysis import run as run_thesis_analysis
 from stages.post_analysis import run as run_post_analysis
 from stages.training import run as run_training
 
@@ -19,6 +20,7 @@ def main() -> int:
 
     run_training()
     run_post_analysis([])
+    run_thesis_analysis([])
     return 0
 
 

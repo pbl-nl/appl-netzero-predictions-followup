@@ -50,7 +50,7 @@ def run_model_comparison(
     perf_df = table_performance_summary(final_results, out_dir)
     produced["performance_summary"] = perf_df
 
-    for metric in ("final_test_mae", "final_test_rmse", "final_test_r2"):
+    for metric in ("final_model_test_mae", "final_model_test_rmse", "final_model_test_r2"):
         if metric in final_results.columns:
             figure_performance_heatmap(final_results, metric, out_dir)
 
@@ -76,30 +76,31 @@ def table_performance_summary(
     """
     Build and save a performance summary table.
 
-    Adds ``train_test_gap_mae = final_test_mae - final_train_mae`` and sorts by
-    ``(target, outer_strategy_source, final_test_mae)``.
+    Adds ``train_test_gap_mae = final_model_test_mae - final_model_train_mae`` and sorts by
+    ``(target, outer_strategy_source, final_model_test_mae)``.
     """
     df = final_results.copy()
 
-    if "final_train_mae" in df.columns and "final_test_mae" in df.columns:
-        df["train_test_gap_mae"] = df["final_test_mae"] - df["final_train_mae"]
+    if "final_model_train_mae" in df.columns and "final_model_test_mae" in df.columns:
+        df["train_test_gap_mae"] = df["final_model_test_mae"] - df["final_model_train_mae"]
 
     keep_cols = [
         c for c in [
             "target", "outer_strategy_source", "branch", "model_name",
             "candidate_rank", "candidate_role",
-            "final_test_mae", "final_test_rows",
-            "final_test_mae_lenient", "final_test_rows_lenient",
-            "final_test_rmse", "final_test_r2",
-            "final_test_mse", "final_test_explained_variance",
-            "final_train_mae", "train_test_gap_mae",
+            "final_model_test_mae", "final_test_rows",
+            "final_model_test_mae_lenient", "final_test_rows_lenient",
+            "final_model_test_rmse", "final_model_test_r2",
+            "final_model_test_mse", "final_model_test_explained_variance",
+            "final_model_train_mae", "train_test_gap_mae",
+            "bootstrap_test_mae_mean", "bootstrap_test_mae_p05", "bootstrap_test_mae_p95",
             "feature_count", "bootstrap_iterations",
             "final_model_svr_converged", "bootstrap_svr_converged_share",
         ] if c in df.columns
     ]
     df = df[keep_cols].copy()
 
-    sort_cols = [c for c in ["target", "outer_strategy_source", "final_test_mae"] if c in df.columns]
+    sort_cols = [c for c in ["target", "outer_strategy_source", "final_model_test_mae"] if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols).reset_index(drop=True)
 
@@ -145,7 +146,7 @@ def figure_performance_heatmap(
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     # For R², higher is better → use a reversed colormap
-    cmap = "RdYlGn" if metric == "final_test_r2" else "RdYlGn_r"
+    cmap = "RdYlGn" if metric == "final_model_test_r2" else "RdYlGn_r"
     sns.heatmap(
         pivot,
         ax=ax,
@@ -170,15 +171,15 @@ def figure_model_ranking(
     out_dir: Path,
 ) -> None:
     """
-    Horizontal bar chart of mean final_test_mae per model_name averaged across all
+    Horizontal bar chart of mean final_model_test_mae per model_name averaged across all
     (target, strategy, branch) combinations. Error bars show std deviation.
     """
-    if "final_test_mae" not in final_results.columns or "model_name" not in final_results.columns:
+    if "final_model_test_mae" not in final_results.columns or "model_name" not in final_results.columns:
         log.warning("Cannot produce model ranking — required columns missing.")
         return
 
     agg = (
-        final_results.groupby("model_name")["final_test_mae"]
+        final_results.groupby("model_name")["final_model_test_mae"]
         .agg(mean_mae="mean", std_mae="std")
         .sort_values("mean_mae")
         .reset_index()
@@ -206,28 +207,28 @@ def figure_train_test_gap_scatter(
     out_dir: Path,
 ) -> None:
     """
-    Scatter plot: x = final_train_mae, y = final_test_mae.
+    Scatter plot: x = final_model_train_mae, y = final_model_test_mae.
 
     Points coloured by model_name. A y=x reference line shows the overfitting
     boundary (points above = test > train = overfitting).
     """
-    if not {"final_train_mae", "final_test_mae", "model_name"}.issubset(final_results.columns):
+    if not {"final_model_train_mae", "final_model_test_mae", "model_name"}.issubset(final_results.columns):
         log.warning("Cannot produce gap scatter — required columns missing.")
         return
 
-    df = final_results.dropna(subset=["final_train_mae", "final_test_mae"]).copy()
+    df = final_results.dropna(subset=["final_model_train_mae", "final_model_test_mae"]).copy()
     colors = model_color_map(df["model_name"].unique().tolist())
 
     fig, ax = plt.subplots(figsize=(7, 6))
     for model, grp in df.groupby("model_name"):
         ax.scatter(
-            grp["final_train_mae"], grp["final_test_mae"],
+            grp["final_model_train_mae"], grp["final_model_test_mae"],
             label=model, color=colors[model], alpha=0.75, s=60, edgecolors="white",
         )
 
     add_diagonal(ax)
-    ax.set_xlabel("Final Train MAE")
-    ax.set_ylabel("Test MAE (2022 holdout)")
+    ax.set_xlabel("Final Model Train MAE")
+    ax.set_ylabel("Final Model Test MAE (2022 holdout)")
     ax.set_title("Train vs. Test MAE — Overfitting Diagnostic")
     ax.legend(fontsize=7, ncol=2)
 

@@ -22,7 +22,6 @@ import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +35,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.feature_selection import SelectKBest, mutual_info_regression
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.feature_selection import RFE
 from sklearn.model_selection import KFold
 
 from stages.preprocessing import (
@@ -265,17 +265,25 @@ def fit_feature_selector(
     x_train: pd.DataFrame,
     y_train: pd.Series,
     n_features: int,
-) -> SelectKBest:
-    selector = SelectKBest(
-        score_func=partial(mutual_info_regression, random_state=RANDOM_STATE),
-        k=min(n_features, x_train.shape[1]),
+) -> RFE:
+    estimator = ExtraTreesRegressor(
+        n_estimators=50,
+        max_features="sqrt",
+        min_samples_leaf=2,
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+    selector = RFE(
+        estimator=estimator,
+        n_features_to_select=min(n_features, x_train.shape[1]),
+        step=0.5,
     )
     selector.fit(x_train, y_train)
     return selector
 
 
 def apply_feature_selector(
-    selector: SelectKBest,
+    selector: RFE,
     x: pd.DataFrame,
     feature_columns: list[str],
 ) -> tuple[pd.DataFrame, list[str]]:
@@ -303,7 +311,7 @@ def _compute_common_features(
 def prepare_cv_fold_data(
     prepared_fold_frames: list[dict[str, Any]],
     target: str,
-    feature_selector: SelectKBest | None = None,
+    feature_selector: RFE | None = None,
     all_feature_columns: list[str] | None = None,
     n_features_to_select: int | None = None,
     common_feature_columns: list[str] | None = None,
@@ -316,7 +324,7 @@ def prepare_cv_fold_data(
         if x_train.empty or x_val.empty:
             continue
 
-        fold_selector: SelectKBest | None = None
+        fold_selector: RFE | None = None
         if n_features_to_select is not None and common_feature_columns:
             fold_selector = fit_feature_selector(
                 x_train.reindex(columns=common_feature_columns, fill_value=0.0),
@@ -1273,7 +1281,7 @@ def _select_training_bundle(
     x_train, y_train, feature_columns = extract_xy(train_frame, target)
     common_feature_columns = _compute_common_features(fold_frames, target, feature_columns)
 
-    selector: SelectKBest | None = None
+    selector: RFE | None = None
     selected_feature_columns: list[str] = []
     prepared_folds: list[dict[str, Any]] = []
 
@@ -1311,7 +1319,7 @@ def _select_training_bundle(
 def _select_eval_xy(
     frame: pd.DataFrame,
     target: str,
-    selector: SelectKBest | None,
+    selector: RFE | None,
     common_feature_columns: list[str],
 ) -> tuple[pd.DataFrame, pd.Series]:
     x_eval, y_eval, _ = extract_xy(frame, target)
@@ -1323,7 +1331,7 @@ def _select_eval_xy(
 
 def _select_feature_matrix(
     frame: pd.DataFrame,
-    selector: SelectKBest | None,
+    selector: RFE | None,
     common_feature_columns: list[str],
 ) -> pd.DataFrame:
     x = frame.loc[:, feature_columns_from_frame(frame)].copy()

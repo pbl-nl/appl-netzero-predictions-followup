@@ -675,6 +675,14 @@ class Preprocessor:
             if retained_cats and self.mice_categorical_imputer_ is not None:
                 out[retained_cats] = self.mice_categorical_imputer_.transform(out[retained_cats])
 
+            # Drop missingness indicators — MICE preprocessing internals, not features.
+            was_missing_cols = [
+                f"{c}_was_missing" for c in self.mice_missing_flags_
+                if f"{c}_was_missing" in out.columns
+            ]
+            if was_missing_cols:
+                out = out.drop(columns=was_missing_cols)
+
         else:
             raise ValueError(f"Unsupported branch: {branch}")
 

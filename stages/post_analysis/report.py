@@ -138,16 +138,16 @@ def build_key_findings(
 
     # --- Performance: best model per target ---
     if performance_summary is not None and not performance_summary.empty:
-        if "final_test_mae" in performance_summary.columns and "target" in performance_summary.columns:
+        if "final_model_test_mae" in performance_summary.columns and "target" in performance_summary.columns:
             targets = sorted(performance_summary["target"].unique())
             for target in targets:
                 subset = performance_summary[
                     performance_summary["target"] == target
-                ].dropna(subset=["final_test_mae"])
+                ].dropna(subset=["final_model_test_mae"])
                 if not subset.empty:
-                    best_row = subset.loc[subset["final_test_mae"].idxmin()]
+                    best_row = subset.loc[subset["final_model_test_mae"].idxmin()]
                     findings[f"best_model_{target}"] = best_row.get("model_name", "unknown")
-                    findings[f"best_mae_{target}"]   = round(float(best_row["final_test_mae"]), 4)
+                    findings[f"best_mae_{target}"]   = round(float(best_row["final_model_test_mae"]), 4)
 
                     if "outer_strategy_source" in best_row:
                         findings[f"best_strategy_{target}"] = best_row["outer_strategy_source"]
