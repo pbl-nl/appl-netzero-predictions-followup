@@ -306,8 +306,8 @@ def evaluate_candidate_model(
 def _aggregate_bootstrap_results(
     bootstrap_results: list[tuple[int, dict[str, float], dict[str, float], dict[str, float], np.ndarray, bool | None]],
     base_predictions: pd.DataFrame,
-) -> tuple[dict[str, float], dict[str, float], dict[str, float], pd.DataFrame, float]:
-    """Aggregate bootstrap iteration results into mean metrics, predictions, and convergence share."""
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], pd.DataFrame, float, dict[str, float]]:
+    """Aggregate bootstrap results into mean metrics, predictions, convergence share, and MAE percentiles."""
     bootstrap_train_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics: list[dict[str, float]] = []
     bootstrap_test_metrics_lenient: list[dict[str, float]] = []
@@ -327,15 +327,15 @@ def _aggregate_bootstrap_results(
     train_metrics_df = pd.DataFrame(bootstrap_train_metrics)
     test_metrics_df = pd.DataFrame(bootstrap_test_metrics)
     test_metrics_lenient_df = pd.DataFrame(bootstrap_test_metrics_lenient)
-    avg_train = {
+    bootstrap_full_train_mean = {
         k: float(train_metrics_df[k].mean()) for k in CORE_METRICS
         if k in train_metrics_df.columns
     }
-    avg_test = {
+    bootstrap_test_mean = {
         k: float(test_metrics_df[k].mean()) for k in CORE_METRICS
         if k in test_metrics_df.columns
     }
-    avg_test_lenient = {
+    bootstrap_test_lenient_mean = {
         k: float(test_metrics_lenient_df[k].mean()) for k in CORE_METRICS
         if k in test_metrics_lenient_df.columns
     }
@@ -344,8 +344,17 @@ def _aggregate_bootstrap_results(
     bootstrap_svr_converged_share = (
         float(sum(svr_flags) / len(svr_flags)) if svr_flags else float("nan")
     )
+    mae_values = test_metrics_df["mae"].dropna().to_numpy() if "mae" in test_metrics_df.columns else np.array([])
+    bootstrap_test_mae_percentiles: dict[str, float] = {
+        "p05": float(np.percentile(mae_values, 5)) if len(mae_values) > 0 else float("nan"),
+        "p50": float(np.percentile(mae_values, 50)) if len(mae_values) > 0 else float("nan"),
+        "p95": float(np.percentile(mae_values, 95)) if len(mae_values) > 0 else float("nan"),
+    }
 
-    return avg_train, avg_test, avg_test_lenient, preds_df, bootstrap_svr_converged_share
+    return (
+        bootstrap_full_train_mean, bootstrap_test_mean, bootstrap_test_lenient_mean,
+        preds_df, bootstrap_svr_converged_share, bootstrap_test_mae_percentiles,
+    )
 
 
 def _save_final_artifact(
@@ -362,8 +371,10 @@ def _save_final_artifact(
     outer_strategy: str,
     candidate_rank: int,
     candidate_role: str,
-    avg_train: dict[str, float],
-    avg_test: dict[str, float],
+    final_model_train_metrics: dict[str, float],
+    final_model_test_metrics: dict[str, float],
+    bootstrap_full_train_mean: dict[str, float],
+    bootstrap_test_mean: dict[str, float],
     pred_summary_df: pd.DataFrame,
     artifact_model: Any = None,
 ) -> Path:
@@ -385,7 +396,12 @@ def _save_final_artifact(
         "candidate_role": candidate_role,
         "params": best_params,
         "feature_columns": feature_columns,
-        "metrics": {"final_train": avg_train, "final_test": avg_test},
+        "metrics": {
+            "final_model_train": final_model_train_metrics,
+            "final_model_test": final_model_test_metrics,
+            "bootstrap_full_train_mean": bootstrap_full_train_mean,
+            "bootstrap_test_mean": bootstrap_test_mean,
+        },
         "bootstrap_iterations": FINAL_BOOTSTRAP_ITERATIONS,
         "prediction_summary": pred_summary_df,
         "outer_strategy_source": outer_strategy,
@@ -409,9 +425,13 @@ def _build_final_result_row(
     x_test_scored: pd.DataFrame,
     x_test_scored_lenient: pd.DataFrame,
     selected_cols: list[str],
-    avg_train: dict[str, float],
-    avg_test: dict[str, float],
-    avg_test_lenient: dict[str, float],
+    final_model_train_metrics: dict[str, float],
+    final_model_test_metrics: dict[str, float],
+    final_model_test_metrics_lenient: dict[str, float],
+    bootstrap_full_train_mean: dict[str, float],
+    bootstrap_test_mean: dict[str, float],
+    bootstrap_test_lenient_mean: dict[str, float],
+    bootstrap_test_mae_percentiles: dict[str, float],
     artifact_path: Path,
     artifact_model: Any,
     bootstrap_svr_converged_share: float,
@@ -437,9 +457,15 @@ def _build_final_result_row(
         "artifact_path": str(artifact_path),
     }
     for metric in CORE_METRICS:
-        row[f"final_train_{metric}"] = float(avg_train.get(metric, float("nan")))
-        row[f"final_test_{metric}"] = float(avg_test.get(metric, float("nan")))
-        row[f"final_test_{metric}_lenient"] = float(avg_test_lenient.get(metric, float("nan")))
+        row[f"final_model_train_{metric}"] = float(final_model_train_metrics.get(metric, float("nan")))
+        row[f"final_model_test_{metric}"] = float(final_model_test_metrics.get(metric, float("nan")))
+        row[f"final_model_test_{metric}_lenient"] = float(final_model_test_metrics_lenient.get(metric, float("nan")))
+        row[f"bootstrap_full_train_{metric}_mean"] = float(bootstrap_full_train_mean.get(metric, float("nan")))
+        row[f"bootstrap_test_{metric}_mean"] = float(bootstrap_test_mean.get(metric, float("nan")))
+        row[f"bootstrap_test_{metric}_lenient_mean"] = float(bootstrap_test_lenient_mean.get(metric, float("nan")))
+    row["bootstrap_test_mae_p05"] = float(bootstrap_test_mae_percentiles.get("p05", float("nan")))
+    row["bootstrap_test_mae_p50"] = float(bootstrap_test_mae_percentiles.get("p50", float("nan")))
+    row["bootstrap_test_mae_p95"] = float(bootstrap_test_mae_percentiles.get("p95", float("nan")))
     return row
 
 
@@ -519,9 +545,10 @@ def _refit_single_winner(
         x_test_all=x_test_all, country_labels=country_labels, bootstrap_workers=bootstrap_workers,
     )
 
-    avg_train, avg_test, avg_test_lenient, preds_df, bootstrap_svr_converged_share = (
-        _aggregate_bootstrap_results(bootstrap_results, base_predictions)
-    )
+    (
+        bootstrap_full_train_mean, bootstrap_test_mean, bootstrap_test_lenient_mean,
+        preds_df, bootstrap_svr_converged_share, bootstrap_test_mae_percentiles,
+    ) = _aggregate_bootstrap_results(bootstrap_results, base_predictions)
     if not pd.isna(bootstrap_svr_converged_share) and bootstrap_svr_converged_share < 1.0:
         logger.warning(
             "%s: only %.1f%% of bootstrap iterations converged.",
@@ -539,6 +566,13 @@ def _refit_single_winner(
             "%s: final artifact model did not converge (n_iter_=%s).",
             tag, artifact_diag["svr_n_iter"],
         )
+
+    final_model_train_metrics, _ = predict_evaluate(artifact_model, x_train, y_train)
+    final_model_test_metrics, _ = predict_evaluate(artifact_model, x_test_scored, y_test_scored)
+    final_model_test_metrics_lenient, _ = predict_evaluate(
+        artifact_model, x_test_scored_lenient, y_test_scored_lenient,
+    )
+
     bootstrap_converged_label = (
         "n/a" if pd.isna(bootstrap_svr_converged_share)
         else f"{bootstrap_svr_converged_share:.2f}"
@@ -548,13 +582,15 @@ def _refit_single_winner(
         model_name, best_params, x_train, y_train,
         preprocessor, selector, selected_cols, feature_columns,
         target, branch, outer_strategy, int(candidate_rank), candidate_role,
-        avg_train, avg_test, pred_summary_df,
+        final_model_train_metrics, final_model_test_metrics,
+        bootstrap_full_train_mean, bootstrap_test_mean,
+        pred_summary_df,
         artifact_model=artifact_model,
     )
 
     print(
-        f"[PID:{pid}] {tag} Done. final_test_mae={avg_test.get('mae', float('nan')):.4f} "
-        f"(lenient={avg_test_lenient.get('mae', float('nan')):.4f}), "
+        f"[PID:{pid}] {tag} Done. final_model_test_mae={final_model_test_metrics.get('mae', float('nan')):.4f} "
+        f"(lenient={final_model_test_metrics_lenient.get('mae', float('nan')):.4f}), "
         f"bootstrap_converged={bootstrap_converged_label}",
         flush=True,
     )
@@ -564,8 +600,11 @@ def _refit_single_winner(
         int(candidate_rank), candidate_role,
         best_params,
         x_train, x_test_scored, x_test_scored_lenient,
-        selected_cols, avg_train, avg_test, avg_test_lenient, artifact_path,
-        artifact_model, bootstrap_svr_converged_share,
+        selected_cols,
+        final_model_train_metrics, final_model_test_metrics, final_model_test_metrics_lenient,
+        bootstrap_full_train_mean, bootstrap_test_mean, bootstrap_test_lenient_mean,
+        bootstrap_test_mae_percentiles,
+        artifact_path, artifact_model, bootstrap_svr_converged_share,
     )
     return final_row, preds_df
 
@@ -1181,5 +1220,5 @@ def run() -> None:
     if not final_results_df.empty:
         logger.info(
             f"\nFinal results:\n"
-            f"{final_results_df[['outer_strategy_source', 'target', 'branch', 'model_name', 'candidate_rank', 'candidate_role', 'final_test_mae', 'final_test_r2']].to_string(index=False)}"
+            f"{final_results_df[['outer_strategy_source', 'target', 'branch', 'model_name', 'candidate_rank', 'candidate_role', 'final_model_test_mae', 'final_model_test_r2']].to_string(index=False)}"
         )

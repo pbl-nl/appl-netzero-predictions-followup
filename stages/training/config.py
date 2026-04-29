@@ -30,8 +30,8 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 10_000_000
 
-ACTIVE_MODELS = ["svr", "elasticnet", "dummy_mean"]
-# ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
+ACTIVE_MODELS = ["svr", "mlp", "dummy_mean"]
+#ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 ACTIVE_BRANCHES = ["simple", "mice"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
@@ -165,15 +165,29 @@ FINAL_RESULTS_COLUMNS = [
     "final_test_rows_lenient",
     "feature_count",
     "bootstrap_iterations",
-    # final_train_{metric} for each of the 5 metrics
-    "final_train_mae", "final_train_mse", "final_train_rmse",
-    "final_train_r2", "final_train_explained_variance",
-    # final_test_{metric} (primary — strict drop_rows=True) for each of the 5 metrics
-    "final_test_mae", "final_test_mse", "final_test_rmse",
-    "final_test_r2", "final_test_explained_variance",
-    # final_test_{metric}_lenient (secondary audit — drop_rows="targets_only")
-    "final_test_mae_lenient", "final_test_mse_lenient", "final_test_rmse_lenient",
-    "final_test_r2_lenient", "final_test_explained_variance_lenient",
+    # Single final-model metrics (deterministic fit on full pre-2022 training data)
+    "final_model_train_mae", "final_model_train_mse", "final_model_train_rmse",
+    "final_model_train_r2", "final_model_train_explained_variance",
+    # Single final-model test metrics (primary — strict drop_rows=True)
+    "final_model_test_mae", "final_model_test_mse", "final_model_test_rmse",
+    "final_model_test_r2", "final_model_test_explained_variance",
+    # Single final-model test metrics (secondary audit — drop_rows="targets_only")
+    "final_model_test_mae_lenient", "final_model_test_mse_lenient", "final_model_test_rmse_lenient",
+    "final_model_test_r2_lenient", "final_model_test_explained_variance_lenient",
+    # Bootstrap-refit train metrics (mean over 200 country-block iterations,
+    # evaluated on the full training panel — not an in-sample fit)
+    "bootstrap_full_train_mae_mean", "bootstrap_full_train_mse_mean", "bootstrap_full_train_rmse_mean",
+    "bootstrap_full_train_r2_mean", "bootstrap_full_train_explained_variance_mean",
+    # Bootstrap test metrics — mean, strict (drop_rows=True)
+    "bootstrap_test_mae_mean", "bootstrap_test_mse_mean", "bootstrap_test_rmse_mean",
+    "bootstrap_test_r2_mean", "bootstrap_test_explained_variance_mean",
+    # Bootstrap test metrics — mean, lenient (drop_rows="targets_only")
+    "bootstrap_test_mae_lenient_mean", "bootstrap_test_mse_lenient_mean", "bootstrap_test_rmse_lenient_mean",
+    "bootstrap_test_r2_lenient_mean", "bootstrap_test_explained_variance_lenient_mean",
+    # Bootstrap MAE percentiles (MAE only to avoid CSV bloat)
+    "bootstrap_test_mae_p05",
+    "bootstrap_test_mae_p50",
+    "bootstrap_test_mae_p95",
     # SVR convergence diagnostics for the saved single-model artifact
     "final_model_svr_converged",
     "final_model_svr_n_iter",
