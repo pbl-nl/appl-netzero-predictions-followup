@@ -239,6 +239,12 @@ class Preprocessor:
         self.mice_input_cols_: list[str] = []
         self.mice_regime_col_: str | None = None
 
+        # Outlier bounds fitted on training data only (country-level and year-level)
+        self.outlier_lower_country_: dict[str, pd.Series] = {}
+        self.outlier_upper_country_: dict[str, pd.Series] = {}
+        self.outlier_lower_year_: dict[str, pd.Series] = {}
+        self.outlier_upper_year_: dict[str, pd.Series] = {}
+
         # Encoders / scalers per branch
         self.encoder_: dict[str, OneHotEncoder] = {}
         self.scaler_: dict[str, Any] = {}
@@ -440,22 +446,16 @@ class Preprocessor:
         drop_rows: bool | str = True,
     ) -> pd.DataFrame:
         current = df.copy().sort_values(ID_COLS).reset_index(drop=True)
-        current["_is_current"] = True
-
-        if history_df is not None and not history_df.empty:
-            history = history_df.copy().sort_values(ID_COLS).reset_index(drop=True)
-            history["_is_current"] = False
-            working = pd.concat([history, current], ignore_index=True, sort=False)
-        else:
-            working = current.copy()
+        current["_is_current"] = True  # kept for _apply_*_range_rules compatibility
 
         outlier_features = [c for c in self.continuous_features_ if c not in self.synthetic_feature_names_]
-        self._apply_outlier_pass(working, COUNTRY_COL, outlier_features, COUNTRY_OUTLIER_MIN_OBS)
-        self._apply_outlier_pass(working, YEAR_COL, outlier_features, YEAR_OUTLIER_MIN_OBS)
-        self._apply_numeric_range_rules(working)
-        self._apply_categorical_range_rules(working)
+        if fit:
+            self._fit_outlier_bounds(current, outlier_features)
+        self._apply_fitted_outlier_bounds(current, outlier_features)
+        self._apply_numeric_range_rules(current)
+        self._apply_categorical_range_rules(current)
 
-        cleaned = working[working["_is_current"]].copy().drop(columns=["_is_current"], errors="ignore")
+        cleaned = current.drop(columns=["_is_current"], errors="ignore")
         feature_cols = get_feature_columns(cleaned)
         real_feature_cols = [c for c in feature_cols if c not in self.synthetic_feature_names_]
         if real_feature_cols:
@@ -486,22 +486,47 @@ class Preprocessor:
         cleaned = cleaned.drop(columns=sorted(self.columns_to_drop_), errors="ignore")
         return cleaned.sort_values(ID_COLS).reset_index(drop=True)
 
-    def _apply_outlier_pass(
-        self, working: pd.DataFrame, group_col: str, features: list[str], min_obs: int
+    def _fit_outlier_bounds(
+        self, df: pd.DataFrame, outlier_features: list[str]
     ) -> None:
-        for col in features:
-            if col not in working.columns:
-                continue
-            grouped = working.groupby(group_col)[col]
-            count = grouped.transform("count")
-            q1 = grouped.transform(lambda s: s.quantile(0.25))
-            q3 = grouped.transform(lambda s: s.quantile(0.75))
-            iqr = q3 - q1
-            valid = (count >= min_obs) & (iqr > 0) & working[col].notna()
-            lower = q1 - IQR_MULTIPLIER * iqr
-            upper = q3 + IQR_MULTIPLIER * iqr
-            mask = valid & ((working[col] < lower) | (working[col] > upper)) & working["_is_current"]
-            working.loc[mask, col] = np.nan
+        for group_col, min_obs, lower_store, upper_store in [
+            (COUNTRY_COL, COUNTRY_OUTLIER_MIN_OBS,
+             self.outlier_lower_country_, self.outlier_upper_country_),
+            (YEAR_COL, YEAR_OUTLIER_MIN_OBS,
+             self.outlier_lower_year_, self.outlier_upper_year_),
+        ]:
+            for col in outlier_features:
+                if col not in df.columns:
+                    continue
+                grouped = df.groupby(group_col)[col]
+                count = grouped.count()
+                q1 = grouped.quantile(0.25)
+                q3 = grouped.quantile(0.75)
+                iqr = q3 - q1
+                valid = (count >= min_obs) & (iqr > 0)
+                lower = (q1 - IQR_MULTIPLIER * iqr).where(valid)
+                upper = (q3 + IQR_MULTIPLIER * iqr).where(valid)
+                lower_store[col] = lower.dropna()
+                upper_store[col] = upper.dropna()
+
+    def _apply_fitted_outlier_bounds(
+        self, df: pd.DataFrame, outlier_features: list[str]
+    ) -> None:
+        for group_col, lower_store, upper_store in [
+            (COUNTRY_COL, self.outlier_lower_country_, self.outlier_upper_country_),
+            (YEAR_COL,    self.outlier_lower_year_,    self.outlier_upper_year_),
+        ]:
+            for col in outlier_features:
+                if col not in df.columns:
+                    continue
+                lower_bounds = lower_store.get(col)
+                upper_bounds = upper_store.get(col)
+                if lower_bounds is None or upper_bounds is None:
+                    continue
+                lower = df[group_col].map(lower_bounds)
+                upper = df[group_col].map(upper_bounds)
+                valid = df[col].notna() & lower.notna() & upper.notna()
+                df.loc[valid & ((df[col] < lower) | (df[col] > upper)), col] = np.nan
 
     def _apply_numeric_range_rules(self, working: pd.DataFrame) -> None:
         current_mask = working["_is_current"]
