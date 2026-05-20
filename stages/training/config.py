@@ -30,11 +30,11 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 10_000_000
 
-# ACTIVE_MODELS = ["svr", "mlp", "dummy_mean"]
-ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
-ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
-ACTIVE_BRANCHES = ["simple", "mice"]
-ACTIVE_OUTER_STRATEGIES = ["temporal_cv", "random_cv"]
+ACTIVE_MODELS = ["svr", "mlp", "dummy_mean"]
+#ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
+ACTIVE_TARGETS = ["linear", "optimistic"]#, "pessimistic"]
+ACTIVE_BRANCHES = ["simple"]# , "mice"]
+ACTIVE_OUTER_STRATEGIES = ["temporal_cv"]#, "random_cv"]
 
 # Nested temporal CV: outer test years for model selection (2022 is final holdout)
 OUTER_TEST_YEARS = [2018, 2019, 2020, 2021]

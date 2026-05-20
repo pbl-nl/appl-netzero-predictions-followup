@@ -53,11 +53,11 @@ TEST_YEAR = 2022
 RANDOM_STATE = 42
 
 ROW_MISSINGNESS_THRESHOLD = 0.30
-SPARSE_COLUMN_THRESHOLD = 0.95
 OUTLIER_METHOD = "iqr"
 IQR_MULTIPLIER = 1.5
 COUNTRY_OUTLIER_MIN_OBS = 5
 YEAR_OUTLIER_MIN_OBS = 20
+OUTLIER_WIPEOUT_WARNING_THRESHOLD = 0.80
 
 LAG_PERIODS = [1, 2, 3]
 ROLLING_WINDOWS = [3, 5, 7]
@@ -118,6 +118,44 @@ CATEGORICAL_ALLOWED_VALUES: dict[str, set[int]] = {
     "v2x_regime": {0, 1, 2, 3},
 }
 
+OUTLIER_POLICY_RANGE_ONLY = "range_only"
+OUTLIER_POLICY_COUNTRY_IQR = "country_iqr"
+OUTLIER_POLICY_COUNTRY_AND_YEAR_IQR = "country_and_year_iqr"
+
+STRUCTURAL_IDENTITY_FEATURES = {
+    "renewable_energy_share_tfc_pct",
+    "renewable_electricity_share_pct",
+    "energy_intensity_mj_per_usd_ppp",
+    "non_co2_emissions_per_capita",
+    "total_ghg_emissions_per_capita",
+    "total_hard_to_abate_emissions_per_capita",
+    "agricultural_land_of_land_area",
+    "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average",
+    "coal_rents_of_gdp",
+    "forest_area_of_land_area",
+    "gdp_per_capita_constant_2015_us",
+    "gdp_ppp_constant_2021_international",
+    "natural_gas_rents_of_gdp",
+    "oil_rents_of_gdp",
+    "population_density_people_per_sq_km_of_land_area",
+}
+
+YEAR_CONFIRMED_OUTLIER_FEATURES = {
+    "annual_deforestation_of_change",
+    "control_of_corruption_estimate",
+    "ghg_growth",
+    "inform_risk_index",
+    "political_stability_and_absence_of_violence_terrorism_estimate",
+    "regulatory_quality_estimate",
+    "rsf_press_freedom_index",
+    "voice_and_accountability_estimate",
+}
+
+OUTLIER_POLICY_BY_FEATURE: dict[str, str] = {
+    **{col: OUTLIER_POLICY_RANGE_ONLY for col in STRUCTURAL_IDENTITY_FEATURES},
+    **{col: OUTLIER_POLICY_COUNTRY_AND_YEAR_IQR for col in YEAR_CONFIRMED_OUTLIER_FEATURES},
+}
+
 BRANCH_NAMES = ("simple", "mice")
 
 # --- Utility functions ---
@@ -157,11 +195,13 @@ class CountryYearFallbackImputer:
         for col in self.numeric_features:
             self.country_stats_[col] = df.groupby(COUNTRY_COL)[col].median()
             self.year_stats_[col] = df.groupby(YEAR_COL)[col].median()
-            self.global_stats_[col] = df[col].median()
+            med = df[col].median()
+            self.global_stats_[col] = 0.0 if pd.isna(med) else med
         for col in self.categorical_features:
             self.country_stats_[col] = df.groupby(COUNTRY_COL)[col].agg(safe_mode)
             self.year_stats_[col] = df.groupby(YEAR_COL)[col].agg(safe_mode)
-            self.global_stats_[col] = safe_mode(df[col])
+            mode = safe_mode(df[col])
+            self.global_stats_[col] = 0.0 if pd.isna(mode) or mode is None else mode
         return self
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -208,7 +248,6 @@ class Preprocessor:
         self.continuous_features_: list[str] = []
         self.retained_raw_features_: list[str] = []
         self.retained_continuous_features_: list[str] = []
-        self.columns_to_drop_: set[str] = set()
 
         # Country PCA embeddings
         self.country_embedding_map_: dict[str, np.ndarray] = {}
@@ -224,6 +263,10 @@ class Preprocessor:
         self.synthetic_feature_names_: list[str] = []
         self._last_clean_missingness_: pd.DataFrame = pd.DataFrame()
         self.last_transform_missingness_: pd.DataFrame = pd.DataFrame()
+        self.outlier_diagnostics_: pd.DataFrame = pd.DataFrame()
+        self.outlier_wipeout_diagnostics_: pd.DataFrame = pd.DataFrame()
+        self.last_outlier_diagnostics_: pd.DataFrame = pd.DataFrame()
+        self.last_outlier_wipeout_diagnostics_: pd.DataFrame = pd.DataFrame()
 
         # Imputers
         self.simple_imputer_: CountryYearFallbackImputer | None = None
@@ -336,16 +379,11 @@ class Preprocessor:
         cleaned = self._fill_temporal_gaps(cleaned)
         n_good = int((~cleaned["_to_drop"]).sum())
         n_ghost = int(cleaned["_to_drop"].sum())
-        self.retained_raw_features_ = [
-            c for c in self.feature_columns_ if c not in self.columns_to_drop_
-        ]
-        self.retained_continuous_features_ = [
-            c for c in self.continuous_features_ if c in self.retained_raw_features_
-        ]
+        self.retained_raw_features_ = list(self.feature_columns_)
+        self.retained_continuous_features_ = list(self.continuous_features_)
         print(
             f"[PID:{pid}] Cleaning: {len(train_df)}→{n_good} rows "
             f"({n_ghost} ghost rows preserved for temporal continuity), "
-            f"dropped {len(self.columns_to_drop_)} columns, "
             f"{len(self.retained_continuous_features_)} continuous features retained",
             flush=True,
         )
@@ -451,8 +489,7 @@ class Preprocessor:
         outlier_features = [c for c in self.continuous_features_ if c not in self.synthetic_feature_names_]
         if fit:
             self._fit_outlier_bounds(current, outlier_features)
-        self._apply_fitted_outlier_bounds(current, outlier_features)
-        self._apply_numeric_range_rules(current)
+        self._apply_feature_outlier_policy(current, outlier_features)
         self._apply_categorical_range_rules(current)
 
         cleaned = current.drop(columns=["_is_current"], errors="ignore")
@@ -475,15 +512,11 @@ class Preprocessor:
         else:
             drop_mask = pd.Series(False, index=cleaned.index)
 
-        if fit:
-            self._fit_column_drops(cleaned.loc[~drop_mask].copy())
-
         self._last_clean_missingness_ = cleaned[[COUNTRY_COL, YEAR_COL]].copy()
         self._last_clean_missingness_["row_missingness_fraction"] = row_missing_fraction.to_numpy()
         self._last_clean_missingness_["included"] = (~drop_mask).to_numpy()
 
         cleaned["_to_drop"] = drop_mask
-        cleaned = cleaned.drop(columns=sorted(self.columns_to_drop_), errors="ignore")
         return cleaned.sort_values(ID_COLS).reset_index(drop=True)
 
     def _fit_outlier_bounds(
@@ -509,24 +542,131 @@ class Preprocessor:
                 lower_store[col] = lower.dropna()
                 upper_store[col] = upper.dropna()
 
-    def _apply_fitted_outlier_bounds(
+    def _apply_feature_outlier_policy(
         self, df: pd.DataFrame, outlier_features: list[str]
     ) -> None:
-        for group_col, lower_store, upper_store in [
-            (COUNTRY_COL, self.outlier_lower_country_, self.outlier_upper_country_),
-            (YEAR_COL,    self.outlier_lower_year_,    self.outlier_upper_year_),
-        ]:
-            for col in outlier_features:
-                if col not in df.columns:
-                    continue
-                lower_bounds = lower_store.get(col)
-                upper_bounds = upper_store.get(col)
-                if lower_bounds is None or upper_bounds is None:
-                    continue
-                lower = df[group_col].map(lower_bounds)
-                upper = df[group_col].map(upper_bounds)
-                valid = df[col].notna() & lower.notna() & upper.notna()
-                df.loc[valid & ((df[col] < lower) | (df[col] > upper)), col] = np.nan
+        diag_rows: list[dict[str, Any]] = []
+        wipeout_rows: list[dict[str, Any]] = []
+
+        for col in outlier_features:
+            if col not in df.columns:
+                continue
+
+            original_notna = df[col].notna()
+            country_flag = self._outlier_mask(
+                df,
+                col,
+                group_col=COUNTRY_COL,
+                lower_store=self.outlier_lower_country_,
+                upper_store=self.outlier_upper_country_,
+            )
+            year_audit_flag = self._outlier_mask(
+                df,
+                col,
+                group_col=YEAR_COL,
+                lower_store=self.outlier_lower_year_,
+                upper_store=self.outlier_upper_year_,
+            )
+            range_flag = self._numeric_range_invalid_mask(df, col)
+
+            policy = self._outlier_policy_for_feature(col)
+            if policy == OUTLIER_POLICY_RANGE_ONLY:
+                iqr_delete = pd.Series(False, index=df.index)
+            elif policy == OUTLIER_POLICY_COUNTRY_AND_YEAR_IQR:
+                iqr_delete = country_flag & year_audit_flag
+            elif policy == OUTLIER_POLICY_COUNTRY_IQR:
+                iqr_delete = country_flag
+            else:
+                raise ValueError(f"Unsupported outlier policy for {col}: {policy}")
+
+            final_delete = (iqr_delete | range_flag) & original_notna
+            df.loc[final_delete, col] = np.nan
+
+            diag_rows.append({
+                "feature": col,
+                "policy": policy,
+                "valid_values": int(original_notna.sum()),
+                "country_iqr_flags": int((country_flag & original_notna).sum()),
+                "year_iqr_audit_flags": int((year_audit_flag & original_notna).sum()),
+                "range_invalid_flags": int((range_flag & original_notna).sum()),
+                "final_deleted_values": int(final_delete.sum()),
+            })
+
+            if original_notna.any():
+                country_summary = pd.DataFrame({
+                    COUNTRY_COL: df[COUNTRY_COL],
+                    "valid_values": original_notna.astype(int),
+                    "deleted_values": final_delete.astype(int),
+                }).groupby(COUNTRY_COL).sum()
+                country_summary = country_summary[country_summary["valid_values"] >= COUNTRY_OUTLIER_MIN_OBS]
+                if not country_summary.empty:
+                    country_summary["deleted_fraction"] = (
+                        country_summary["deleted_values"] / country_summary["valid_values"]
+                    )
+                    flagged = country_summary[
+                        country_summary["deleted_fraction"] >= OUTLIER_WIPEOUT_WARNING_THRESHOLD
+                    ]
+                    for country, row in flagged.iterrows():
+                        wipeout_rows.append({
+                            COUNTRY_COL: country,
+                            "feature": col,
+                            "policy": policy,
+                            "valid_values": int(row["valid_values"]),
+                            "deleted_values": int(row["deleted_values"]),
+                            "deleted_fraction": float(row["deleted_fraction"]),
+                        })
+
+        self.last_outlier_diagnostics_ = pd.DataFrame(diag_rows)
+        self.last_outlier_wipeout_diagnostics_ = pd.DataFrame(wipeout_rows)
+        if not self.last_outlier_diagnostics_.empty:
+            self.outlier_diagnostics_ = pd.concat(
+                [self.outlier_diagnostics_, self.last_outlier_diagnostics_],
+                ignore_index=True,
+            )
+        if not self.last_outlier_wipeout_diagnostics_.empty:
+            self.outlier_wipeout_diagnostics_ = pd.concat(
+                [self.outlier_wipeout_diagnostics_, self.last_outlier_wipeout_diagnostics_],
+                ignore_index=True,
+            )
+            logger.warning(
+                "Outlier cleaning deleted >=%.0f%% of valid history for %d country-feature pairs.",
+                OUTLIER_WIPEOUT_WARNING_THRESHOLD * 100,
+                len(self.last_outlier_wipeout_diagnostics_),
+            )
+
+    def _outlier_mask(
+        self,
+        df: pd.DataFrame,
+        col: str,
+        group_col: str,
+        lower_store: dict[str, pd.Series],
+        upper_store: dict[str, pd.Series],
+    ) -> pd.Series:
+        lower_bounds = lower_store.get(col)
+        upper_bounds = upper_store.get(col)
+        if lower_bounds is None or upper_bounds is None:
+            return pd.Series(False, index=df.index)
+        lower = df[group_col].map(lower_bounds)
+        upper = df[group_col].map(upper_bounds)
+        valid = df[col].notna() & lower.notna() & upper.notna()
+        return valid & ((df[col] < lower) | (df[col] > upper))
+
+    def _numeric_range_invalid_mask(self, working: pd.DataFrame, col: str) -> pd.Series:
+        rule = NUMERIC_RANGE_RULES.get(col)
+        if rule is None or col not in working.columns:
+            return pd.Series(False, index=working.index)
+        current_mask = working["_is_current"]
+        series = working[col]
+        invalid = current_mask & series.notna()
+        if rule.get("finite_only"):
+            invalid &= ~np.isfinite(series)
+        else:
+            invalid &= (series < rule.get("lower", -np.inf)) | (series > rule.get("upper", np.inf))
+        return invalid
+
+    @staticmethod
+    def _outlier_policy_for_feature(col: str) -> str:
+        return OUTLIER_POLICY_BY_FEATURE.get(col, OUTLIER_POLICY_COUNTRY_IQR)
 
     def _apply_numeric_range_rules(self, working: pd.DataFrame) -> None:
         current_mask = working["_is_current"]
@@ -548,21 +688,6 @@ class Preprocessor:
                 continue
             invalid = current_mask & working[col].notna() & ~working[col].isin(sorted(allowed))
             working.loc[invalid, col] = np.nan
-
-    def _fit_column_drops(self, train_frame: pd.DataFrame) -> None:
-        """Drop sparse and zero-variance columns."""
-        feature_cols = get_feature_columns(train_frame)
-        sparse = train_frame[feature_cols].isna().mean()
-        self.columns_to_drop_ = set(sparse[sparse >= SPARSE_COLUMN_THRESHOLD].index.tolist())
-        candidates = [
-            c for c in self.continuous_features_
-            if c not in self.columns_to_drop_ and c in train_frame.columns
-        ]
-        if not candidates:
-            return
-        matrix = train_frame[candidates]
-        zero_var = [c for c in matrix.columns if matrix[c].nunique(dropna=False) <= 1]
-        self.columns_to_drop_.update(zero_var)
 
     def _fill_temporal_gaps(
         self, df: pd.DataFrame, up_to_year: int | None = None,
@@ -594,7 +719,7 @@ class Preprocessor:
     # Phase 2: Impute
     # -----------------------------------------------------------------
     def _fit_imputers(self, cleaned_train: pd.DataFrame) -> None:
-        self.numeric_global_fallback_ = cleaned_train[self.retained_continuous_features_].median()
+        self.numeric_global_fallback_ = cleaned_train[self.retained_continuous_features_].median().fillna(0.0)
         retained_cats = [c for c in CATEGORICAL_FEATURES if c in self.retained_raw_features_]
         self._fit_simple_imputer(cleaned_train, retained_cats)
         if "mice" in self.active_branches_:
