@@ -260,11 +260,62 @@ def extract_xy(frame: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Serie
     return x, y, feature_columns
 
 
+_RAW_FEATURE_NAMES: list[str] = [
+    "renewable_energy_share_tfc_pct",
+    "renewable_electricity_share_pct",
+    "energy_intensity_mj_per_usd_ppp",
+    "inform_risk_index",
+    "ghg_growth",
+    "rsf_press_freedom_index",
+    "agricultural_land_of_land_area",
+    "annual_deforestation_of_change",
+    "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average",
+    "coal_rents_of_gdp",
+    "control_of_corruption_estimate",
+    "forest_area_of_land_area",
+    "gdp_per_capita_constant_2015_us",
+    "gdp_ppp_constant_2021_international",
+    "natural_gas_rents_of_gdp",
+    "oil_rents_of_gdp",
+    "political_stability_and_absence_of_violence_terrorism_estimate",
+    "population_density_people_per_sq_km_of_land_area",
+    "regulatory_quality_estimate",
+    "voice_and_accountability_estimate",
+    "non_co2_emissions_per_capita",
+    "total_ghg_emissions_per_capita",
+    "total_hard_to_abate_emissions_per_capita",
+    "v2x_regime_0",
+    "v2x_regime_1",
+    "v2x_regime_2",
+    "v2x_regime_3",
+]
+
+
+class _RawFeaturesPassthrough:
+    """Selector that returns only hardcoded raw source features (no RFE)."""
+
+    def __init__(self, all_cols: list[str], kept_cols: list[str]) -> None:
+        self.feature_names_in_ = np.array(all_cols)
+        self._kept: set[str] = set(kept_cols)
+
+    def get_support(self) -> np.ndarray:
+        return np.array([c in self._kept for c in self.feature_names_in_])
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        kept = [c for c in self.feature_names_in_ if c in self._kept]
+        return X[kept]
+
+
 def fit_feature_selector(
     x_train: pd.DataFrame,
     y_train: pd.Series,
     n_features: int,
 ) -> RFE:
+    if False:  # RAW FEATURES EXPERIMENT: bypasses RFE, returns only original source features; set to False to re-enable RFE
+        all_cols = x_train.columns.tolist()
+        kept = [c for c in all_cols if c in set(_RAW_FEATURE_NAMES)]
+        return _RawFeaturesPassthrough(all_cols, kept)  # type: ignore[return-value]
+
     estimator = ExtraTreesRegressor(
         n_estimators=50,
         max_features="sqrt",

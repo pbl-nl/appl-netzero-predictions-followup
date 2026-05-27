@@ -194,8 +194,9 @@ def figure_bootstrap_distribution(
     top_n: int = UNCERTAINTY_BOOTSTRAP_TOP_N,
 ) -> None:
     """
-    KDE plot of the 200 bootstrap prediction values for the top-N highest-
-    uncertainty countries per target scenario.
+    KDE plot of the 200 bootstrap prediction values for a representative subset of countries,
+    showing both data-rich emitters (Germany, China, India) and data-sparse countries (Djibouti,
+    Venezuela, Somalia).
     """
     if bootstrap_predictions.empty or "prediction" not in bootstrap_predictions.columns:
         return
@@ -215,13 +216,9 @@ def figure_bootstrap_distribution(
             else bootstrap_predictions
         )
 
-        # Find top-N countries by std of bootstrap predictions
-        country_std = (
-            subset.groupby("country")["prediction"]
-            .std()
-            .nlargest(top_n)
-        )
-        top_countries = country_std.index.tolist()
+        # Select representative countries: data-rich vs data-sparse
+        selected_countries = ["DEU", "CHN", "IND", "DJI", "VEN", "SOM"]
+        top_countries = [c for c in selected_countries if c in subset["country"].unique()]
         if not top_countries:
             continue
 
@@ -230,6 +227,15 @@ def figure_bootstrap_distribution(
         nrows = (n + ncols - 1) // ncols
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows))
         axes = np.array(axes).flatten()
+
+        name_map = {
+            "DEU": "Germany",
+            "CHN": "China",
+            "IND": "India",
+            "DJI": "Djibouti",
+            "VEN": "Venezuela",
+            "SOM": "Somalia",
+        }
 
         for ax, country in zip(axes, top_countries):
             vals = subset[subset["country"] == country]["prediction"].dropna()
@@ -242,16 +248,19 @@ def figure_bootstrap_distribution(
                 ax.plot(xs, kde(xs), color="black", linewidth=1.2)
             except Exception:
                 pass
-            ax.set_title(f"{country}\nσ = {vals.std():.3f}", fontsize=9)
+            
+            cname = name_map.get(country, country)
+            ax.set_title(f"{cname} ({country})\nσ = {vals.std():.3f}", fontsize=10)
             ax.set_xlabel("Bootstrap prediction")
-            ax.set_ylabel("")
+            ax.set_ylabel("Density")
 
         # Hide unused subplots
         for ax in axes[n:]:
             ax.set_visible(False)
 
         scenario_str = scenario_label(str(target)) if target else "All scenarios"
-        fig.suptitle(f"Bootstrap Distribution — Top-{n} Uncertain Countries\n{scenario_str}", fontsize=12)
+        fig.suptitle(f"Bootstrap Predictive Distributions — Selected Countries\n{scenario_str}", fontsize=12)
+        plt.tight_layout()
 
         fname = f"bootstrap_kde_{target}.png" if target else "bootstrap_kde.png"
         save_fig(out_dir / fname)

@@ -31,47 +31,60 @@ def table_model_performance(final_results: pd.DataFrame, out_dir: Path) -> pd.Da
             return pd.DataFrame()
 
         scol = strategy_col(final_results) or "outer_strategy_source"
+        
+        # Keep and group columns: Target (Scenario), Strategy, Branch, Model, Rank,
+        # strict MAE, strict R2, lenient MAE, lenient R2, Boot. P05, Boot. P95, Boot. Mean
         keep = [c for c in [
-            scol, "target", "branch", "model_name", "candidate_rank", "candidate_role",
-            "final_model_test_mae", "bootstrap_test_mae_p05", "bootstrap_test_mae_p95",
-            "bootstrap_test_mae_mean", "final_model_test_mae_lenient",
-            "final_model_test_rmse", "final_model_test_r2",
-            "final_test_rows", "final_test_rows_lenient",
+            "target", scol, "branch", "model_name", "candidate_rank", "candidate_role",
+            "final_model_test_mae", "final_model_test_r2",
+            "final_model_test_mae_lenient", "final_model_test_r2_lenient",
+            "bootstrap_test_mae_p05", "bootstrap_test_mae_p95",
+            "bootstrap_test_mae_mean",
         ] if c in final_results.columns]
 
         result = final_results[keep].copy()
+        
         # Primary candidates only for the main table
         if "candidate_role" in result.columns:
             result = result[result["candidate_role"] == "primary"]
 
-        result = result.sort_values(
-            [c for c in ["target", "final_model_test_mae"] if c in result.columns]
-        )
+        # Sort: Target (Scenario) -> Strategy -> Rank
+        sort_cols = [c for c in ["target", scol, "candidate_rank"] if c in result.columns]
+        result = result.sort_values(sort_cols)
+
+        # Capitalize model and target names for paper-quality presentation
+        if "model_name" in result.columns:
+            result["model_name"] = result["model_name"].str.upper()
+        if "target" in result.columns:
+            result["target"] = result["target"].str.lower()  # Keep lower to match LaTeX template
 
         col_rename = {
+            "target": "Scenario",
             scol: "Strategy",
-            "target": "Target",
             "branch": "Branch",
             "model_name": "Model",
             "candidate_rank": "Rank",
-            "candidate_role": "Role",
             "final_model_test_mae": "Test MAE (strict)",
-            "bootstrap_test_mae_p05": "Bootstrap p05",
-            "bootstrap_test_mae_p95": "Bootstrap p95",
-            "bootstrap_test_mae_mean": "Bootstrap mean",
-            "final_model_test_mae_lenient": "Test MAE (lenient)",
-            "final_model_test_rmse": "Test RMSE (strict)",
             "final_model_test_r2": "Test R² (strict)",
-            "final_test_rows": "N (strict)",
-            "final_test_rows_lenient": "N (lenient)",
+            "final_model_test_mae_lenient": "Test MAE (lenient)",
+            "final_model_test_r2_lenient": "Test R² (lenient)",
+            "bootstrap_test_mae_p05": "Boot. (strict) P05",
+            "bootstrap_test_mae_p95": "Boot. (strict) P95",
+            "bootstrap_test_mae_mean": "Boot. (strict) Mean",
         }
+
+        # Remove candidate_role prior to exporting
+        if "candidate_role" in result.columns:
+            result = result.drop(columns="candidate_role")
 
         return save_thesis_table(
             result, out_dir, "summary_model_performance",
             caption=(
                 "Primary winner performance on the 2022 final holdout. "
-                "Test MAE (strict) uses drop_rows=True; lenient uses drop_rows='targets_only'. "
-                "Bootstrap CI = p05–p95 over 200 country-block resampling iterations."
+                "Test MAE (strict) is computed on the 109 observations satisfying the <30% feature-missingness floor; "
+                "lenient columns use all 123 target-valid holdout observations. "
+                "Bootstrap columns report 5th and 95th percentiles and mean of per-country MAE across 200 resampling iterations "
+                "evaluated on the strict set of countries."
             ),
             col_rename=col_rename,
         )

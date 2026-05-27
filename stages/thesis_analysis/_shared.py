@@ -42,12 +42,12 @@ def parse_params_json(s: str) -> dict:
 
 def layers_label(value) -> str:
     """Convert hidden_layer_sizes to a human-readable string label, e.g. '64-32'."""
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return "-".join(str(v) for v in value)
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-            if isinstance(parsed, list):
+            if isinstance(parsed, (list, tuple)):
                 return "-".join(str(v) for v in parsed)
         except Exception:
             pass

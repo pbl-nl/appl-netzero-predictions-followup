@@ -303,7 +303,7 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
             # OLD: 7 choices incl. single-layer → 2-layer configs dominate 30/48; single-layer rarely selected
             "hidden_layer_sizes": hp.choice(
                 "hidden_layer_sizes",
-                [(32, 16), (64, 32), (128, 64), (256, 128)],
+                [(32,), (64,), (128,), (8, 16), (16, 8), (32, 16), (64, 32)],
             ),
             # activation fixed to tanh in build_model (tanh 32/48, relu 16/48; near-zero correlation — wasted dimension)
             # OLD: alpha [1e-6, 1e-1] → all gap > 8× cases had alpha < 1e-4; worst was alpha=5.7e-5
@@ -488,7 +488,7 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             batch_size=int(params["batch_size"]),
             early_stopping=True,
             n_iter_no_change=20,
-            max_iter=1000,
+            max_iter=2000,
             random_state=random_state,
         )
     if model_name == "extra_trees":
