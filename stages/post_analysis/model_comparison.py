@@ -287,6 +287,7 @@ def figure_outer_cv_boxplots(
         ax.set_title(f"Target: {scenario_label(target)}")
         ax.set_xlabel("Outer Test MAE")
         ax.set_ylabel("")
+        ax.set_xlim(0, 1)
 
     fig.suptitle("Outer CV MAE Distribution per Model", y=1.02, fontsize=13)
 

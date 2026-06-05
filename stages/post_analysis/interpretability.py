@@ -288,14 +288,11 @@ def figure_shap_beeswarm(
             plot_type="dot",
         )
         fig = plt.gcf()
-        fig.set_size_inches(
-            SHAP_BEESWARM_FIGURE_WIDTH,
-            max(5, len(top_idx) * 0.48 + 1.8),
-        )
-        fig.subplots_adjust(left=0.42, right=0.97, top=0.90, bottom=0.14)
+        fig.set_size_inches(14, 12)
+        fig.subplots_adjust(left=0.45, right=0.97, top=0.92, bottom=0.12)
         ax = plt.gca()
         ax.axvline(0, color="#999999", linewidth=0.8, zorder=0)
-        ax.set_title(title, fontsize=11)
+        ax.set_title(title, fontsize=12, pad=15)
         save_fig(out_path, tight=False)
     except Exception as exc:
         log.warning("SHAP beeswarm plot failed: %s", exc)
@@ -315,15 +312,18 @@ def figure_shap_bar(
         top_idx = np.argsort(mean_abs)[::-1][:max_display]
         wrapped_names = [wrap_label(feature_names[i], width=SHAP_FEATURE_LABEL_WRAP) for i in top_idx[::-1]]
 
-        fig, ax = plt.subplots(figsize=(9, max(4, max_display * 0.45)))
+        fig, ax = plt.subplots(figsize=(11, 11))
         ax.barh(
             wrapped_names,
             mean_abs[top_idx[::-1]],
             color="#4393c3", edgecolor="white",
+            height=0.55
         )
-        ax.set_xlabel("Mean |SHAP value|")
-        ax.set_title(title)
-        fig.subplots_adjust(left=0.40, right=0.96)
+        ax.set_xlabel("Mean |SHAP value|", fontsize=11, labelpad=10)
+        ax.set_title(title, fontsize=12, pad=15)
+        ax.tick_params(axis='y', which='major', pad=8)
+        ax.set_ylim(-0.6, len(wrapped_names) - 0.4)
+        fig.subplots_adjust(left=0.45, right=0.96, top=0.92, bottom=0.10)
         save_fig(out_path, tight=False)
     except Exception as exc:
         log.warning("SHAP bar plot failed: %s", exc)

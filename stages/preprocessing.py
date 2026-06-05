@@ -60,6 +60,9 @@ YEAR_OUTLIER_MIN_OBS = 20
 OUTLIER_WIPEOUT_WARNING_THRESHOLD = 0.80
 
 LAG_PERIODS = []#[1, 2, 3]
+# Max number of consecutive years a last-valid value may be carried forward (per country)
+# before the cross-sectional imputer takes over. Bounds reporting-lag fill (e.g. 2021→2022).
+FORWARD_FILL_LIMIT = 3
 ROLLING_WINDOWS = [7]#[3, 5, 7]
 ROLLING_STD_WINDOWS = [3,5]
 ROLLING_MIN_PERIODS = 1
@@ -83,10 +86,17 @@ RATE_FEATURES = {
 
 # Pct-change is applied to all engineerable features except RATE_FEATURES (already rates).
 
+# Lower bound for features that cannot logically be zero (denominators / fundamental
+# magnitudes). The strict `<` check in _numeric_range_invalid_mask then flags exact 0 or
+# fabricated near-zero values (e.g. an all-NaN IEA group that summed to 0.0) and converts
+# them to NaN at clean time. A single tiny epsilon is safe: the realistic minimum of every
+# feature it guards is orders of magnitude larger.
+POSITIVE_LOWER_EPSILON = 1e-6
+
 NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
     "renewable_energy_share_tfc_pct": {"lower": 0.0, "upper": 100.0},
     "renewable_electricity_share_pct": {"lower": 0.0, "upper": 100.0},
-    "energy_intensity_mj_per_usd_ppp": {"lower": 0.0, "upper": 100.0},
+    "energy_intensity_mj_per_usd_ppp": {"lower": POSITIVE_LOWER_EPSILON, "upper": 100.0},
     "inform_risk_index": {"lower": 0.0, "upper": 10.0},
     "ghg_growth": {"finite_only": True},
     "non_co2_emissions_per_capita": {"lower": 0.0, "upper": 500.0},
@@ -101,15 +111,17 @@ NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
     "coal_rents_of_gdp": {"lower": 0.0, "upper": 100.0},
     "control_of_corruption_estimate": {"lower": -4.0, "upper": 4.0},
     "forest_area_of_land_area": {"lower": 0.0, "upper": 100.0},
-    "gdp_per_capita_constant_2015_us": {"lower": 0.0, "upper": 500000.0},
-    "gdp_ppp_constant_2021_international": {"lower": 0.0, "upper": 2.0e14},
+    "gdp_per_capita_constant_2015_us": {"lower": POSITIVE_LOWER_EPSILON, "upper": 500000.0},
+    "gdp_ppp_constant_2021_international": {"lower": POSITIVE_LOWER_EPSILON, "upper": 2.0e14},
     "natural_gas_rents_of_gdp": {"lower": 0.0, "upper": 100.0},
     "oil_rents_of_gdp": {"lower": 0.0, "upper": 100.0},
     "political_stability_and_absence_of_violence_terrorism_estimate": {
         "lower": -4.0, "upper": 4.0,
     },
-    "population_density_people_per_sq_km_of_land_area": {"lower": 0.0, "upper": 100000.0},
-    "population_total": {"lower": 0.0, "upper": 1.0e10},
+    "population_density_people_per_sq_km_of_land_area": {
+        "lower": POSITIVE_LOWER_EPSILON, "upper": 100000.0,
+    },
+    "population_total": {"lower": POSITIVE_LOWER_EPSILON, "upper": 1.0e10},
     "regulatory_quality_estimate": {"lower": -4.0, "upper": 4.0},
     "voice_and_accountability_estimate": {"lower": -4.0, "upper": 4.0},
 }
@@ -399,6 +411,12 @@ class Preprocessor:
 
         self._fit_imputers(good_rows)
 
+        # Forward-fill reporting-lag gaps (per country, <= FORWARD_FILL_LIMIT yrs) before the
+        # cross-sectional imputer runs, then re-evaluate the missingness floor on the filled
+        # values. Imputers are already fit on the pre-ffill observed rows above.
+        cleaned = self._forward_fill_features(cleaned)
+        cleaned, _ = self._rescue_dropped_rows(cleaned, drop_rows=True)
+
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
             imputed = self._impute(cleaned, branch)
@@ -442,7 +460,9 @@ class Preprocessor:
         drop_rows: bool | str = True,
     ) -> dict[str, pd.DataFrame]:
         cleaned = self._clean(df, history_df=history_df, fit=False, drop_rows=drop_rows)
-        self.last_transform_missingness_ = self._last_clean_missingness_.copy()
+        # Capture this split's diagnostic now: the history _clean() call below clobbers
+        # self._last_clean_missingness_ with the training rows.
+        split_missingness = self._last_clean_missingness_.copy()
         cleaned = self._fill_temporal_gaps(cleaned)
         cleaned = self._attach_synthetic_features(cleaned)
 
@@ -454,6 +474,17 @@ class Preprocessor:
                 history_cleaned, up_to_year=current_max_year - 1
             )
             history_cleaned = self._attach_synthetic_features(history_cleaned)
+
+        # Carry the most recent valid value (incl. the last training year) forward into the
+        # current frame, then re-evaluate the missingness floor so rows rescued by the fill
+        # survive, and refresh the diagnostic to match the values actually used.
+        cleaned, history_cleaned = self._forward_fill_with_history(cleaned, history_cleaned)
+        cleaned, post_missing = self._rescue_dropped_rows(cleaned, drop_rows)
+        if post_missing is not None:
+            split_missingness = self._refresh_missingness_diagnostic(
+                split_missingness, cleaned, post_missing
+            )
+        self.last_transform_missingness_ = split_missingness
 
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
@@ -714,6 +745,120 @@ class Preprocessor:
         ghosts = pd.concat(ghost_pieces, ignore_index=True)
         result = pd.concat([df, ghosts], ignore_index=True)
         return result.sort_values(ID_COLS).reset_index(drop=True)
+
+    # -----------------------------------------------------------------
+    # Phase 1b: Forward-fill (reporting-lag handling, before imputation)
+    # -----------------------------------------------------------------
+    def _forward_fill_columns(self) -> list[str]:
+        """Raw continuous + categorical features eligible for forward-fill.
+
+        Excludes synthetic (deterministic) features, targets, non-features and IDs."""
+        cont = [c for c in self.retained_continuous_features_ if c not in self.synthetic_feature_names_]
+        cats = [c for c in CATEGORICAL_FEATURES if c in self.retained_raw_features_]
+        return cont + cats
+
+    def _forward_fill_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Carry each country's last valid value forward (<= FORWARD_FILL_LIMIT years).
+
+        Grouping by COUNTRY_COL guarantees values never cross country boundaries."""
+        cols = [c for c in self._forward_fill_columns() if c in df.columns]
+        if not cols:
+            return df
+        out = df.sort_values(ID_COLS).reset_index(drop=True)
+        out[cols] = out.groupby(COUNTRY_COL)[cols].ffill(limit=FORWARD_FILL_LIMIT)
+        return out
+
+    def _forward_fill_with_history(
+        self, current: pd.DataFrame, history: pd.DataFrame | None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        """Forward-fill across the history->current boundary (e.g. 2021 -> 2022 test).
+
+        Concatenates history + current per country so the most recent training-year value
+        can be carried into the current frame, then splits the frames back apart."""
+        cols = [c for c in self._forward_fill_columns() if c in current.columns]
+        if not cols:
+            return current, history
+        if history is None or history.empty:
+            return self._forward_fill_features(current), history
+        marker = "_ff_is_current"
+        cur = current.copy()
+        cur[marker] = True
+        hist = history.copy()
+        hist[marker] = False
+        combined = (
+            pd.concat([hist, cur], ignore_index=True)
+            .sort_values(ID_COLS)
+            .reset_index(drop=True)
+        )
+        combined[cols] = combined.groupby(COUNTRY_COL)[cols].ffill(limit=FORWARD_FILL_LIMIT)
+        new_current = combined[combined[marker]].drop(columns=[marker]).reset_index(drop=True)
+        new_history = combined[~combined[marker]].drop(columns=[marker]).reset_index(drop=True)
+        return new_current, new_history
+
+    def _rescue_dropped_rows(
+        self, cleaned: pd.DataFrame, drop_rows: bool | str,
+    ) -> tuple[pd.DataFrame, pd.Series | None]:
+        """Re-evaluate the row-missingness floor after forward-fill.
+
+        Forward-fill only removes NaNs, so post-ffill missingness is always <= pre-ffill:
+        no row that passed the floor can begin failing. We therefore only flip previously
+        dropped rows back in (rows ffill rescued). Ghost / target-less rows keep NaN targets
+        and are never rescued. Returns the updated frame plus the post-ffill missingness
+        fraction (per row) so callers can refresh their diagnostic frame; None when there
+        are no real feature columns to score."""
+        real_feats = [
+            c for c in get_feature_columns(cleaned)
+            if c not in self.synthetic_feature_names_ and c != "_to_drop"
+        ]
+        if not real_feats:
+            return cleaned, None
+        post_missing = cleaned[real_feats].isna().mean(axis=1)
+        cleaned = cleaned.copy()
+        if drop_rows is True:
+            all_targets_nan = cleaned[TARGET_COLS].isna().all(axis=1)
+            rescued = (
+                cleaned["_to_drop"]
+                & ~all_targets_nan
+                & (post_missing <= ROW_MISSINGNESS_THRESHOLD)
+            )
+            if rescued.any():
+                cleaned.loc[rescued, "_to_drop"] = False
+        return cleaned, post_missing
+
+    def _refresh_missingness_diagnostic(
+        self, diag: pd.DataFrame | None, cleaned: pd.DataFrame, post_missing: pd.Series,
+    ) -> pd.DataFrame | None:
+        """Return `diag` updated to post-ffill missingness / inclusion.
+
+        Pure function (does not mutate self): callers pass the diagnostic frame captured
+        for *this* split, because `_last_clean_missingness_` is clobbered by the separate
+        history `_clean` call inside transform(). Aligned by (country, year) so ghost rows
+        (absent from the diagnostic) are ignored."""
+        if diag is None or diag.empty:
+            return diag
+        upd = pd.DataFrame({
+            COUNTRY_COL: cleaned[COUNTRY_COL].to_numpy(),
+            YEAR_COL: cleaned[YEAR_COL].to_numpy(),
+            "_post_missing": post_missing.to_numpy(),
+            "_post_included": (~cleaned["_to_drop"]).to_numpy(),
+        })
+        merged = diag.merge(upd, on=[COUNTRY_COL, YEAR_COL], how="left")
+        # Where a post-ffill update exists, replace missingness/inclusion; else keep the
+        # pre-ffill value. Built via np.where to avoid partial-assignment dtype issues.
+        has = merged["_post_missing"].notna().to_numpy()
+        merged["row_missingness_fraction"] = np.where(
+            has,
+            merged["_post_missing"].to_numpy(dtype=float),
+            merged["row_missingness_fraction"].to_numpy(dtype=float),
+        )
+        merged["included"] = np.where(
+            has,
+            (merged["_post_included"] == True).to_numpy(),  # noqa: E712 (NaN -> False)
+            merged["included"].to_numpy(dtype=bool),
+        )
+        return merged[
+            [COUNTRY_COL, YEAR_COL, "row_missingness_fraction", "included"]
+        ].copy()
 
     # -----------------------------------------------------------------
     # Phase 2: Impute

@@ -167,7 +167,7 @@ END_YEAR = 2024
 PATH_MID_YEAR = 2030
 SCALE = 1e6
 
-NZ_XLSX = "Reduction rates NZ target revised_23Feb2026.xlsx"
+NZ_XLSX = "Reduction rates NZ target revised_18May2026.xlsx"
 
 SCENARIO_ALPHAS = {
     "linear": 1.0,
@@ -539,7 +539,11 @@ def process_iea() -> None:
         mask = (d["FLOW"] == flow) & (
             d["PRODUCT"].isin(products) if isinstance(products, set) else (d["PRODUCT"] == products)
         )
-        return d[mask].groupby(["COUNTRY", "year"], as_index=False, observed=True)["value"].sum()
+        # min_count=1 so all-NaN groups (e.g. a country with no reported records for a
+        # lagged year like 2022) return NaN instead of a fabricated 0.0.
+        return d[mask].groupby(["COUNTRY", "year"], as_index=False, observed=True)["value"].sum(
+            min_count=1
+        )
 
     elo_total = _grp("ELOUTPUT", "TOTAL").rename(columns={"value": "elo_total"})
     elo_ren = _grp("ELOUTPUT", RENEWABLE_PRODUCTS).rename(columns={"value": "elo_ren"})
@@ -991,9 +995,9 @@ def load_nz_data() -> pd.DataFrame:
     xlsx_path = NETZERO_DIR / NZ_XLSX
     nz = pd.read_excel(
         xlsx_path, sheet_name="NZ targets", skiprows=7,
-        usecols=["isocode", "ISO Code", "NZ GHG year.1"],
+        usecols=["isocode", "ISO Code", "NZ GHG year.3"],
     )
-    nz = nz.rename(columns={"ISO Code": "iso3", "NZ GHG year.1": "nz_ghg_year"})
+    nz = nz.rename(columns={"ISO Code": "iso3", "NZ GHG year.3": "nz_ghg_year"})
     nz["nz_ghg_year"] = pd.to_numeric(nz["nz_ghg_year"], errors="coerce")
 
     emi = pd.read_excel(

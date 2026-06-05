@@ -28,6 +28,7 @@ SUBDIR_BENCHMARK        = "benchmark"
 SUBDIR_INTERPRETABILITY = "interpretability"
 SUBDIR_UNCERTAINTY      = "uncertainty"
 SUBDIR_SUMMARY          = "summary"
+SUBDIR_BOXPLOTS         = "boxplots"
 
 # ---------------------------------------------------------------------------
 # Active subsets – None means "use everything found in the loaded results"

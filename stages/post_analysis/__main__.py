@@ -151,7 +151,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=[],
         choices=["model_comparison", "training_comparison", "sensitivity", "net_zero", "benchmark",
-                 "interpretability", "uncertainty", "report"],
+                 "interpretability", "uncertainty", "report", "boxplots"],
         help="Skip specific analysis steps.",
     )
     return parser.parse_args(argv)
@@ -295,6 +295,7 @@ def run(argv: list[str] | None = None) -> None:
         cfg.SUBDIR_INTERPRETABILITY,
         cfg.SUBDIR_UNCERTAINTY,
         cfg.SUBDIR_SUMMARY,
+        cfg.SUBDIR_BOXPLOTS,
     ])
 
     setup_logging(out_dir / cfg.SUBDIR_SUMMARY / "post_analysis.log")
@@ -587,6 +588,25 @@ def run(argv: list[str] | None = None) -> None:
             run_report(all_tables, subdirs[cfg.SUBDIR_SUMMARY])
         except Exception as exc:
             log.warning("Report generation failed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Boxplots
+    # ------------------------------------------------------------------
+    if "boxplots" not in skip:
+        log.info("=== Boxplots Generation ===")
+        try:
+            from stages.post_analysis.boxplots import run_boxplots
+            bootstrap_implied = all_tables.get("tnz_bootstrap_implied_years")
+            if bootstrap_implied is not None and not bootstrap_implied.empty:
+                run_boxplots(
+                    winners,
+                    bootstrap_implied,
+                    subdirs[cfg.SUBDIR_BOXPLOTS]
+                )
+            else:
+                log.warning("Boxplots skipped: tnz_bootstrap_implied_years not available (run net_zero first).")
+        except Exception as exc:
+            log.warning("Boxplots generation failed: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Summary
