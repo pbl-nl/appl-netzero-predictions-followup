@@ -23,7 +23,7 @@ from sklearn.metrics import (
 )
 from sklearn.dummy import DummyRegressor
 from sklearn.neural_network import MLPRegressor
-from sklearn.svm import SVR
+from sklearn.svm import NuSVR
 from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
@@ -172,13 +172,14 @@ def fit_model(model: Any, x_train: pd.DataFrame, y_train: pd.Series) -> Any:
     return model
 
 
-def get_fit_diagnostics(model: Any) -> dict[str, Any]:
-    """Return convergence diagnostics for models that expose fit state (SVR/SVC)."""
-    if not isinstance(model, SVR):
+def get_fit_diagnostics(model: Any, n_train: int | None = None) -> dict[str, Any]:
+    """Return convergence diagnostics for models that expose fit state (NuSVR)."""
+    if not isinstance(model, NuSVR):
         return {
             "svr_converged": None,
             "svr_n_iter": None,
             "svr_support_vectors": None,
+            "svr_sv_ratio": None,
         }
     converged = not hasattr(model, "fit_status_") or model.fit_status_ == 0
     n_iter = getattr(model, "n_iter_", None)
@@ -187,10 +188,12 @@ def get_fit_diagnostics(model: Any) -> dict[str, Any]:
         if hasattr(model, "support_vectors_")
         else None
     )
+    sv_ratio = (n_sv / n_train) if (n_sv is not None and n_train) else None
     return {
         "svr_converged": converged,
         "svr_n_iter": n_iter,
         "svr_support_vectors": n_sv,
+        "svr_sv_ratio": round(sv_ratio, 4) if sv_ratio is not None else None,
     }
 
 
@@ -264,23 +267,14 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
         }
     if model_name == "svr":
         return {
-            # OLD: [linear, rbf, poly, sigmoid] → poly mean 16.43×/max 292×; sigmoid max 3.88× at high C
-            # "kernel": hp.choice("kernel", ["linear", "rbf"]),
-            # "kernel": hp.choice("kernel", ["rbf"]),
+            # NuSVR: nu replaces epsilon as the primary regularisation handle.
+            # nu ∈ (0, 1] is an lower bound on the support-vector fraction of training
+            # rows. nu=0.5 → at least 50% of
+            # training rows become support vectors; Hyperopt searches the full range.
             "kernel": hp.choice("kernel", ["rbf"]),
-            # OLD: C [1e-3, 1e3] → sigmoid 3.88× case had C=16.78; high-C SVR memorises small data
-            # "C": hp.loguniform("C", np.log(1e-2), np.log(10.0)),
-            # "C": hp.loguniform("C", np.log(1e-2), np.log(30.0)),
-            "C": hp.loguniform("C", np.log(1e-2), np.log(50.0)),
-            # OLD: epsilon [1e-4, 1.0] → low epsilon is primary overfit signal (rho_inner=-0.843); sub-0.005 is degenerate attractor
-            # OLD: epsilon [0.01, 1.0] → Run4 raised floor to 0.01 which, combined with full convergence (10M max_iter), worsened final test (2022) from 0.167→0.295 while outer test improved; wider-margin solutions overfit to 2018-2021 patterns
-            # "epsilon": hp.loguniform("epsilon", np.log(0.02), np.log(1.0)),
-            # "epsilon": hp.loguniform("epsilon", np.log(0.01), np.log(1.0)),
-            "epsilon": hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
-            # OLD: gamma [1e-6, 10] → RBF 7.14× case had gamma=5.0; best configs had gamma < 0.1
-            # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.5)),
-            # "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.1)),
-            "gamma": hp.loguniform("gamma", np.log(1e-4), np.log(0.25)),
+            "C":      hp.loguniform("C", np.log(1e-2), np.log(50.0)),
+            "nu":     hp.uniform("nu", 0.05, 0.90),
+            "gamma":  hp.loguniform("gamma", np.log(1e-4), np.log(0.25)),
         }
     if model_name == "random_forest":
         return {
@@ -462,10 +456,10 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             gamma=float(params["gamma"]),
         )
     if model_name == "svr":
-        return SVR(
+        return NuSVR(
             kernel=str(params["kernel"]),
             C=float(params["C"]),
-            epsilon=float(params["epsilon"]),
+            nu=float(params["nu"]),
             gamma=float(params["gamma"]),
             max_iter=SVR_MAX_ITER,
         )

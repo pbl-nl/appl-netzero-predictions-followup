@@ -187,7 +187,7 @@ def _prepare_X_for_artifact(
 
     try:
         # Preprocessor.transform returns dict[branch -> DataFrame]
-        branch_outputs = preprocessor.transform(target_df, history_df=history_df, drop_rows=False)
+        branch_outputs = preprocessor.transform(target_df, history_df=history_df, drop_rows=True)
     except Exception as exc:
         log.warning("Preprocessor.transform failed: %s", exc)
         return None

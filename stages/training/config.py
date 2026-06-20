@@ -30,14 +30,14 @@ TUNING_BUDGET_SECONDS = 240.0
 MIN_TUNING_TRIALS = 3
 SVR_MAX_ITER = 10_000_000
 
-ACTIVE_MODELS = ["catboost", "svr", "mlp", "hist_gradient_boosting"]
-# ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
-ACTIVE_TARGETS = ["linear"]
-# ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
-ACTIVE_BRANCHES = ["simple"]
-# ACTIVE_BRANCHES = ["simple","mice"]
-ACTIVE_OUTER_STRATEGIES = ["temporal_cv"]
-# ACTIVE_OUTER_STRATEGIES = ["temporal_cv","random_cv"]
+# ACTIVE_MODELS = ["catboost", "svr", "mlp", "hist_gradient_boosting"]
+ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "elasticnet", "xgboost", "svr", "mlp", "extra_trees", "hist_gradient_boosting", "kernel_ridge", "dummy_mean"] #
+# ACTIVE_TARGETS = ["linear"]
+ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
+# ACTIVE_BRANCHES = ["simple"]
+ACTIVE_BRANCHES = ["simple","mice"]
+# ACTIVE_OUTER_STRATEGIES = ["temporal_cv"]
+ACTIVE_OUTER_STRATEGIES = ["temporal_cv","random_cv"]
 
 # Nested temporal CV: outer test years for model selection (2022 is final holdout)
 OUTER_TEST_YEARS = [2018, 2019, 2020, 2021]
@@ -191,10 +191,12 @@ FINAL_RESULTS_COLUMNS = [
     "bootstrap_test_mae_p05",
     "bootstrap_test_mae_p50",
     "bootstrap_test_mae_p95",
-    # SVR convergence diagnostics for the saved single-model artifact
+    # NuSVR convergence and support-vector diagnostics for the saved single-model artifact
     "final_model_svr_converged",
     "final_model_svr_n_iter",
     "final_model_svr_support_vectors",
+    # SV fraction = svr_support_vectors / final_train_rows (advisory; not gating)
+    "final_model_svr_sv_ratio",
     # Fraction of the 200 bootstrap iterations where the model converged
     "bootstrap_svr_converged_share",
     "artifact_path",
@@ -238,3 +240,40 @@ FINAL_PREDICTION_SUMMARY_COLUMNS = [
     "prediction_p05",
     "prediction_p95",
 ]
+
+
+# =============================================================================
+# Root config override
+# =============================================================================
+
+def _apply_root_config_overrides() -> None:
+    """Load project-root config.py and override module constants when not None."""
+    import importlib.util
+    from pathlib import Path as _Path
+    root_path = _Path(__file__).resolve().parent.parent.parent / "config.py"
+    if not root_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location("_root_cfg", root_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    g = globals()
+    for name in (
+        "ACTIVE_MODELS",
+        "ACTIVE_TARGETS",
+        "ACTIVE_BRANCHES",
+        "ACTIVE_OUTER_STRATEGIES",
+        "N_FEATURES_TO_SELECT",
+        "TUNING_BUDGET_SECONDS",
+        "FINAL_BOOTSTRAP_ITERATIONS",
+        "CANDIDATE_PRIMARY_COUNT",
+        "GAP_PENALTY_WEIGHT",
+        "OUTER_GAP_ABS_THRESHOLD",
+        "OUTER_GAP_REL_THRESHOLD",
+        "SVR_MAX_ITER",
+    ):
+        val = getattr(m, name, None)
+        if val is not None:
+            g[name] = val
+
+
+_apply_root_config_overrides()

@@ -147,11 +147,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Custom tag for the output directory name (replaces timestamp).",
     )
     parser.add_argument(
+        "--preprocessed-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to data/preprocessed/<hash>/ directory used in training. "
+             "Auto-discovered if omitted (picks most recently modified valid directory).",
+    )
+    parser.add_argument(
         "--skip",
         nargs="+",
         default=[],
         choices=["model_comparison", "training_comparison", "sensitivity", "net_zero", "benchmark",
-                 "interpretability", "uncertainty", "report", "boxplots"],
+                 "interpretability", "uncertainty", "report", "boxplots", "pca_components"],
         help="Skip specific analysis steps.",
     )
     return parser.parse_args(argv)
@@ -296,6 +304,7 @@ def run(argv: list[str] | None = None) -> None:
         cfg.SUBDIR_UNCERTAINTY,
         cfg.SUBDIR_SUMMARY,
         cfg.SUBDIR_BOXPLOTS,
+        cfg.SUBDIR_PCA_COMPONENTS,
     ])
 
     setup_logging(out_dir / cfg.SUBDIR_SUMMARY / "post_analysis.log")
@@ -607,6 +616,22 @@ def run(argv: list[str] | None = None) -> None:
                 log.warning("Boxplots skipped: tnz_bootstrap_implied_years not available (run net_zero first).")
         except Exception as exc:
             log.warning("Boxplots generation failed: %s", exc, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # PCA component analysis (sequential, conditional on PCA features used)
+    # ------------------------------------------------------------------
+    if "pca_components" not in skip:
+        log.info("=== PCA Component Analysis ===")
+        try:
+            from stages.post_analysis.pca_components import run_pca_components
+            run_pca_components(
+                final_results=final_results,
+                merged_df=merged_df,
+                out_dir=subdirs[cfg.SUBDIR_PCA_COMPONENTS],
+                preprocessed_dir=args.preprocessed_dir,
+            )
+        except Exception as exc:
+            log.warning("PCA component analysis failed: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Summary

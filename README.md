@@ -1,29 +1,30 @@
 # Net-Zero Predictions Follow-Up
 
-This repository contains three related workflows:
-
-- a data pipeline that builds `data/merged/merged.csv`
-- two reproduction scripts for the original study logic: `reproduce_old.py` and `reproduce_new.py`
-- the current training pipeline under `stages.training`
-
-All commands below assume you are running from the repository root.
+Machine learning pipeline that predicts national greenhouse gas emissions reduction rates toward net-zero. It combines six public data sources (INFORM, PRIMAP-hist, V-Dem, FAO/Data360, IEA, RSF/World Bank), trains an ensemble of regression models under nested cross-validation with Bayesian hyperparameter tuning, and produces implied net-zero arrival years per country with bootstrap uncertainty estimates — benchmarked against each country's announced net-zero target.
 
 ## Python Version
 
-Use Python 3.12 if possible. Python 3.10-3.12 is the intended range for this repo. Python 3.13+ is not recommended here because some dependencies may fail to install or build cleanly.
+Use Python 3.12 if possible. Python 3.10–3.12 is the intended range. Python 3.13+ is not recommended; some dependencies may fail to install or build cleanly.
 
 ## Setup
 
-Before pulling the large data files, make sure Git LFS is installed on your machine: [git-lfs.com](https://git-lfs.com/).
-
-After cloning the repository, initialize Git LFS and fetch the tracked files:
+Git LFS is required before cloning. Install it from [git-lfs.com](https://git-lfs.com/), then:
 
 ```bash
 git lfs install
 git lfs pull
 ```
 
-If Git LFS was already installed before cloning, the large files may already be present. If you see tiny text pointer files instead of real CSV data, run `git lfs pull` again.
+If you see small text pointer files instead of real CSV data, run `git lfs pull` again.
+
+### macOS / Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 ### Windows
 
@@ -34,181 +35,180 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-If PowerShell blocks activation, run:
+If PowerShell blocks activation:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-### macOS/Linux
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
 ## Data Requirements
-
-The project expects some input files to already exist locally.
 
 ### Git LFS-tracked files
 
-- `data/raw/8624f431-en_2023.csv`
-- CSV files under `data/old_data/`
+- `data/raw/8624f431-en_2023.csv` — IEA energy intensity data
 
-These files are stored with Git LFS. A normal clone is only enough if Git LFS is installed and the LFS objects were fetched correctly.
+These are fetched by `git lfs pull`. Run `python main.py --download` to refresh from source.
 
-### Required workbook files
+### Required workbook
 
-- `data/netzero/Reduction rates NZ target revised_23Feb2026.xlsx`
-  Required by `main.py` and `reproduce_new.py`.
-- `data/netzero/Reduction rates NZ targets_26March2024.xlsx`
-  Required by `reproduce_old.py`.
+- `data/netzero/Reduction rates NZ target revised_18May2026.xlsx`
 
-### Files created automatically
+This file must be present. It contains the national net-zero targets and the emissions NDC tool used to compute the three reduction-rate scenarios.
 
-- `python main.py` processes existing local inputs in `data/raw/`
-- `python main.py` writes processed files into `data/processed/`
-- `python main.py` writes the merged panel to `data/merged/merged.csv`
-- `python -m stages.data` downloads public-source raw data into `data/raw/`
-- `stages/data.py` can create `data/netzero/population_estimate.csv` automatically if it is missing when downloads are enabled
+### Auto-created files
 
-### Legacy file note
+- `data/netzero/population_estimate.csv` — created automatically on first `--download` run; must exist for offline runs
+- `data/processed/*.csv` — written by the data stage
+- `data/merged/merged.csv` — the final merged panel; required by training
 
-`data/netzero/results_18December2025.csv` exists in the repository, but it is not used by the current `main.py`, `reproduce_new.py`, or `python -m stages.training` flow.
+## Pipeline Overview
 
-## Run The Project
+The pipeline runs four stages in order. `python main.py` runs all of them.
 
-### 1. Old Study
+| Stage | Entry point | What it does |
+|---|---|---|
+| Data | `python main.py` | Processes six source CSVs and builds `data/merged/merged.csv` |
+| Training | `python -m stages.training` | Nested CV, Bayesian hyperparameter tuning, bootstrap refit |
+| Post-analysis | `python -m stages.post_analysis` | Thesis-ready plots, tables, and net-zero year predictions |
+| Thesis analysis | `python -m stages.thesis_analysis` | Eight diagnostic sections (A–H) for chapter-level analysis |
 
-This runs the legacy reproduction logic against the original study inputs configured in `modules/config.json`.
+### Emission-reduction scenarios
 
-Prerequisites:
+Training produces predictions under three scenario alphas, each representing a different shape of the required reduction pathway to reach the announced net-zero year:
 
-- `data/old_data/` must be present and populated
-- `data/netzero/Reduction rates NZ targets_26March2024.xlsx` must be present
+| Scenario | Alpha | Shape |
+|---|---|---|
+| linear | 1.0 | Straight-line reduction |
+| optimistic | 2.0 | Accelerating early reductions |
+| pessimistic | 0.5 | Slower initial reductions |
 
-Run:
+## Running the Pipeline
 
-```bash
-python reproduce_old.py
-```
-
-Outputs:
-
-- `data/old_reproduce/`
-
-### 2. Old Study With New Data
-
-This keeps the old-study logic but swaps in the new merged indicator panel.
-
-Prerequisites:
-
-- run `python main.py` first
-- keep `data/old_data/` present, because `reproduce_new.py` still uses supplemental legacy files for EU aggregation, population forecasts, and reference cluster inputs
-- keep `data/netzero/Reduction rates NZ target revised_23Feb2026.xlsx` present
-
-Run:
+### All-in-one
 
 ```bash
 python main.py
-python reproduce_new.py
 ```
 
-Outputs:
+Runs all four stages. The data stage is incremental: it only re-processes sources whose config-tracked keys changed or whose processed CSV is missing. Download is always opt-in.
 
-- `data/merged/merged.csv`
-- `data/new_reproduce/`
+### `main.py` flags
 
-### 3. New Study / Current Training Pipeline
-
-This is the current training workflow.
-
-Important:
-
-- `python main.py` is required first
-- `python main.py` does not run model training; it only runs the download, process, and merge steps
-
-Run:
-
-```bash
-python main.py
-python -m stages.training
+```
+--download             Download fresh raw data from all six sources before processing
+--data-only            Stop after the data stage; skip training and analysis
+--skip-training        Skip training; use an existing results/ directory for analysis
+--skip-post-analysis   Skip the post-analysis stage
+--skip-thesis-analysis Skip the thesis-analysis stage
 ```
 
-Outputs:
-
-- `results/training_<timestamp>/final_results.csv`
-- `results/training_<timestamp>/final_prediction_summary.csv`
-- `results/training_<timestamp>/trials.csv`
-- `results/training_<timestamp>/outer_results.csv`
-- `results/training_<timestamp>/winners.csv`
-- `results/training_<timestamp>/overfitting_audit.csv`
-- `results/training_<timestamp>/final_bootstrap_predictions.csv`
-
-Where `<timestamp>` is auto-generated in `YYYYMMDD_HHMMSS` format.
-
-### 4. Post-Analysis
-
-Converts training outputs into thesis-ready artifacts. Requires a completed training run.
-
-Run (auto-discovers latest training results):
+### Running stages individually
 
 ```bash
-python -m stages.post_analysis
+python -m stages.data           # download fresh raw data only
+python -m stages.training       # training only
+python -m stages.post_analysis  # post-analysis only (auto-discovers latest results/)
+python -m stages.thesis_analysis
 ```
 
-Common options:
+### Post-analysis options
 
 ```bash
-# Use a specific training results directory
+# Target a specific training run
 python -m stages.post_analysis --results-dir results/training_<timestamp>
 
-# Skip SHAP computation (much faster for quick iteration)
+# Skip SHAP (much faster for iteration)
 python -m stages.post_analysis --no-shap
 
-# Filter to a subset of models / targets / strategies / branches
-python -m stages.post_analysis --models extra_trees bayesian_ridge --targets linear
+# Filter to a subset of models or targets
+python -m stages.post_analysis --models extra_trees hist_gradient_boosting --targets linear
+
+# Skip specific steps
+python -m stages.post_analysis --skip interpretability benchmark
 
 # Compare two training runs side by side
 python -m stages.post_analysis \
     --results-dir results/training_<tag1> \
     --compare results/training_<tag2>
-
-# Skip specific analysis steps
-python -m stages.post_analysis --skip interpretability benchmark
 ```
 
-Outputs to `results/post_analysis_<timestamp>/`:
+## Outputs
 
-| Subdirectory          | Contents                                                           |
-| --------------------- | ------------------------------------------------------------------ |
-| `model_comparison/` | Performance tables, heatmaps, model rankings, gap scatter          |
-| `sensitivity/`      | Branch, strategy, and scenario sensitivity tables and plots        |
-| `net_zero_years/`   | Implied net-zero year predictions (inverse budget mapping)         |
-| `benchmark/`        | Gap vs. announced targets, acceptability bands, choropleth maps    |
-| `interpretability/` | SHAP beeswarm/bar plots, built-in feature importance               |
-| `uncertainty/`      | Bootstrap CI width analysis, country ranking, world maps           |
-| `summary/`          | `post_analysis_results.xlsx` (multi-sheet), `key_findings.csv` |
+### Training (`results/training_<YYYYMMDD_HHMMSS>/`)
 
-## What `main.py` Does
+| File | Contents |
+|---|---|
+| `final_results.csv` | Train/test MAE, MSE, RMSE, R², explained variance per winner |
+| `final_prediction_summary.csv` | Mean, std, p5, p95 predictions per country |
+| `final_bootstrap_predictions.csv` | 200 bootstrap prediction arrays per country |
+| `outer_results.csv` | Outer CV performance per fold × strategy × branch × target × model |
+| `winners.csv` | Selected best model per (strategy, target) with overfitting flags |
+| `overfitting_audit.csv` | Inner/outer gap flags and candidate aggregates |
+| `trials.csv` | All Hyperopt tuning trials |
 
-`python main.py` runs these steps:
+### Post-analysis (`results/post_analysis_<YYYYMMDD_HHMMSS>/`)
 
-1. use existing local files in `data/raw/`
-2. process raw files into `data/processed/`
-3. merge processed data and target inputs into `data/merged/merged.csv`
+| Subdirectory | Contents |
+|---|---|
+| `model_comparison/` | Performance tables, heatmaps, rankings, train/test gap scatter |
+| `sensitivity/` | Branch, strategy, and scenario sensitivity tables and plots |
+| `net_zero_years/` | Implied net-zero year predictions (inverse budget mapping) |
+| `benchmark/` | Gap vs. announced targets, acceptability bands, choropleth maps |
+| `interpretability/` | SHAP beeswarm/bar plots, built-in feature importance |
+| `uncertainty/` | Bootstrap CI width analysis, country ranking, world maps |
+| `summary/` | `post_analysis_results.xlsx` (multi-sheet), `key_findings.csv` |
 
-It does not run `reproduce_old.py`, `reproduce_new.py`, or `python -m stages.training`.
-`python -m stages.data` remains the download-first entrypoint unless `run(skip_download=True)` is called explicitly.
+## Configuration (`config.py`)
+
+`config.py` at the repo root overrides module-level defaults across all four stages. Every setting defaults to `None`, meaning the module's own default applies. Set a value to override it everywhere.
+
+### Data
+
+| Setting | Default | Notes |
+|---|---|---|
+| `PRIMAP_SCENARIO` | `"HISTCR"` | `"HISTTP"` for third-party estimates; triggers reprocessing of `data/processed/primap.csv` |
+
+### Preprocessing
+
+| Setting | Default | Notes |
+|---|---|---|
+| `ROW_MISSINGNESS_THRESHOLD` | `0.30` | Drop rows with more than this fraction of features missing |
+| `IQR_MULTIPLIER` | `1.5` | Outlier fence width; higher = fewer outliers flagged |
+| `ALL_PAIRWISE_INTERACTIONS` | `True` | Generate all C(n,2) interaction terms; set `False` and use `INTERACTION_PAIRS` for explicit pairs |
+| `LAG_PERIODS` | `[]` | Year lags to add as features, e.g. `[1, 2, 3]` |
+| `ROLLING_WINDOWS` | `[7]` | Rolling-mean window sizes in years |
+| `ROLLING_STD_WINDOWS` | `[3, 5]` | Rolling-std window sizes in years |
+| `INCLUDE_SYNTHETIC_FEATURES` | `True` | Add country PCA components and normalized year features to model input |
+| `SCALER_CHOICE` | `"standard"` | `"standard"`, `"minmax"`, or `"robust"` |
+
+### Training
+
+| Setting | Default | Notes |
+|---|---|---|
+| `ACTIVE_MODELS` | all 13 | Subset to speed up nested CV, e.g. `["ridge", "xgboost", "lightgbm"]` |
+| `ACTIVE_TARGETS` | all 3 | e.g. `["linear"]` for fast dev runs |
+| `ACTIVE_BRANCHES` | both | `["simple"]` or `["mice"]` imputation |
+| `ACTIVE_OUTER_STRATEGIES` | both | `["temporal_cv"]` or `["random_cv"]` |
+| `N_FEATURES_TO_SELECT` | `24` | RFE feature count (ExtraTreesRegressor selector) |
+| `TUNING_BUDGET_SECONDS` | `240.0` | Wall-clock per Hyperopt search per (fold, model, target) |
+| `FINAL_BOOTSTRAP_ITERATIONS` | `200` | Bootstrap resamples for uncertainty quantification |
+| `CANDIDATE_PRIMARY_COUNT` | `3` | Winners per (strategy, target) before backup candidates |
+| `GAP_PENALTY_WEIGHT` | `0.5` | Penalizes inner train/val gap in Hyperopt objective |
+| `OUTER_GAP_ABS_THRESHOLD` | `0.1` | Absolute MAE gap threshold for overfitting flag |
+| `OUTER_GAP_REL_THRESHOLD` | `0.5` | Relative MAE gap threshold (fraction of inner val MAE) |
+
+### Post-analysis
+
+| Setting | Default | Notes |
+|---|---|---|
+| `SHAP_MAX_DISPLAY` | `15` | Features shown in SHAP beeswarm/bar plots |
+| `SHAP_BACKGROUND_SAMPLES` | `50` | Background samples for KernelExplainer / LinearExplainer |
+| `BENCHMARK_TOLERANCE_YEARS` | `5.0` | ±N year acceptability band for country benchmarking |
 
 ## Troubleshooting
 
-- If a required CSV is missing or looks like a Git LFS pointer file, run `git lfs pull`.
-- `python main.py` now expects local raw files and `data/netzero/population_estimate.csv` to already exist.
-- `python -m stages.data` still needs internet access for automatic downloads and for population data fallback if `data/netzero/population_estimate.csv` is missing.
-- If `python -m stages.training` fails immediately, make sure `data/merged/merged.csv` exists and rerun `python main.py`.
-- If `reproduce_new.py` fails after `python main.py`, verify that `data/old_data/` is still populated. `reproduce_new.py` is not fully self-contained from `merged.csv`.
-- If dependency installation fails, recreate the environment with Python 3.12.
+- **LFS pointer files instead of data** — run `git lfs pull`.
+- **`data/merged/merged.csv` missing** — run `python main.py` (add `--download` to pull fresh source data first).
+- **Data config changed but processed files look stale** — delete `data/processed/.data_config_fingerprint.json` and re-run `python main.py`; changed sources will be re-processed automatically.
+- **Training fails immediately** — confirm `data/merged/merged.csv` exists, then re-run `python main.py`.
+- **Dependency install fails** — recreate the virtual environment with Python 3.12.

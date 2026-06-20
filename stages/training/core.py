@@ -89,7 +89,7 @@ _ERROR_ROW_NAN_FIELDS = frozenset(
         "inner_positive_gap_fold_share",
         "folds_used", "trial_count", "tuning_elapsed_seconds",
         "outer_train_rows", "outer_test_rows", "outer_test_rows_lenient", "feature_count",
-        "svr_n_iter", "svr_support_vectors",
+        "svr_n_iter", "svr_support_vectors", "svr_sv_ratio",
     }
     | {f"inner_train_mean_{m}" for m in CORE_METRICS}
     | {f"inner_val_mean_{m}" for m in CORE_METRICS}
@@ -436,7 +436,7 @@ def _build_final_result_row(
     artifact_model: Any,
     bootstrap_svr_converged_share: float,
 ) -> dict[str, Any]:
-    artifact_diag = get_fit_diagnostics(artifact_model)
+    artifact_diag = get_fit_diagnostics(artifact_model, n_train=len(x_train))
     row: dict[str, Any] = {
         "target": target,
         "outer_strategy_source": outer_strategy,
@@ -453,6 +453,7 @@ def _build_final_result_row(
         "final_model_svr_converged": artifact_diag["svr_converged"],
         "final_model_svr_n_iter": artifact_diag["svr_n_iter"],
         "final_model_svr_support_vectors": artifact_diag["svr_support_vectors"],
+        "final_model_svr_sv_ratio": artifact_diag["svr_sv_ratio"],
         "bootstrap_svr_converged_share": bootstrap_svr_converged_share,
         "artifact_path": str(artifact_path),
     }
@@ -870,7 +871,7 @@ def _evaluate_single_model(
         model_name, best_params, x_train, y_train, x_test, y_test,
     )
     test_metrics_lenient, _ = predict_evaluate(fitted_model, x_test_lenient, y_test_lenient)
-    outer_diag = get_fit_diagnostics(fitted_model)
+    outer_diag = get_fit_diagnostics(fitted_model, n_train=len(x_train))
     if outer_diag["svr_converged"] is False:
         logger.warning(
             "SVR did not converge in outer refit for %s (n_iter_=%s).",
@@ -921,6 +922,7 @@ def _evaluate_single_model(
         "svr_converged": outer_diag["svr_converged"],
         "svr_n_iter": outer_diag["svr_n_iter"],
         "svr_support_vectors": outer_diag["svr_support_vectors"],
+        "svr_sv_ratio": outer_diag["svr_sv_ratio"],
         "artifact": artifact,
     }
     for key, value in tuning_result.items():

@@ -69,6 +69,9 @@ ROLLING_MIN_PERIODS = 1
 STRUCTURAL_NA_FILL_VALUE = 0.0
 ALL_PAIRWISE_INTERACTIONS = True  # generates all C(n,2) pairs from engineerable features
 INTERACTION_PAIRS: list[tuple[str, str]] = []  # used only when ALL_PAIRWISE_INTERACTIONS=False
+# When False, country_pc1–5, year_std, year_std_sq are NOT added as model input columns.
+# PCA is still computed internally for MICE auxiliary features.
+INCLUDE_SYNTHETIC_FEATURES = True
 ENABLE_DIFF_FEATURES = False #True
 ENABLE_PCT_CHANGE_FEATURES = False #True
 
@@ -92,6 +95,35 @@ RATE_FEATURES = {
 # them to NaN at clean time. A single tiny epsilon is safe: the realistic minimum of every
 # feature it guards is orders of magnitude larger.
 POSITIVE_LOWER_EPSILON = 1e-6
+
+# Canonical list of constants whose runtime values affect the preprocessor output.
+# data_preparation.py reads this list to build the cache fingerprint automatically.
+# Add the name of any new preprocessing toggle here — no other fingerprint code changes needed.
+PREPROCESSING_CACHE_KEYS: list[str] = [
+    "ROW_MISSINGNESS_THRESHOLD",
+    "OUTLIER_METHOD",
+    "IQR_MULTIPLIER",
+    "COUNTRY_OUTLIER_MIN_OBS",
+    "YEAR_OUTLIER_MIN_OBS",
+    "LAG_PERIODS",
+    "FORWARD_FILL_LIMIT",
+    "ROLLING_WINDOWS",
+    "ROLLING_STD_WINDOWS",
+    "ROLLING_MIN_PERIODS",
+    "STRUCTURAL_NA_FILL_VALUE",
+    "ENABLE_DIFF_FEATURES",
+    "ENABLE_PCT_CHANGE_FEATURES",
+    "ALL_PAIRWISE_INTERACTIONS",
+    "INTERACTION_PAIRS",
+    "INCLUDE_SYNTHETIC_FEATURES",
+    "SCALER_CHOICE",
+    "MICE_MAX_ITER",
+    "MICE_TOL",
+    "MICE_SKIP_COMPLETE",
+    "MICE_COUNTRY_N_COMPONENTS",
+    "MICE_MISSING_THRESHOLD",
+    "RANDOM_STATE",
+]
 
 NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
     "renewable_energy_share_tfc_pct": {"lower": 0.0, "upper": 100.0},
@@ -363,7 +395,14 @@ class Preprocessor:
         )
 
     def _attach_synthetic_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add permanent synthetic columns: country PCA components + year features."""
+        """Add permanent synthetic columns: country PCA components + year features.
+
+        When INCLUDE_SYNTHETIC_FEATURES is False, no columns are attached and
+        synthetic_feature_names_ is set to an empty list.
+        """
+        if not INCLUDE_SYNTHETIC_FEATURES:
+            self.synthetic_feature_names_ = []
+            return df.copy()
         out = df.copy()
         if self.country_n_pca_components_ > 0:
             fallback = self.country_pca_global_fallback_
@@ -1182,6 +1221,45 @@ class Preprocessor:
 
 CountryYearFallbackImputer.__module__ = "stages.preprocessing"
 Preprocessor.__module__ = "stages.preprocessing"
+
+
+# =============================================================================
+# Root config override
+# =============================================================================
+
+def _apply_root_config_overrides() -> None:
+    """Load project-root config.py and override module constants when not None."""
+    import importlib.util
+    from pathlib import Path as _Path
+    root_path = _Path(__file__).resolve().parent.parent / "config.py"
+    if not root_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location("_root_cfg", root_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    g = globals()
+    for name in (
+        "INCLUDE_SYNTHETIC_FEATURES",
+        "ALL_PAIRWISE_INTERACTIONS",
+        "INTERACTION_PAIRS",
+        "ROW_MISSINGNESS_THRESHOLD",
+        "IQR_MULTIPLIER",
+        "LAG_PERIODS",
+        "ROLLING_WINDOWS",
+        "ROLLING_STD_WINDOWS",
+        "FORWARD_FILL_LIMIT",
+        "ENABLE_DIFF_FEATURES",
+        "ENABLE_PCT_CHANGE_FEATURES",
+        "SCALER_CHOICE",
+        "MICE_COUNTRY_N_COMPONENTS",
+        "MICE_MAX_ITER",
+    ):
+        val = getattr(m, name, None)
+        if val is not None:
+            g[name] = val
+
+
+_apply_root_config_overrides()
 
 
 if __name__ == "__main__":

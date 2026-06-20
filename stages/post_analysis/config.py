@@ -29,6 +29,7 @@ SUBDIR_INTERPRETABILITY = "interpretability"
 SUBDIR_UNCERTAINTY      = "uncertainty"
 SUBDIR_SUMMARY          = "summary"
 SUBDIR_BOXPLOTS         = "boxplots"
+SUBDIR_PCA_COMPONENTS   = "pca_components"
 
 # ---------------------------------------------------------------------------
 # Active subsets – None means "use everything found in the loaded results"
@@ -163,3 +164,32 @@ NATURALEARTH_RESOLUTION = "110m"
 NATURALEARTH_DOWNLOAD_URL = (
     "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
 )
+
+
+# =============================================================================
+# Root config override
+# =============================================================================
+
+def _apply_root_config_overrides() -> None:
+    """Load project-root config.py and override module constants when not None."""
+    import importlib.util
+    from pathlib import Path as _Path
+    root_path = _Path(__file__).resolve().parent.parent.parent / "config.py"
+    if not root_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location("_root_cfg", root_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    g = globals()
+    for name in (
+        "SHAP_MAX_DISPLAY",
+        "SHAP_BACKGROUND_SAMPLES",
+        "KERNEL_SHAP_NSAMPLES",
+        "BENCHMARK_TOLERANCE_YEARS",
+    ):
+        val = getattr(m, name, None)
+        if val is not None:
+            g[name] = val
+
+
+_apply_root_config_overrides()

@@ -98,6 +98,12 @@ STATIC_SOURCES = [
     },
 ]
 
+# PRIMAP-hist scenario selector.
+# "HISTCR" = country-reported (primary); "HISTTP" = third-party independent.
+# Changing this requires re-running main.py and rebuilding the preprocessor cache.
+PRIMAP_SCENARIO = "HISTCR"
+_PRIMAP_VALID_SCENARIOS = {"HISTCR", "HISTTP"}
+
 WORLD_BANK_SOURCES = [
     {"name": "world_bank_oil_rents", "indicator": "NY.GDP.PETR.RT.ZS", "source": 2},
     {"name": "world_bank_natural_gas_rents", "indicator": "NY.GDP.NGAS.RT.ZS", "source": 2},
@@ -665,7 +671,11 @@ def process_primap() -> None:
     year_cols = sorted(year_cols, key=lambda x: int(x))
 
     scen_col = "scenario (PRIMAP-hist)"
-    df = df[df[scen_col] == "HISTCR"].copy()
+    if PRIMAP_SCENARIO not in _PRIMAP_VALID_SCENARIOS:
+        raise ValueError(
+            f"PRIMAP_SCENARIO must be one of {_PRIMAP_VALID_SCENARIOS}, got {PRIMAP_SCENARIO!r}"
+        )
+    df = df[df[scen_col] == PRIMAP_SCENARIO].copy()
     id_vars = [c for c in meta_cols if c in df.columns]
     long = df.melt(id_vars=id_vars, value_vars=year_cols, var_name="date", value_name="value")
     long["date"] = long["date"].astype(int)
@@ -1420,6 +1430,30 @@ def run(skip_download: bool = False) -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     final_df.to_csv(OUTPUT_PATH, index=False)
     print(f"Wrote {len(final_df)} rows to {OUTPUT_PATH}")
+
+
+# =============================================================================
+# Root config override
+# =============================================================================
+
+def _apply_root_config_overrides() -> None:
+    """Load project-root config.py and override module constants when not None."""
+    import importlib.util
+    from pathlib import Path as _Path
+    root_path = _Path(__file__).resolve().parent.parent / "config.py"
+    if not root_path.exists():
+        return
+    spec = importlib.util.spec_from_file_location("_root_cfg", root_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    g = globals()
+    for name in ("PRIMAP_SCENARIO",):
+        val = getattr(m, name, None)
+        if val is not None:
+            g[name] = val
+
+
+_apply_root_config_overrides()
 
 
 if __name__ == "__main__":

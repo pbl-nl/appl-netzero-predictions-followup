@@ -55,6 +55,7 @@ from stages.preprocessing import (
     MICE_SKIP_COMPLETE,
     MICE_TOL,
     OUTLIER_METHOD,
+    PREPROCESSING_CACHE_KEYS,
     Preprocessor,
     RANDOM_STATE,
     ROLLING_MIN_PERIODS,
@@ -425,11 +426,29 @@ def _build_fingerprint_config() -> dict[str, Any]:
         TEST_YEAR as _TEST_YEAR,
         TRAIN_START_YEAR,
     )
+    import stages.preprocessing as _prep
+
+    # Derive preprocessing state from the canonical list in preprocessing.py.
+    # Adding a new toggle to PREPROCESSING_CACHE_KEYS is all that's needed to
+    # include it in future cache fingerprints — no changes required here.
+    preprocessing_state: dict[str, Any] = {}
+    for _key in _prep.PREPROCESSING_CACHE_KEYS:
+        _val = getattr(_prep, _key)
+        if isinstance(_val, (list, tuple, set)):
+            _val = sorted(_val, key=str)
+        preprocessing_state[_key.lower()] = _val
+
+    root_cfg_path = Path("config.py")
 
     return {
         "data_sha256": _file_sha256(DATA_PATH),
         "preprocessing_sha256": _file_sha256(Path("stages/preprocessing.py")),
         "data_preparation_sha256": _file_sha256(Path("stages/training/data_preparation.py")),
+        # Belt-and-suspenders: any edit to root config.py also busts the cache,
+        # even for constants not yet in PREPROCESSING_CACHE_KEYS.
+        "root_config_sha256": _file_sha256(root_cfg_path) if root_cfg_path.exists() else "absent",
+        "eval_drop_mode": "strict_primary_lenient_secondary_v1",
+        "preprocessing_constants": preprocessing_state,
         "branches": sorted(ACTIVE_BRANCHES),
         "targets": sorted(ACTIVE_TARGETS),
         "strategies": sorted(ACTIVE_OUTER_STRATEGIES),
@@ -438,26 +457,6 @@ def _build_fingerprint_config() -> dict[str, Any]:
         "train_start_year": TRAIN_START_YEAR,
         "n_temporal_cv_folds": N_TEMPORAL_CV_FOLDS,
         "n_features_to_select": N_FEATURES_TO_SELECT,
-        "random_state": RANDOM_STATE,
-        "row_missingness_threshold": ROW_MISSINGNESS_THRESHOLD,
-        "eval_drop_mode": "strict_primary_lenient_secondary_v1",
-        "outlier_method": OUTLIER_METHOD,
-        "iqr_multiplier": IQR_MULTIPLIER,
-        "country_outlier_min_obs": COUNTRY_OUTLIER_MIN_OBS,
-        "year_outlier_min_obs": YEAR_OUTLIER_MIN_OBS,
-        "lag_periods": LAG_PERIODS,
-        "rolling_windows": ROLLING_WINDOWS,
-        "rolling_min_periods": ROLLING_MIN_PERIODS,
-        "structural_na_fill_value": STRUCTURAL_NA_FILL_VALUE,
-        "enable_diff_features": ENABLE_DIFF_FEATURES,
-        "enable_pct_change_features": ENABLE_PCT_CHANGE_FEATURES,
-        "scaler_choice": SCALER_CHOICE,
-        "mice_max_iter": MICE_MAX_ITER,
-        "mice_tol": MICE_TOL,
-        "mice_skip_complete": MICE_SKIP_COMPLETE,
-        "mice_country_n_components": MICE_COUNTRY_N_COMPONENTS,
-        "mice_missing_threshold": MICE_MISSING_THRESHOLD,
-        "interaction_pairs": sorted(INTERACTION_PAIRS),
     }
 
 

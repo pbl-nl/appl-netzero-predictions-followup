@@ -22,7 +22,6 @@ def run_boxplots(winners: pd.DataFrame, bootstrap_df: pd.DataFrame, out_dir: Pat
         f.unlink()
     
     nz_data = load_nz_data()
-    nz_data["nz_ghg_year"] = nz_data["nz_ghg_year"].fillna(2125)
     announced_map = dict(zip(nz_data["iso3"], nz_data["nz_ghg_year"]))
     
     top20_emitters = ['CHN', 'USA', 'IND', 'RUS', 'BRA', 'IDN', 'JPN', 'IRN', 'MEX', 'SAU',
@@ -66,8 +65,9 @@ def run_boxplots(winners: pd.DataFrame, bootstrap_df: pd.DataFrame, out_dir: Pat
         plt.grid(True)
         
         for j, country_code in enumerate(countries_to_plot):
-            actual_nz_year = announced_map.get(country_code, 2125)
-            plt.scatter(actual_nz_year, j, color='red', zorder=3)
+            actual_nz_year = announced_map.get(country_code)
+            if actual_nz_year is not None and not pd.isna(actual_nz_year):
+                plt.scatter(actual_nz_year, j, color='red', zorder=3)
             
         fig = plt.gcf()
         fig.set_size_inches(10, 6)
