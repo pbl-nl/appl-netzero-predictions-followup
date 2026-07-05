@@ -23,7 +23,7 @@ from sklearn.metrics import (
 )
 from sklearn.dummy import DummyRegressor
 from sklearn.neural_network import MLPRegressor
-from sklearn.svm import NuSVR
+from sklearn.svm import SVR
 from sklearn.tree import DecisionTreeRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
@@ -172,14 +172,13 @@ def fit_model(model: Any, x_train: pd.DataFrame, y_train: pd.Series) -> Any:
     return model
 
 
-def get_fit_diagnostics(model: Any, n_train: int | None = None) -> dict[str, Any]:
-    """Return convergence diagnostics for models that expose fit state (NuSVR)."""
-    if not isinstance(model, NuSVR):
+def get_fit_diagnostics(model: Any) -> dict[str, Any]:
+    """Return convergence diagnostics for models that expose fit state (SVR)."""
+    if not isinstance(model, SVR):
         return {
             "svr_converged": None,
             "svr_n_iter": None,
             "svr_support_vectors": None,
-            "svr_sv_ratio": None,
         }
     converged = not hasattr(model, "fit_status_") or model.fit_status_ == 0
     n_iter = getattr(model, "n_iter_", None)
@@ -188,12 +187,10 @@ def get_fit_diagnostics(model: Any, n_train: int | None = None) -> dict[str, Any
         if hasattr(model, "support_vectors_")
         else None
     )
-    sv_ratio = (n_sv / n_train) if (n_sv is not None and n_train) else None
     return {
         "svr_converged": converged,
         "svr_n_iter": n_iter,
         "svr_support_vectors": n_sv,
-        "svr_sv_ratio": round(sv_ratio, 4) if sv_ratio is not None else None,
     }
 
 
@@ -267,14 +264,13 @@ def get_hyperopt_space(model_name: str) -> dict[str, Any]:
         }
     if model_name == "svr":
         return {
-            # NuSVR: nu replaces epsilon as the primary regularisation handle.
-            # nu ∈ (0, 1] is an lower bound on the support-vector fraction of training
-            # rows. nu=0.5 → at least 50% of
-            # training rows become support vectors; Hyperopt searches the full range.
-            "kernel": hp.choice("kernel", ["rbf"]),
-            "C":      hp.loguniform("C", np.log(1e-2), np.log(50.0)),
-            "nu":     hp.uniform("nu", 0.05, 0.90),
-            "gamma":  hp.loguniform("gamma", np.log(1e-4), np.log(0.25)),
+            "kernel":   hp.choice("kernel", ["rbf"]),
+            "C":        hp.loguniform("C", np.log(1e-2), np.log(50.0)),
+            # epsilon: margin of tolerance — primary regularisation handle.
+            # Low epsilon (< 0.005) is the primary overfitting signal; sub-0.005 is
+            # a degenerate attractor that memorises small datasets.
+            "epsilon":  hp.loguniform("epsilon", np.log(0.005), np.log(1.0)),
+            "gamma":    hp.loguniform("gamma", np.log(1e-4), np.log(0.25)),
         }
     if model_name == "random_forest":
         return {
@@ -456,10 +452,10 @@ def build_model(model_name: str, params: dict[str, Any], random_state: int) -> A
             gamma=float(params["gamma"]),
         )
     if model_name == "svr":
-        return NuSVR(
+        return SVR(
             kernel=str(params["kernel"]),
             C=float(params["C"]),
-            nu=float(params["nu"]),
+            epsilon=float(params["epsilon"]),
             gamma=float(params["gamma"]),
             max_iter=SVR_MAX_ITER,
         )

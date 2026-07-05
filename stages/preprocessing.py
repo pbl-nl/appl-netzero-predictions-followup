@@ -96,6 +96,10 @@ RATE_FEATURES = {
 # feature it guards is orders of magnitude larger.
 POSITIVE_LOWER_EPSILON = 1e-6
 
+# Columns to drop before any preprocessing step (cleaning, imputation, engineering).
+# Override via EXCLUDE_COLUMNS in root config.py.
+EXCLUDE_COLUMNS: list[str] = []
+
 # Canonical list of constants whose runtime values affect the preprocessor output.
 # data_preparation.py reads this list to build the cache fingerprint automatically.
 # Add the name of any new preprocessing toggle here — no other fingerprint code changes needed.
@@ -123,6 +127,7 @@ PREPROCESSING_CACHE_KEYS: list[str] = [
     "MICE_COUNTRY_N_COMPONENTS",
     "MICE_MISSING_THRESHOLD",
     "RANDOM_STATE",
+    "EXCLUDE_COLUMNS",
 ]
 
 NUMERIC_RANGE_RULES: dict[str, dict[str, Any]] = {
@@ -421,6 +426,11 @@ class Preprocessor:
     # Public API
     # -----------------------------------------------------------------
     def fit_transform(self, train_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        if EXCLUDE_COLUMNS:
+            cols_to_drop = [c for c in EXCLUDE_COLUMNS if c in train_df.columns]
+            if cols_to_drop:
+                logger.info("Excluding %d columns before preprocessing: %s", len(cols_to_drop), cols_to_drop)
+                train_df = train_df.drop(columns=cols_to_drop)
         pid = os.getpid()
         self.feature_columns_ = get_feature_columns(train_df)
         self.continuous_features_ = get_continuous_features(train_df, self.feature_columns_)
@@ -498,6 +508,10 @@ class Preprocessor:
         split_name: str = "data",
         drop_rows: bool | str = True,
     ) -> dict[str, pd.DataFrame]:
+        if EXCLUDE_COLUMNS:
+            cols_to_drop = [c for c in EXCLUDE_COLUMNS if c in df.columns]
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
         cleaned = self._clean(df, history_df=history_df, fit=False, drop_rows=drop_rows)
         # Capture this split's diagnostic now: the history _clean() call below clobbers
         # self._last_clean_missingness_ with the training rows.
@@ -1253,6 +1267,7 @@ def _apply_root_config_overrides() -> None:
         "SCALER_CHOICE",
         "MICE_COUNTRY_N_COMPONENTS",
         "MICE_MAX_ITER",
+        "EXCLUDE_COLUMNS",
     ):
         val = getattr(m, name, None)
         if val is not None:

@@ -275,6 +275,11 @@ from stages.post_analysis._workers import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Config snapshot
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Main run function
 # ---------------------------------------------------------------------------
 
@@ -310,6 +315,8 @@ def run(argv: list[str] | None = None) -> None:
     setup_logging(out_dir / cfg.SUBDIR_SUMMARY / "post_analysis.log")
     log = logging.getLogger(__name__)
     log.info("Post-analysis output directory: %s", out_dir)
+    from stages.run_config import write_run_config
+    write_run_config(out_dir)
 
     t0 = time.perf_counter()
     skip = set(args.skip)

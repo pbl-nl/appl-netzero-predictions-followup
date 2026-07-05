@@ -69,18 +69,18 @@ INTERACTION_PAIRS = [
     ("coal_rents_of_gdp", "total_ghg_emissions_per_capita"),
     ("ghg_growth", "population_density_people_per_sq_km_of_land_area"),
     ("ghg_growth", "gdp_ppp_constant_2021_international"),
-    ("energy_intensity_mj_per_usd_ppp", "gdp_ppp_constant_2021_international"),
-    ("gdp_ppp_constant_2021_international", "population_density_people_per_sq_km_of_land_area"),
-    ("population_density_people_per_sq_km_of_land_area", "total_ghg_emissions_per_capita"),
-    ("ghg_growth", "agricultural_land_of_land_area"),
-    ("coal_rents_of_gdp", "total_hard_to_abate_emissions_per_capita"),
-    ("ghg_growth", "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average"),
-    ("coal_rents_of_gdp", "control_of_corruption_estimate"),
-    ("ghg_growth", "gdp_per_capita_constant_2015_us"),
-    ("ghg_growth", "total_hard_to_abate_emissions_per_capita"),
-    ("ghg_growth", "non_co2_emissions_per_capita"),
-    ("renewable_energy_share_tfc_pct", "agricultural_land_of_land_area"),
-    ("coal_rents_of_gdp", "gdp_ppp_constant_2021_international"),
+    # ("energy_intensity_mj_per_usd_ppp", "gdp_ppp_constant_2021_international"),
+    # ("gdp_ppp_constant_2021_international", "population_density_people_per_sq_km_of_land_area"),
+    # ("population_density_people_per_sq_km_of_land_area", "total_ghg_emissions_per_capita"),
+    # ("ghg_growth", "agricultural_land_of_land_area"),
+    # ("coal_rents_of_gdp", "total_hard_to_abate_emissions_per_capita"),
+    # ("ghg_growth", "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average"),
+    # ("coal_rents_of_gdp", "control_of_corruption_estimate"),
+    # ("ghg_growth", "gdp_per_capita_constant_2015_us"),
+    # ("ghg_growth", "total_hard_to_abate_emissions_per_capita"),
+    # ("ghg_growth", "non_co2_emissions_per_capita"),
+    # ("renewable_energy_share_tfc_pct", "agricultural_land_of_land_area"),
+    # ("coal_rents_of_gdp", "gdp_ppp_constant_2021_international"),
 ] # module default: []
 
 # Fraction of a row's feature values that may be missing before the row is
@@ -119,6 +119,18 @@ ENABLE_DIFF_FEATURES = None  # module default: False
 # Example: ENABLE_PCT_CHANGE_FEATURES = True
 ENABLE_PCT_CHANGE_FEATURES = None  # module default: False
 
+# Columns to exclude from the model input matrix BEFORE preprocessing begins.
+# Enforced at the very start of Preprocessor.fit_transform() and Preprocessor.transform(),
+# which means excluded columns:
+#   (a) never become base features and cannot generate lag / rolling / interaction terms,
+#   (b) cannot be selected by RFE — feature selection runs on the post-exclusion matrix,
+#   (c) are invisible to imputation, outlier cleaning, and scaling.
+# Changing this list busts the preprocessor cache (triggers a full re-run).
+# Interaction pairs in INTERACTION_PAIRS that reference an excluded column are silently
+# skipped (existing "unknown names are silently skipped" behaviour covers this).
+# Example: EXCLUDE_COLUMNS = ["v2x_regime", "coal_rents_of_gdp"]
+EXCLUDE_COLUMNS = None  # module default: []
+
 # Scaler applied after feature engineering.
 # Valid: "standard" (StandardScaler), "minmax" (MinMaxScaler), "robust" (RobustScaler).
 # Example: SCALER_CHOICE = "robust"
@@ -141,10 +153,10 @@ MICE_MAX_ITER = None  # module default: 20
 # Full registry: ridge, elasticnet, xgboost, svr, random_forest, mlp,
 #   extra_trees, hist_gradient_boosting, adaboost, lightgbm, catboost,
 #   kernel_ridge, dummy_mean.
-# Note: "svr" uses NuSVR internally; the `nu` hyperparameter (0.05–0.90) bounds
-#   the support-vector fraction, analogous to max_depth in tree models.
+# Note: "svr" uses SVR with epsilon regularisation; the `epsilon` hyperparameter
+#   (0.005–1.0) controls the margin of tolerance for the regression tube.
 # Example: ACTIVE_MODELS = ["ridge", "xgboost", "svr", "lightgbm"]
-ACTIVE_MODELS = ["svr", "hist_gradient_boosting", "ridge"]  # module default: all models
+ACTIVE_MODELS = ["svr", "ridge"]#"hist_gradient_boosting", "ridge"]  # module default: all models
 
 # Target variables to train.
 # Valid: "linear", "optimistic", "pessimistic" (scenario alpha values).
@@ -193,7 +205,7 @@ OUTER_GAP_ABS_THRESHOLD = None  # module default: 0.1
 # Example: OUTER_GAP_REL_THRESHOLD = 0.4
 OUTER_GAP_REL_THRESHOLD = None  # module default: 0.5
 
-# Maximum solver iterations for NuSVR (convergence guard, not a quality limit).
+# Maximum solver iterations for SVR (convergence guard, not a quality limit).
 # Example: SVR_MAX_ITER = 5_000_000
 SVR_MAX_ITER = None  # module default: 10_000_000
 

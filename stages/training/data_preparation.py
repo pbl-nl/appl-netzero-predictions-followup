@@ -1986,6 +1986,9 @@ def _build_cache(base_dir: Path, fingerprint: str) -> dict[str, list]:
     }
     write_json(base_dir / "manifest.json", manifest)
 
+    from stages.run_config import write_run_config
+    write_run_config(base_dir)
+
     logger.info(f"Data preparation stage complete in {stage_elapsed:.1f}s")
     return units
 

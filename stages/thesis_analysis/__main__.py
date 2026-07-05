@@ -135,6 +135,8 @@ def run(argv=None) -> None:
     setup_logging(subdirs[SUBDIR_SUMMARY] / "thesis_analysis.log")
 
     log.info("Output directory: %s", out_dir)
+    from stages.run_config import write_run_config
+    write_run_config(out_dir)
 
     # Discover and load training outputs
     try:

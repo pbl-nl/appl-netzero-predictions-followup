@@ -195,10 +195,17 @@ def run_final_bootstrap_iterations(
                     executor.submit(_run_iteration_from_state, idx)
                     for idx in iteration_indices
                 ]
-                return sorted(
-                    [f.result() for f in as_completed(futures)],
-                    key=lambda item: item[0],
-                )
+                log_every = max(10, FINAL_BOOTSTRAP_ITERATIONS // 10)
+                results = []
+                for f in as_completed(futures):
+                    results.append(f.result())
+                    n = len(results)
+                    if n % log_every == 0 or n == FINAL_BOOTSTRAP_ITERATIONS:
+                        print(
+                            f"[Bootstrap {target}/{model_name}] {n}/{FINAL_BOOTSTRAP_ITERATIONS} iterations done",
+                            flush=True,
+                        )
+                return sorted(results, key=lambda item: item[0])
         except PermissionError as exc:
             logger.warning(
                 f"Process pool unavailable for target={target} ({exc}). "
@@ -209,8 +216,10 @@ def run_final_bootstrap_iterations(
         f"Final bootstrap sequential: target={target} iterations={FINAL_BOOTSTRAP_ITERATIONS} "
         f"sample_unit={sample_unit}"
     )
-    return [
-        _run_one_iteration(
+    log_every = max(10, FINAL_BOOTSTRAP_ITERATIONS // 10)
+    results = []
+    for idx in iteration_indices:
+        results.append(_run_one_iteration(
             model_name=model_name,
             best_params=best_params,
             x_train=x_train,
@@ -222,6 +231,11 @@ def run_final_bootstrap_iterations(
             x_test_all=x_test_all,
             iteration_idx=idx,
             country_labels=country_labels,
-        )
-        for idx in iteration_indices
-    ]
+        ))
+        n = len(results)
+        if n % log_every == 0 or n == FINAL_BOOTSTRAP_ITERATIONS:
+            print(
+                f"[Bootstrap {target}/{model_name}] {n}/{FINAL_BOOTSTRAP_ITERATIONS} iterations done",
+                flush=True,
+            )
+    return results

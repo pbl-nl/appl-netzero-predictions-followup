@@ -191,13 +191,11 @@ FINAL_RESULTS_COLUMNS = [
     "bootstrap_test_mae_p05",
     "bootstrap_test_mae_p50",
     "bootstrap_test_mae_p95",
-    # NuSVR convergence and support-vector diagnostics for the saved single-model artifact
+    # SVR convergence diagnostics for the saved single-model artifact
     "final_model_svr_converged",
     "final_model_svr_n_iter",
     "final_model_svr_support_vectors",
-    # SV fraction = svr_support_vectors / final_train_rows (advisory; not gating)
-    "final_model_svr_sv_ratio",
-    # Fraction of the 200 bootstrap iterations where the model converged
+    # Fraction of the bootstrap iterations where the model converged
     "bootstrap_svr_converged_share",
     "artifact_path",
 ]
