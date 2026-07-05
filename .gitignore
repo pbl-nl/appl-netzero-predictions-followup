@@ -43,3 +43,10 @@ tests/
 
 # --- Claude / agent tooling directories ---
 .claude/
+
+# --- simplified/ subproject generated data & run artifacts ---
+simplified/data/
+simplified/data/raw/
+simplified/data/interim/
+simplified/data/processed/
+simplified/artifacts/
