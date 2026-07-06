@@ -521,6 +521,10 @@ class Preprocessor:
 
         history_cleaned: pd.DataFrame | None = None
         if history_df is not None and not history_df.empty:
+            if EXCLUDE_COLUMNS:
+                hist_cols_to_drop = [c for c in EXCLUDE_COLUMNS if c in history_df.columns]
+                if hist_cols_to_drop:
+                    history_df = history_df.drop(columns=hist_cols_to_drop)
             history_cleaned = self._clean(history_df, history_df=None, fit=False)
             current_max_year = int(cleaned[YEAR_COL].max())
             history_cleaned = self._fill_temporal_gaps(

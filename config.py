@@ -69,18 +69,18 @@ INTERACTION_PAIRS = [
     ("coal_rents_of_gdp", "total_ghg_emissions_per_capita"),
     ("ghg_growth", "population_density_people_per_sq_km_of_land_area"),
     ("ghg_growth", "gdp_ppp_constant_2021_international"),
-    # ("energy_intensity_mj_per_usd_ppp", "gdp_ppp_constant_2021_international"),
-    # ("gdp_ppp_constant_2021_international", "population_density_people_per_sq_km_of_land_area"),
-    # ("population_density_people_per_sq_km_of_land_area", "total_ghg_emissions_per_capita"),
-    # ("ghg_growth", "agricultural_land_of_land_area"),
-    # ("coal_rents_of_gdp", "total_hard_to_abate_emissions_per_capita"),
-    # ("ghg_growth", "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average"),
-    # ("coal_rents_of_gdp", "control_of_corruption_estimate"),
-    # ("ghg_growth", "gdp_per_capita_constant_2015_us"),
-    # ("ghg_growth", "total_hard_to_abate_emissions_per_capita"),
-    # ("ghg_growth", "non_co2_emissions_per_capita"),
-    # ("renewable_energy_share_tfc_pct", "agricultural_land_of_land_area"),
-    # ("coal_rents_of_gdp", "gdp_ppp_constant_2021_international"),
+    ("energy_intensity_mj_per_usd_ppp", "gdp_ppp_constant_2021_international"),
+    ("gdp_ppp_constant_2021_international", "population_density_people_per_sq_km_of_land_area"),
+    ("population_density_people_per_sq_km_of_land_area", "total_ghg_emissions_per_capita"),
+    ("ghg_growth", "agricultural_land_of_land_area"),
+    ("coal_rents_of_gdp", "total_hard_to_abate_emissions_per_capita"),
+    ("ghg_growth", "average_supply_of_protein_of_animal_origin_g_cap_day_3_year_average"),
+    ("coal_rents_of_gdp", "control_of_corruption_estimate"),
+    ("ghg_growth", "gdp_per_capita_constant_2015_us"),
+    ("ghg_growth", "total_hard_to_abate_emissions_per_capita"),
+    ("ghg_growth", "non_co2_emissions_per_capita"),
+    ("renewable_energy_share_tfc_pct", "agricultural_land_of_land_area"),
+    ("coal_rents_of_gdp", "gdp_ppp_constant_2021_international"),
 ] # module default: []
 
 # Fraction of a row's feature values that may be missing before the row is
@@ -129,7 +129,7 @@ ENABLE_PCT_CHANGE_FEATURES = None  # module default: False
 # Interaction pairs in INTERACTION_PAIRS that reference an excluded column are silently
 # skipped (existing "unknown names are silently skipped" behaviour covers this).
 # Example: EXCLUDE_COLUMNS = ["v2x_regime", "coal_rents_of_gdp"]
-EXCLUDE_COLUMNS = None  # module default: []
+EXCLUDE_COLUMNS = ["annual_deforestation_of_change"] # None  # module default: []
 
 # Scaler applied after feature engineering.
 # Valid: "standard" (StandardScaler), "minmax" (MinMaxScaler), "robust" (RobustScaler).
@@ -156,12 +156,12 @@ MICE_MAX_ITER = None  # module default: 20
 # Note: "svr" uses SVR with epsilon regularisation; the `epsilon` hyperparameter
 #   (0.005–1.0) controls the margin of tolerance for the regression tube.
 # Example: ACTIVE_MODELS = ["ridge", "xgboost", "svr", "lightgbm"]
-ACTIVE_MODELS = ["svr", "ridge"]#"hist_gradient_boosting", "ridge"]  # module default: all models
+ACTIVE_MODELS = ["catboost", "hist_gradient_boosting", "svr", "mlp", "kernel_ridge", "xgboost"]  # module default: all models
 
 # Target variables to train.
 # Valid: "linear", "optimistic", "pessimistic" (scenario alpha values).
 # Example: ACTIVE_TARGETS = ["linear"]
-ACTIVE_TARGETS = ["linear"]  # module default: ["linear", "optimistic", "pessimistic"]
+ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]  # module default: ["linear", "optimistic", "pessimistic"]
 
 # Imputation branches to run.
 # Valid: "simple" (country/year/global median fallback), "mice" (IterativeImputer).
