@@ -607,9 +607,10 @@ def derive_tnz_for_summary(
     Apply :func:`invert_prediction_to_tnz` to every row of *prediction_summary*.
 
     Inverts:
-    - ``prediction_mean``  → ``tnz_implied_mean``
-    - ``prediction_p05``   → ``tnz_implied_p95_year``
-    - ``prediction_p95``   → ``tnz_implied_p05_year``
+    - ``prediction_mean``   → ``tnz_implied_mean``
+    - ``prediction_p05``    → ``tnz_implied_p95_year``
+    - ``prediction_p95``    → ``tnz_implied_p05_year``
+    - ``prediction_median`` → ``tnz_implied_p50_year``
     - ``prediction_mean`` with a wider diagnostic ceiling → ``tnz_implied_mean_diag``
     """
     if prediction_summary.empty:
@@ -646,6 +647,7 @@ def derive_tnz_for_summary(
     results_mean: list[dict[str, Any]] = []
     results_p05: list[dict[str, Any]] = []
     results_p95: list[dict[str, Any]] = []
+    results_p50: list[dict[str, Any]] = []
     results_diag: list[dict[str, Any]] = []
 
     for row in rows:
@@ -688,16 +690,27 @@ def derive_tnz_for_summary(
             prediction_year=prediction_year,
             search_hi=TNZ_DIAGNOSTIC_SEARCH_HI,
         )
+        r_p50 = invert_prediction_to_tnz(
+            y_pred=float(row.get("prediction_median", float("nan"))),
+            iso3=iso3,
+            scenario=scenario,
+            country_inputs=country_inputs,
+            input_audit=input_audit_map,
+            prediction_year=prediction_year,
+            search_hi=TNZ_SEARCH_HI,
+        )
         results_mean.append(r_mean)
         results_p05.append(r_p05)
         results_p95.append(r_p95)
         results_diag.append(r_diag)
+        results_p50.append(r_p50)
 
     out["tnz_implied_mean"] = [r["tnz_implied"] for r in results_mean]
     out["tnz_status_mean"] = [r["tnz_status"] for r in results_mean]
     out["tnz_status_detail"] = [r["tnz_status_detail"] for r in results_mean]
     out["tnz_implied_p95_year"] = [r["tnz_implied"] for r in results_p05]
     out["tnz_implied_p05_year"] = [r["tnz_implied"] for r in results_p95]
+    out["tnz_implied_p50_year"] = [r["tnz_implied"] for r in results_p50]
     out["tnz_implied_mean_diag"] = [r["tnz_implied"] for r in results_diag]
     out["tnz_status_diag"] = [r["tnz_status"] for r in results_diag]
     out["tnz_status_detail_diag"] = [r["tnz_status_detail"] for r in results_diag]
