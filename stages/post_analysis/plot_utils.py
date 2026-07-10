@@ -75,7 +75,7 @@ def strategy_label(strategy: str) -> str:
 
 def branch_label(branch: str) -> str:
     """Human-readable label for an imputation branch name."""
-    return {"simple": "Simple", "mice": "MICE"}.get(branch, branch)
+    return {"simple": "Simple", "mice": "MICE", "interpolation": "Interpolation"}.get(branch, branch)
 
 
 def add_diagonal(ax: plt.Axes, color: str = "grey", linestyle: str = "--") -> None:

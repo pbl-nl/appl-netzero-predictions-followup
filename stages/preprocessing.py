@@ -4,9 +4,12 @@ preprocessing.py - reusable preprocessing classes and constants.
 The Preprocessor class implements a three-phase pipeline:
     clean -> impute -> engineer -> encode/scale
 
-Two imputation branches:
-    simple : Country -> year -> global median fallback
-    mice   : Iterative imputer with panel-aware auxiliary predictors
+Three imputation branches:
+    simple        : Country -> year -> global median fallback
+    mice          : Iterative imputer with panel-aware auxiliary predictors
+    interpolation : Per-country linear interpolation over the time series, with
+                    slope-based extrapolation for leading/trailing gaps. Skips the
+                    forward-fill step (Phase 1b) that the other branches use.
 """
 
 from __future__ import annotations
@@ -205,7 +208,7 @@ OUTLIER_POLICY_BY_FEATURE: dict[str, str] = {
     **{col: OUTLIER_POLICY_COUNTRY_AND_YEAR_IQR for col in YEAR_CONFIRMED_OUTLIER_FEATURES},
 }
 
-BRANCH_NAMES = ("simple", "mice")
+BRANCH_NAMES = ("simple", "mice", "interpolation")
 
 # --- Utility functions ---
 
@@ -463,12 +466,17 @@ class Preprocessor:
         # Forward-fill reporting-lag gaps (per country, <= FORWARD_FILL_LIMIT yrs) before the
         # cross-sectional imputer runs, then re-evaluate the missingness floor on the filled
         # values. Imputers are already fit on the pre-ffill observed rows above.
+        pre_ffill = cleaned.copy()
         cleaned = self._forward_fill_features(cleaned)
         cleaned, _ = self._rescue_dropped_rows(cleaned, drop_rows=True)
+        # The interpolation branch must not see forward-filled values, but keeps the same
+        # row-inclusion decisions as the other branches for cross-branch comparability.
+        cleaned_no_ffill = self._transplant_to_drop(pre_ffill, cleaned)
 
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
-            imputed = self._impute(cleaned, branch)
+            src = cleaned_no_ffill if branch == "interpolation" else cleaned
+            imputed = self._impute(src, branch)
             feat_cols = get_feature_columns(imputed)
             nans = int(imputed[feat_cols].isna().sum().sum())
             print(f"[PID:{pid}] Imputation ({branch}): {nans} NaNs remaining", flush=True)
@@ -532,6 +540,11 @@ class Preprocessor:
             )
             history_cleaned = self._attach_synthetic_features(history_cleaned)
 
+        # The interpolation branch must not see forward-filled values; snapshot the
+        # pre-ffill frames now, before the ffill-with-history call below mutates them.
+        pre_ffill_current = cleaned.copy()
+        pre_ffill_history = history_cleaned.copy() if history_cleaned is not None else None
+
         # Carry the most recent valid value (incl. the last training year) forward into the
         # current frame, then re-evaluate the missingness floor so rows rescued by the fill
         # survive, and refresh the diagnostic to match the values actually used.
@@ -543,13 +556,24 @@ class Preprocessor:
             )
         self.last_transform_missingness_ = split_missingness
 
+        # Same row-inclusion decisions as the ffill-based branches, but non-ffilled values;
+        # history keeps its own (unrescued) _to_drop, since it never gates the final rows.
+        cleaned_no_ffill = self._transplant_to_drop(pre_ffill_current, cleaned)
+        history_cleaned_no_ffill = pre_ffill_history
+
         outputs: dict[str, pd.DataFrame] = {}
         for branch in self.active_branches_:
-            imputed = self._impute(cleaned, branch)
-
-            history_imputed = None
-            if history_cleaned is not None:
-                history_imputed = self._impute(history_cleaned, branch)
+            if branch == "interpolation":
+                imputed = self._impute(cleaned_no_ffill, branch, history=history_cleaned_no_ffill)
+                history_imputed = (
+                    self._impute(history_cleaned_no_ffill, branch)
+                    if history_cleaned_no_ffill is not None else None
+                )
+            else:
+                imputed = self._impute(cleaned, branch)
+                history_imputed = (
+                    self._impute(history_cleaned, branch) if history_cleaned is not None else None
+                )
 
             engineered = self._engineer(imputed, history_df=history_imputed)
             engineered = (
@@ -917,6 +941,17 @@ class Preprocessor:
             [COUNTRY_COL, YEAR_COL, "row_missingness_fraction", "included"]
         ].copy()
 
+    def _transplant_to_drop(self, target: pd.DataFrame, source: pd.DataFrame) -> pd.DataFrame:
+        """Copy `_to_drop` from `source` (post-ffill, post-rescue) onto `target`.
+
+        Aligned by (country, year) rather than positional index, since ffill/rescue
+        re-sort and reset the index. Lets the interpolation branch share the exact same
+        row-inclusion decisions as the ffill-based branches, on non-ffilled values."""
+        mask = source[ID_COLS + ["_to_drop"]]
+        out = target.drop(columns=["_to_drop"], errors="ignore").merge(mask, on=ID_COLS, how="left")
+        out["_to_drop"] = out["_to_drop"].fillna(True).astype(bool)
+        return out
+
     # -----------------------------------------------------------------
     # Phase 2: Impute
     # -----------------------------------------------------------------
@@ -1002,7 +1037,121 @@ class Preprocessor:
             self.mice_categorical_imputer_ = SimpleImputer(strategy="most_frequent")
             self.mice_categorical_imputer_.fit(cleaned_train[retained_cats])
 
-    def _impute(self, df: pd.DataFrame, branch: str) -> pd.DataFrame:
+    def _linear_interpolate_columns(self, df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        """Per-country linear interpolation over the time series.
+
+        Interior gaps are filled by interpolating between the two neighboring valid
+        values (by actual year, not row position). Leading/trailing gaps that interior
+        interpolation cannot reach are extrapolated using the slope of the country's
+        first two (leading) or last two (trailing) *genuinely observed* points -- never
+        values already synthesized by the interior interpolation step, so extrapolation
+        error can't compound. A country/column with fewer than 2 observed points is left
+        NaN, for the caller's fallback to handle."""
+        cols = [c for c in cols if c in df.columns]
+        if not cols:
+            return df
+        out = df.sort_values(ID_COLS).reset_index(drop=True)
+
+        def _interp_group(g: pd.DataFrame) -> pd.DataFrame:
+            country = g.name
+            g = g.set_index(YEAR_COL)
+            observed = g[cols].copy()
+            g[cols] = g[cols].interpolate(method="index", limit_area="inside")
+            years = g.index.to_numpy()
+            for col in cols:
+                valid = observed[col].dropna()
+                if len(valid) < 2:
+                    continue
+                col_loc = g.columns.get_loc(col)
+                y1, y2 = valid.index[0], valid.index[1]
+                v1, v2 = valid.iloc[0], valid.iloc[1]
+                if y2 != y1:
+                    slope = (v2 - v1) / (y2 - y1)
+                    # Positional (.iloc) assignment: robust even if `years` contains a
+                    # duplicate label, unlike a label-based `.loc[Index]` lookup.
+                    leading_mask = (years < y1) & g[col].isna().to_numpy()
+                    if leading_mask.any():
+                        g.iloc[leading_mask, col_loc] = v1 + slope * (years[leading_mask] - y1)
+                yn1, yn2 = valid.index[-2], valid.index[-1]
+                vn1, vn2 = valid.iloc[-2], valid.iloc[-1]
+                if yn2 != yn1:
+                    slope_end = (vn2 - vn1) / (yn2 - yn1)
+                    trailing_mask = (years > yn2) & g[col].isna().to_numpy()
+                    if trailing_mask.any():
+                        g.iloc[trailing_mask, col_loc] = vn2 + slope_end * (years[trailing_mask] - yn2)
+            result = g.reset_index()
+            result[COUNTRY_COL] = country
+            return result
+
+        out = out.groupby(COUNTRY_COL, group_keys=False).apply(_interp_group, include_groups=False)
+        return out.reset_index(drop=True)
+
+    def _interpolate_with_history(
+        self, current: pd.DataFrame, history: pd.DataFrame | None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        """Interpolate across the history->current boundary.
+
+        Concatenating history + current per country before interpolating lets a leading
+        gap in `current` (e.g. a holdout year) extrapolate from history's tail, rather
+        than being treated as an unrecoverable edge with only one data point."""
+        cont_cols = [
+            c for c in self.retained_continuous_features_
+            if c not in self.synthetic_feature_names_ and c in current.columns
+        ]
+        if not cont_cols:
+            return current, history
+        if history is None or history.empty:
+            return self._linear_interpolate_columns(current, cont_cols), history
+        marker = "_interp_is_current"
+        cur = current.copy()
+        cur[marker] = True
+        hist = history.copy()
+        hist[marker] = False
+        combined = pd.concat([hist, cur], ignore_index=True)
+
+        # History and current each independently ghost-fill gaps in their own year range
+        # (_fill_temporal_gaps). Those ranges are only guaranteed disjoint for chronological
+        # splits (temporal_cv); for e.g. random_cv, a year can be a real row on one side and
+        # an independently-inserted ghost row on the other, producing a duplicate (country,
+        # year) key here. Resolve by preferring a real row over a ghost row, and current over
+        # history on a tie, before a duplicate label can reach the interpolation index.
+        if "_to_drop" in combined.columns:
+            combined = (
+                combined.assign(
+                    _dedup_ghost=combined["_to_drop"].astype(int),
+                    _dedup_hist=(~combined[marker]).astype(int),
+                )
+                .sort_values(ID_COLS + ["_dedup_ghost", "_dedup_hist"])
+                .drop_duplicates(subset=ID_COLS, keep="first")
+                .drop(columns=["_dedup_ghost", "_dedup_hist"])
+            )
+        combined = combined.sort_values(ID_COLS).reset_index(drop=True)
+        combined = self._linear_interpolate_columns(combined, cont_cols)
+        new_current = combined[combined[marker]].drop(columns=[marker]).reset_index(drop=True)
+        new_history = combined[~combined[marker]].drop(columns=[marker]).reset_index(drop=True)
+        return new_current, new_history
+
+    def _interpolate_impute(
+        self, df: pd.DataFrame, history: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Interpolation branch: linear interpolation + edge extrapolation, then a
+        fallback mop-up (country/year/global median/mode) for whatever remains NaN --
+        categoricals (never interpolated) and continuous columns with <2 valid points."""
+        cont_cols = [
+            c for c in self.retained_continuous_features_
+            if c not in self.synthetic_feature_names_ and c in df.columns
+        ]
+        if history is not None:
+            out, _ = self._interpolate_with_history(df, history)
+        else:
+            out = self._linear_interpolate_columns(df, cont_cols)
+        if self.simple_imputer_ is None:
+            raise RuntimeError("Simple imputer has not been fit.")
+        return self.simple_imputer_.transform(out)
+
+    def _impute(
+        self, df: pd.DataFrame, branch: str, history: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         out = df.copy()
         retained_cats = [c for c in CATEGORICAL_FEATURES if c in out.columns]
 
@@ -1010,6 +1159,9 @@ class Preprocessor:
             if self.simple_imputer_ is None:
                 raise RuntimeError("Simple imputer has not been fit.")
             out = self.simple_imputer_.transform(out)
+
+        elif branch == "interpolation":
+            out = self._interpolate_impute(out, history=history)
 
         elif branch == "mice":
             if self.mice_numeric_imputer_ is None and self.retained_continuous_features_:

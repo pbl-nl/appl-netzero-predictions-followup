@@ -95,7 +95,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=None,
         metavar="BRANCH",
-        help="Filter to specific imputation branches (simple, mice).",
+        help="Filter to specific imputation branches (simple, mice, interpolation).",
     )
     parser.add_argument(
         "--targets",

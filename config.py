@@ -164,9 +164,11 @@ ACTIVE_MODELS = ["catboost", "hist_gradient_boosting", "svr", "mlp", "kernel_rid
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]  # module default: ["linear", "optimistic", "pessimistic"]
 
 # Imputation branches to run.
-# Valid: "simple" (country/year/global median fallback), "mice" (IterativeImputer).
+# Valid: "simple" (country/year/global median fallback), "mice" (IterativeImputer),
+# "interpolation" (per-country linear interpolation with slope-based edge extrapolation;
+# skips the forward-fill step the other branches use).
 # Example: ACTIVE_BRANCHES = ["simple"]
-ACTIVE_BRANCHES = ["simple"]  # module default: ["simple", "mice"]
+ACTIVE_BRANCHES = ["simple"]  # module default: ["simple", "mice", "interpolation"]
 
 # Outer cross-validation strategies.
 # Valid: "temporal_cv", "random_cv".

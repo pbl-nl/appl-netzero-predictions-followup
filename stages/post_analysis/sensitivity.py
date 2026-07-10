@@ -8,6 +8,7 @@ so matched comparisons are populated even when the final winners differ.
 from __future__ import annotations
 
 import logging
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from stages.post_analysis.plot_utils import apply_thesis_style, save_fig
+from stages.post_analysis.plot_utils import apply_thesis_style, branch_label, save_fig
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +84,12 @@ def table_branch_sensitivity(
     out_dir: Path,
 ) -> pd.DataFrame:
     """
-    Compare simple vs mice on matched outer folds for each
+    Compare every pair of active imputation branches on matched outer folds for each
     ``(outer_strategy, target, model_name)`` combination.
+
+    One row per (outer_strategy, target, model_name, branch_a, branch_b) — branch_a/
+    branch_b range over all ``C(n, 2)`` pairs of branches present in the data, so this
+    scales from two branches (simple/mice) to any number (e.g. + interpolation).
     """
     strategy_col = _get_strategy_col(outer_results)
     required = {"branch", "outer_test_mae", "model_name", "target", "outer_test_year"}
@@ -99,33 +104,38 @@ def table_branch_sensitivity(
         .reset_index()
     )
     pivot = pivot.rename(columns={strategy_col: "outer_strategy_source"})
-    if "simple" not in pivot.columns:
-        pivot["simple"] = np.nan
-    if "mice" not in pivot.columns:
-        pivot["mice"] = np.nan
 
-    pivot["paired"] = pivot[["simple", "mice"]].notna().all(axis=1)
-    pivot["delta_mae"] = pivot["mice"] - pivot["simple"]
+    branches = sorted(outer_results["branch"].dropna().unique())
+    for branch in branches:
+        if branch not in pivot.columns:
+            pivot[branch] = np.nan
 
     rows: list[dict[str, Any]] = []
-    for keys, grp in pivot.groupby(["outer_strategy_source", "target", "model_name"], dropna=False):
-        pair_count = int(grp["paired"].sum())
-        expected_count = int(len(grp))
-        paired = grp[grp["paired"]]
-        rows.append(
-            {
-                "outer_strategy_source": keys[0],
-                "target": keys[1],
-                "model_name": keys[2],
-                "simple_mae_mean": float(paired["simple"].mean()) if not paired.empty else float("nan"),
-                "mice_mae_mean": float(paired["mice"].mean()) if not paired.empty else float("nan"),
-                "delta_mae_mean": float(paired["delta_mae"].mean()) if not paired.empty else float("nan"),
-                "delta_mae_std": float(paired["delta_mae"].std()) if len(paired) > 1 else float("nan"),
-                "pair_count": pair_count,
-                "expected_pair_count": expected_count,
-                "coverage_status": _coverage_status(pair_count, expected_count),
-            }
-        )
+    for branch_a, branch_b in combinations(branches, 2):
+        pair = pivot.copy()
+        pair["paired"] = pair[[branch_a, branch_b]].notna().all(axis=1)
+        pair["delta_mae"] = pair[branch_b] - pair[branch_a]
+
+        for keys, grp in pair.groupby(["outer_strategy_source", "target", "model_name"], dropna=False):
+            pair_count = int(grp["paired"].sum())
+            expected_count = int(len(grp))
+            paired = grp[grp["paired"]]
+            rows.append(
+                {
+                    "outer_strategy_source": keys[0],
+                    "target": keys[1],
+                    "model_name": keys[2],
+                    "branch_a": branch_a,
+                    "branch_b": branch_b,
+                    "branch_a_mae_mean": float(paired[branch_a].mean()) if not paired.empty else float("nan"),
+                    "branch_b_mae_mean": float(paired[branch_b].mean()) if not paired.empty else float("nan"),
+                    "delta_mae_mean": float(paired["delta_mae"].mean()) if not paired.empty else float("nan"),
+                    "delta_mae_std": float(paired["delta_mae"].std()) if len(paired) > 1 else float("nan"),
+                    "pair_count": pair_count,
+                    "expected_pair_count": expected_count,
+                    "coverage_status": _coverage_status(pair_count, expected_count),
+                }
+            )
 
     return _save_table(pd.DataFrame(rows), out_dir, "branch_sensitivity.csv")
 
@@ -300,20 +310,48 @@ def figure_sensitivity_heatmaps(
     scenario_df: pd.DataFrame,
     out_dir: Path,
 ) -> None:
-    """Three-panel heatmap figure summarising matched sensitivity comparisons."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    """Heatmap figure summarising matched sensitivity comparisons.
+
+    One panel per branch pair (``branch_a``/``branch_b`` in ``branch_df``, i.e. every
+    ``C(n, 2)`` combination of active branches), plus one panel each for strategy and
+    scenario sensitivity."""
+    branch_pairs: list[tuple[str, str]] = []
+    if not branch_df.empty and {"branch_a", "branch_b"}.issubset(branch_df.columns):
+        branch_pairs = sorted(set(zip(branch_df["branch_a"], branch_df["branch_b"])))
+    n_branch_panels = max(len(branch_pairs), 1)
+
+    total_panels = n_branch_panels + 2
+    fig, axes = plt.subplots(1, total_panels, figsize=(6 * total_panels, 6))
+    if total_panels == 1:
+        axes = [axes]
+
+    if branch_pairs:
+        for i, (branch_a, branch_b) in enumerate(branch_pairs):
+            pair_df = branch_df[
+                (branch_df["branch_a"] == branch_a) & (branch_df["branch_b"] == branch_b)
+            ]
+            _heatmap_or_message(
+                axes[i],
+                pair_df,
+                index_col="model_name",
+                column_col="target",
+                value_col="delta_mae_mean",
+                title=f"Branch ∆ MAE\n({branch_label(branch_b)} − {branch_label(branch_a)})",
+                cbar_label="∆ MAE",
+            )
+    else:
+        _heatmap_or_message(
+            axes[0],
+            branch_df,
+            index_col="model_name",
+            column_col="target",
+            value_col="delta_mae_mean",
+            title="Branch ∆ MAE",
+            cbar_label="∆ MAE",
+        )
 
     _heatmap_or_message(
-        axes[0],
-        branch_df,
-        index_col="model_name",
-        column_col="target",
-        value_col="delta_mae_mean",
-        title="Branch ∆ MAE\n(MICE − Simple)",
-        cbar_label="∆ MAE",
-    )
-    _heatmap_or_message(
-        axes[1],
+        axes[n_branch_panels],
         strategy_df,
         index_col="model_name",
         column_col="target",
@@ -322,7 +360,7 @@ def figure_sensitivity_heatmaps(
         cbar_label="∆ MAE",
     )
     _heatmap_or_message(
-        axes[2],
+        axes[n_branch_panels + 1],
         scenario_df,
         index_col="model_name",
         column_col="outer_strategy_source",

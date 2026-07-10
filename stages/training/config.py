@@ -35,7 +35,8 @@ ACTIVE_MODELS = ["catboost", "ridge", "adaboost", "lightgbm", "random_forest", "
 # ACTIVE_TARGETS = ["linear"]
 ACTIVE_TARGETS = ["linear", "optimistic", "pessimistic"]
 # ACTIVE_BRANCHES = ["simple"]
-ACTIVE_BRANCHES = ["simple","mice"]
+# Valid: "simple", "mice", "interpolation" (per-country linear interpolation, skips ffill).
+ACTIVE_BRANCHES = ["simple","mice","interpolation"]
 # ACTIVE_OUTER_STRATEGIES = ["temporal_cv"]
 ACTIVE_OUTER_STRATEGIES = ["temporal_cv","random_cv"]
 

@@ -16,9 +16,10 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from stages.post_analysis.config import SCENARIO_COLORS, STRATEGY_COLORS
+from stages.post_analysis.config import BRANCH_COLORS, SCENARIO_COLORS, STRATEGY_COLORS
 from stages.post_analysis.plot_utils import (
     apply_thesis_style,
+    branch_label,
     model_color_map,
     save_fig,
     scenario_label,
@@ -59,6 +60,7 @@ def run_model_comparison(
 
     if not outer_results.empty:
         figure_outer_cv_boxplots(outer_results, out_dir)
+        figure_outer_cv_boxplots_by_branch(outer_results, out_dir)
         produced["outer_cv_results"] = outer_results
 
     return produced
@@ -242,6 +244,9 @@ def figure_outer_cv_boxplots(
 ) -> None:
     """
     Box plots of outer-fold test MAE per model and strategy, faceted by target.
+
+    Compact single-row layout; pools all imputation branches together. See
+    figure_outer_cv_boxplots_by_branch() for the branch-separated version.
     """
     required = {"outer_test_mae", "model_name", "target"}
     if not required.issubset(outer_results.columns):
@@ -292,4 +297,84 @@ def figure_outer_cv_boxplots(
     fig.suptitle("Outer CV MAE Distribution per Model", y=1.02, fontsize=13)
 
     save_fig(out_dir / "outer_cv_boxplots.png")
-    log.info("Saved outer CV boxplots.")
+    log.info("Saved outer CV boxplots (compact).")
+
+
+def figure_outer_cv_boxplots_by_branch(
+    outer_results: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    """
+    Box plots of outer-fold test MAE per model, faceted by target (columns) and
+    strategy (rows, when more than one is present), coloured by imputation branch.
+    """
+    required = {"outer_test_mae", "model_name", "target"}
+    if not required.issubset(outer_results.columns):
+        log.warning("Cannot produce outer CV boxplots by branch — 'outer_test_mae' column missing.")
+        return
+
+    df = outer_results.dropna(subset=["outer_test_mae"]).copy()
+    targets = sorted(df["target"].unique())
+    if not targets:
+        return
+
+    strategy_col = next(
+        (c for c in ["outer_strategy", "outer_strategy_source"] if c in df.columns), None
+    )
+    strategies = (
+        sorted(df[strategy_col].unique()) if strategy_col and df[strategy_col].nunique() > 1
+        else [None]
+    )
+    branches = sorted(df["branch"].unique()) if "branch" in df.columns else []
+
+    n_targets = len(targets)
+    n_rows = len(strategies)
+    fig, axes = plt.subplots(
+        n_rows, n_targets, figsize=(5 * n_targets, 5 * n_rows), sharey=False, squeeze=False,
+    )
+
+    for row, strategy in enumerate(strategies):
+        row_df = df if strategy is None else df[df[strategy_col] == strategy]
+        for col, target in enumerate(targets):
+            ax = axes[row][col]
+            subset = row_df[row_df["target"] == target]
+            order = (
+                subset.groupby("model_name")["outer_test_mae"]
+                .median()
+                .sort_values()
+                .index.tolist()
+            )
+
+            hue = "branch" if len(branches) > 1 and "branch" in subset.columns else None
+            if hue:
+                palette = {k: v for k, v in BRANCH_COLORS.items() if k in subset[hue].unique()}
+                sns.boxplot(
+                    data=subset, x="outer_test_mae", y="model_name",
+                    hue=hue, hue_order=[b for b in branches if b in subset[hue].unique()],
+                    order=order, ax=ax, palette=palette,
+                    linewidth=0.8,
+                )
+                handles, labels = ax.get_legend_handles_labels()
+                ax.legend(
+                    handles, [branch_label(l) for l in labels],
+                    title="Branch", fontsize=7, title_fontsize=8,
+                )
+            else:
+                color = BRANCH_COLORS.get(branches[0], "#4393c3") if branches else "#4393c3"
+                sns.boxplot(
+                    data=subset, x="outer_test_mae", y="model_name",
+                    order=order, ax=ax, color=color, linewidth=0.8,
+                )
+
+            title = f"Target: {scenario_label(target)}"
+            if strategy is not None:
+                title += f"\n{strategy_label(strategy)}"
+            ax.set_title(title)
+            ax.set_xlabel("Outer Test MAE")
+            ax.set_ylabel("")
+            ax.set_xlim(0, 1)
+
+    fig.suptitle("Outer CV MAE Distribution per Model, by Branch", y=1.02, fontsize=13)
+
+    save_fig(out_dir / "outer_cv_boxplots_by_branch.png")
+    log.info("Saved outer CV boxplots (by branch).")

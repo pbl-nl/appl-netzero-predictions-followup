@@ -151,8 +151,9 @@ STRATEGY_COLORS: dict[str, str] = {
 
 # Per-branch colour palette
 BRANCH_COLORS: dict[str, str] = {
-    "simple": "#d6604d",
-    "mice":   "#4393c3",
+    "simple":        "#d6604d",
+    "mice":          "#4393c3",
+    "interpolation": "#e08214",
 }
 
 # ---------------------------------------------------------------------------
