@@ -61,6 +61,7 @@ from stages.training.data_preparation import (
     load_prepared_outer_target,
     run_data_preparation_stage,
 )
+from stages.training.target_maps import run_target_maps
 from stages.training.helpers import (
     build_model,
     compute_penalized_cv_objective,
@@ -1124,6 +1125,9 @@ def run() -> None:
         logger.info(
             f"TRAIN_START_YEAR={TRAIN_START_YEAR}: will filter training rows after feature engineering"
         )
+
+    run_target_maps(OUTPUT_DIR)
+    logger.info("Target maps saved to %s", OUTPUT_DIR / "target_maps_2024")
 
     preprocessed_dir = run_data_preparation_stage()
     logger.info(f"Using preprocessed data from: {preprocessed_dir}")

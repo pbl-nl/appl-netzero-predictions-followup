@@ -8,6 +8,12 @@ from stages.data import load_nz_data
 
 log = logging.getLogger(__name__)
 
+EU27_ISO3 = [
+    'AUT', 'BEL', 'BGR', 'HRV', 'CYP', 'CZE', 'DNK', 'EST', 'FIN', 'FRA',
+    'DEU', 'GRC', 'HUN', 'IRL', 'ITA', 'LVA', 'LTU', 'LUX', 'MLT', 'NLD',
+    'POL', 'PRT', 'ROU', 'SVK', 'SVN', 'ESP', 'SWE',
+]
+
 def run_boxplots(winners: pd.DataFrame, bootstrap_df: pd.DataFrame, out_dir: Path) -> None:
     """
     Generate boxplots of implied net-zero years for the top 20 emitters
@@ -26,7 +32,7 @@ def run_boxplots(winners: pd.DataFrame, bootstrap_df: pd.DataFrame, out_dir: Pat
     
     top20_emitters = ['CHN', 'USA', 'IND', 'RUS', 'BRA', 'IDN', 'JPN', 'IRN', 'MEX', 'SAU',
                       'DEU', 'CAN', 'KOR', 'TUR', 'AUS', 'PAK', 'ZAF', 'VNM', 'THA', 'GBR']
-    countries_to_plot = sorted(top20_emitters)
+    countries_to_plot = sorted(top20_emitters + ['EUU'])
     
     log.info("Generating boxplots for top 20 valid emitters...")
     
@@ -38,20 +44,28 @@ def run_boxplots(winners: pd.DataFrame, bootstrap_df: pd.DataFrame, out_dir: Pat
         
         tag_interpretability = f"{strategy}_{target}_{model_name}_{branch}"
         
-        sub = bootstrap_df[
+        sub_all = bootstrap_df[
             (bootstrap_df["outer_strategy_source"] == strategy) &
             (bootstrap_df["target"] == target) &
             (bootstrap_df["branch"] == branch) &
-            (bootstrap_df["model_name"] == model_name) &
-            (bootstrap_df["country"].isin(countries_to_plot))
+            (bootstrap_df["model_name"] == model_name)
         ]
-        
+
+        sub = sub_all[sub_all["country"].isin(countries_to_plot)]
+
         pivot_df = sub.pivot(index="iteration", columns="country", values="tnz_implied")
         pivot_df = pivot_df.reindex(columns=countries_to_plot)
-        
+
         if pivot_df.empty:
             log.warning(f"No prediction data found for model {tag_interpretability}")
             continue
+
+        eu_avg = (
+            sub_all[sub_all["country"].isin(EU27_ISO3)]
+            .groupby("iteration")["tnz_implied"]
+            .mean()
+        )
+        pivot_df["EUU"] = eu_avg.reindex(pivot_df.index)
             
         plt.close('all')
         plt.rcParams['figure.dpi'] = 300
