@@ -16,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — must come before pyplot import
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 from matplotlib.colors import Normalize
